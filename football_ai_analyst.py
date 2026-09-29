@@ -1,0 +1,1737 @@
+# =============================================================================
+# Der-AI | Football Quant Desk — V1
+#
+# One click on "Analyse" runs the whole pipeline:
+#   1. PYTHON collects every fixture of the chosen day from API-Football (api-sports.io)
+#      -> top leagues, mid leagues, cups, international matches, friendlies.
+#   2. PYTHON enriches a budget-aware shortlist: predictions, last-10 form, H2H, injuries,
+#      lineups, standings, odds (multi-bookmaker), corners/shots/xG history and individual
+#      player ratings (batched fixtures?ids= calls keep the request count low).
+#   3. PYTHON runs a Monte Carlo per match (Poisson goals + shared tempo variance +
+#      Dixon-Coles low-score correction + first-half split + negative-binomial corners) for:
+#      1 / X / 2, 1X, X2, 12, BTTS Yes/No, Over/Under 0.5-4.5, team totals, 1H goals,
+#      total corners. Model probabilities are blended with de-vigged bookmaker prices.
+#   4. PYTHON scores every match for "bookmaker trap" risk and builds a safe-leg menu.
+#   5. AI (Groq, gpt-oss-120b -> gpt-oss-20b -> qwen3-32b) acts as bookmaker + quant, reads a
+#      compact evidence pack and returns 3 tickets x 5 legs (each ticket odds >= 3.5).
+#      The whole AI step is hard-capped at 8,000 tokens (prompt + completion, all attempts).
+#   6. PYTHON verifies the AI output (real ids, real odds, 5 distinct matches, odds >= 3.5),
+#      repairs it if needed, falls back to a deterministic optimiser if the AI is unavailable,
+#      and pushes the tickets + reasoning to Telegram.
+# =============================================================================
+
+import os, re, json, math, time, html, hashlib, threading, random, traceback
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
+
+# ── Configuration ───────────────────────────────────────────────────────────
+APIF_BASE = "https://v3.football.api-sports.io"
+DEFAULT_TZ = "Africa/Kampala"
+CACHE_DIR = os.environ.get("DERAI_FB_CACHE", ".derai_fb_cache")
+STATE_PATH = os.environ.get("DERAI_FB_STATE", "derai_football_state.json")
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_TIMEOUT = 90
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3-32b"]
+GROQ_MODEL_CONFIG = {
+    "openai/gpt-oss-120b": {"max_completion_tokens": 2400, "reasoning_effort": "low", "supports_reasoning_effort": True},
+    "openai/gpt-oss-20b": {"max_completion_tokens": 2400, "reasoning_effort": "low", "supports_reasoning_effort": True},
+    "qwen/qwen3-32b": {"max_completion_tokens": 2200, "reasoning_effort": "none", "supports_reasoning_effort": True},
+}
+GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
+NON_RETRYABLE = {400, 401, 403, 404, 422}
+
+# ── Token budget (HARD LIMIT per analysis: prompt + completion, across ALL attempts) ──
+TOTAL_TOKEN_BUDGET = 8000
+OUTPUT_RESERVE = 2200        # completion tokens reserved (includes hidden reasoning on gpt-oss)
+TOKEN_SAFETY = 100
+MIN_COMPLETION = 900         # below this a call cannot finish the JSON -> don't start it
+DEFAULT_CHARS_PER_TOKEN = 3.0  # deliberately conservative for dense numeric text
+
+# ── Ticket rules ────────────────────────────────────────────────────────────
+N_TICKETS, LEGS_PER_TICKET, MIN_TICKET_ODDS = 3, 5, 3.5
+MIN_LEG_P, MIN_LEG_ODDS, MAX_LEG_ODDS = 0.62, 1.10, 2.00
+TICKET_LABELS = ["Ticket 1 - Safest", "Ticket 2 - Balanced", "Ticket 3 - Value"]
+
+# ── League intelligence (API-Football league ids; unknown leagues fall into LOW) ──
+TOP_LEAGUES = {39: "Premier League", 140: "La Liga", 135: "Serie A", 78: "Bundesliga", 61: "Ligue 1",
+               2: "Champions League", 3: "Europa League", 848: "Conference League", 1: "World Cup",
+               4: "Euro", 9: "Copa America", 5: "Nations League"}
+MID_LEAGUES = {88, 94, 40, 144, 203, 179, 71, 128, 262, 253, 307, 13, 11, 41, 42, 79, 136, 141, 62, 89, 95,
+               145, 204, 180, 72, 218, 207, 119, 103, 113, 106, 197, 235, 98, 292, 188, 45, 48, 81, 66, 143, 137}
+CAT_WEIGHT = {"TOP": 100, "INTL": 80, "MID": 70, "LOW": 50}
+CAT_QUOTA = {"TOP": 0.40, "INTL": 0.20, "MID": 0.30, "LOW": 0.10}
+LEAGUE_EXCLUDE_RE = re.compile(r"\b(U-?1[5-9]|U-?2[0-3]|Youth|Reserve|Reserves|Women|Feminine|Femenin|Femminile|Frauen|Junior|Juniors|Development)\b", re.I)
+TEAM_EXCLUDE_RE = re.compile(r"\s(II|B|U-?\d{2}|Youth|Women|W)$", re.I)
+PLAYED_OK = {"FT", "AET", "PEN"}
+UPCOMING_OK = {"NS", "TBD"}
+
+GOAL_LINES = [0.5, 1.5, 2.5, 3.5, 4.5]
+TEAM_LINES = [0.5, 1.5, 2.5]
+HT_LINES = [0.5, 1.5]
+CORNER_LINES = [7.5, 8.5, 9.5, 10.5, 11.5, 12.5]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Small helpers
+# ═════════════════════════════════════════════════════════════════════════════
+def get_secret(name, default=""):
+    try:
+        v = st.secrets.get(name, None)
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
+def _f(x, d=None):
+    try:
+        if x is None or x == "":
+            return d
+        if isinstance(x, str):
+            x = x.replace("%", "").strip()
+        return float(x)
+    except Exception:
+        return d
+
+
+def _esc(t):
+    return "" if t is None else html.escape(str(t), quote=False)
+
+
+def _pct(p):
+    return int(round(100 * p))
+
+
+def _short(name, n=16):
+    name = str(name or "")
+    return name if len(name) <= n else name[: n - 1] + "."
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# API-Football client (thread-safe, rate-limited, disk + memory cache, quota aware)
+# ═════════════════════════════════════════════════════════════════════════════
+class RateLimiter:
+    def __init__(self, per_minute):
+        self.interval = 60.0 / max(1, per_minute)
+        self.lock = threading.Lock()
+        self.next = 0.0
+
+    def wait(self):
+        with self.lock:
+            now = time.monotonic()
+            t = max(now, self.next)
+            self.next = t + self.interval
+        if t > now:
+            time.sleep(t - now)
+
+
+class ApiFootball:
+    def __init__(self, key, per_minute=10, cache_dir=CACHE_DIR):
+        self.session = requests.Session()
+        self.session.headers.update({"x-apisports-key": key})
+        self.rate = RateLimiter(per_minute)
+        self.lock = threading.Lock()
+        self.calls = 0
+        self.cache_hits = 0
+        self.remaining = None
+        self.limit = None
+        self.errors: List[str] = []
+        self.mem: Dict[str, Any] = {}
+        self.quota_out = False
+        self.cache_dir = cache_dir
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            for fn in os.listdir(cache_dir):
+                p = os.path.join(cache_dir, fn)
+                if time.time() - os.path.getmtime(p) > 2 * 86400:
+                    os.remove(p)
+        except Exception:
+            pass
+
+    def _note_headers(self, r):
+        with self.lock:
+            self.calls += 1
+            rem = r.headers.get("x-ratelimit-requests-remaining")
+            lim = r.headers.get("x-ratelimit-requests-limit")
+            if rem is not None and str(rem).isdigit():
+                self.remaining = int(rem)
+            if lim is not None and str(lim).isdigit():
+                self.limit = int(lim)
+
+    def status(self):
+        """/status does not consume quota; used to read plan + remaining calls."""
+        try:
+            r = self.session.get(f"{APIF_BASE}/status", timeout=20)
+            d = r.json()
+            resp = d.get("response") or {}
+            if isinstance(resp, list):
+                resp = resp[0] if resp else {}
+            req = resp.get("requests") or {}
+            sub = resp.get("subscription") or {}
+            cur, lim = req.get("current"), req.get("limit_day")
+            if lim is not None:
+                self.limit = int(lim)
+                self.remaining = int(lim) - int(cur or 0)
+            return {"plan": sub.get("plan"), "active": sub.get("active"), "used": cur, "limit": lim,
+                    "errors": d.get("errors")}
+        except Exception as e:
+            return {"plan": None, "errors": str(e)}
+
+    def get(self, endpoint, params=None, ttl=3600):
+        params = {k: v for k, v in (params or {}).items() if v is not None}
+        ck = endpoint + "?" + "&".join(f"{k}={params[k]}" for k in sorted(params))
+        h = hashlib.md5(ck.encode()).hexdigest()
+        path = os.path.join(self.cache_dir, h + ".json")
+        if ttl > 0:
+            with self.lock:
+                mem = self.mem.get(h)
+            if mem and time.time() - mem[0] < ttl:
+                with self.lock:
+                    self.cache_hits += 1
+                return mem[1]
+            try:
+                if os.path.exists(path):
+                    with open(path, "r", encoding="utf-8") as fh:
+                        obj = json.load(fh)
+                    if time.time() - obj["t"] < ttl:
+                        with self.lock:
+                            self.cache_hits += 1
+                            self.mem[h] = (obj["t"], obj["d"])
+                        return obj["d"]
+            except Exception:
+                pass
+        if self.quota_out:
+            return {"response": [], "paging": {}, "errors": {"quota": "daily quota exhausted"}}
+        last_err = ""
+        for attempt in range(3):
+            self.rate.wait()
+            try:
+                r = self.session.get(APIF_BASE + endpoint, params=params, timeout=30)
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            self._note_headers(r)
+            if r.status_code == 429:
+                time.sleep(6 * (attempt + 1))
+                continue
+            if r.status_code >= 500:
+                time.sleep(2 * (attempt + 1))
+                continue
+            if r.status_code != 200:
+                self.errors.append(f"{endpoint} HTTP {r.status_code}")
+                return {"response": [], "paging": {}, "errors": {"http": r.status_code}}
+            try:
+                data = r.json()
+            except Exception:
+                last_err = "bad json"
+                continue
+            errs = data.get("errors")
+            if errs:
+                msg = json.dumps(errs)[:300]
+                low = msg.lower()
+                if "ratelimit" in low or ("rate" in low and "limit" in low and "minute" in low):
+                    time.sleep(8)
+                    continue
+                if "request limit" in low or "requests" in low and "day" in low:
+                    self.quota_out = True
+                self.errors.append(f"{endpoint} {msg}")
+                data.setdefault("response", [])
+                return data
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    json.dump({"t": time.time(), "d": data}, fh)
+            except Exception:
+                pass
+            with self.lock:
+                self.mem[h] = (time.time(), data)
+            return data
+        self.errors.append(f"{endpoint} failed: {last_err}")
+        return {"response": [], "paging": {}, "errors": {"network": last_err}}
+
+    def resp(self, endpoint, params=None, ttl=3600):
+        return self.get(endpoint, params, ttl).get("response") or []
+
+    def pages(self, endpoint, params, ttl=1200, max_pages=4):
+        out, page = [], 1
+        while page <= max_pages:
+            d = self.get(endpoint, dict(params, page=page), ttl)
+            out.extend(d.get("response") or [])
+            pg = d.get("paging") or {}
+            if int(pg.get("current", page) or page) >= int(pg.get("total", 1) or 1):
+                break
+            page += 1
+        return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Parsers
+# ═════════════════════════════════════════════════════════════════════════════
+def league_category(lid, country):
+    if lid in TOP_LEAGUES:
+        return "TOP"
+    if (country or "").lower() == "world":
+        return "INTL"
+    if lid in MID_LEAGUES:
+        return "MID"
+    return "LOW"
+
+
+def parse_fixture(f):
+    fx, lg, tm = f.get("fixture", {}), f.get("league", {}), f.get("teams", {})
+    return {
+        "id": fx.get("id"), "ts": fx.get("timestamp"), "status": (fx.get("status") or {}).get("short"),
+        "league_id": lg.get("id"), "league": lg.get("name"), "country": lg.get("country"),
+        "season": lg.get("season"), "round": lg.get("round"),
+        "home_id": (tm.get("home") or {}).get("id"), "home": (tm.get("home") or {}).get("name"),
+        "away_id": (tm.get("away") or {}).get("id"), "away": (tm.get("away") or {}).get("name"),
+        "cat": league_category(lg.get("id"), lg.get("country")),
+    }
+
+
+def _norm_line(txt):
+    m = re.match(r"\s*(over|under)\s*([\d.]+)", txt.lower())
+    if not m:
+        return None
+    line = float(m.group(2))
+    if abs(line * 2 - round(line * 2)) > 1e-9 or int(line * 2) % 2 == 0:
+        return None
+    return ("O" if m.group(1) == "over" else "U") + f"{line:g}"
+
+
+def canonical_market_key(name, value):
+    n, v = name.lower().strip(), str(value).strip().lower()
+    if n == "match winner":
+        return {"home": "1", "draw": "X", "away": "2"}.get(v)
+    if n == "double chance":
+        return {"home/draw": "1X", "draw/away": "X2", "home/away": "12"}.get(v)
+    if n == "both teams score":
+        return {"yes": "BTTS_Y", "no": "BTTS_N"}.get(v)
+    if n == "goals over/under":
+        k = _norm_line(v)
+        return k if k and float(k[1:]) in GOAL_LINES else None
+    if n.startswith("goals over/under") and ("first half" in n or "1st half" in n):
+        k = _norm_line(v)
+        return "HT_" + k if k and float(k[1:]) in HT_LINES else None
+    if "half" in n or "1st" in n or "2nd" in n or "corner" in n and ("home" in n or "away" in n):
+        return None
+    bad = ("card", "shot", "handicap", "race", "exact", "odd/even", "result", "minute", "first", "last")
+    if "total" in n and any(w in n for w in ("home", "away")) and "corner" not in n and not any(b in n for b in bad):
+        side = "H_" if "home" in n else "A_"
+        k = _norm_line(v)
+        return side + k if k and float(k[1:]) in TEAM_LINES else None
+    if "corner" in n and ("over" in n or "total" in n) and not any(b in n for b in ("handicap", "race", "asian")):
+        k = _norm_line(v)
+        return "C_" + k if k and float(k[1:]) in CORNER_LINES else None
+    return None
+
+
+def parse_odds_item(item, pref_bookmaker):
+    store, pref = defaultdict(list), {}
+    for bk in item.get("bookmakers", []) or []:
+        for bet in bk.get("bets", []) or []:
+            for v in bet.get("values", []) or []:
+                key = canonical_market_key(str(bet.get("name", "")), str(v.get("value", "")))
+                odd = _f(v.get("odd"))
+                if not key or not odd or odd <= 1.0:
+                    continue
+                store[key].append(odd)
+                if bk.get("id") == pref_bookmaker:
+                    pref[key] = odd
+    out = {}
+    for k, lst in store.items():
+        med = float(np.median(lst))
+        out[k] = {"odds": float(pref.get(k, med)), "median": med, "best": float(max(lst)), "n": len(lst)}
+    return out
+
+
+def parse_predictions(resp):
+    if not resp:
+        return None
+    r = resp[0]
+    pr, teams, comp = r.get("predictions") or {}, r.get("teams") or {}, r.get("comparison") or {}
+
+    def side(s):
+        t = teams.get(s) or {}
+        L = t.get("league") or {}
+        g = L.get("goals") or {}
+        gf, ga = (g.get("for") or {}).get("average") or {}, (g.get("against") or {}).get("average") or {}
+        pl = (L.get("fixtures") or {}).get("played") or {}
+        l5 = t.get("last_5") or {}
+        return {"gf_h": _f(gf.get("home")), "gf_a": _f(gf.get("away")), "ga_h": _f(ga.get("home")),
+                "ga_a": _f(ga.get("away")), "played_h": _f(pl.get("home"), 0), "played_a": _f(pl.get("away"), 0),
+                "l5_form": l5.get("form"), "season_form": L.get("form") or ""}
+
+    pc = pr.get("percent") or {}
+    return {"pct": [_f(pc.get("home")), _f(pc.get("draw")), _f(pc.get("away"))], "advice": pr.get("advice"),
+            "home": side("home"), "away": side("away"),
+            "comp": {k: (_f((comp.get(k) or {}).get("home")), _f((comp.get(k) or {}).get("away")))
+                     for k in ("form", "att", "def", "total")},
+            "h2h": r.get("h2h") or []}
+
+
+def _ft_goals(f):
+    sc = (f.get("score") or {}).get("fulltime") or {}
+    g = f.get("goals") or {}
+    h = sc.get("home") if sc.get("home") is not None else g.get("home")
+    a = sc.get("away") if sc.get("away") is not None else g.get("away")
+    return h, a
+
+
+def parse_results(resp, team_id):
+    out = []
+    for f in resp or []:
+        if ((f.get("fixture") or {}).get("status") or {}).get("short") not in PLAYED_OK:
+            continue
+        h, a = _ft_goals(f)
+        if h is None or a is None:
+            continue
+        tm = f.get("teams") or {}
+        is_home = (tm.get("home") or {}).get("id") == team_id
+        gf, ga = (h, a) if is_home else (a, h)
+        opp = tm.get("away" if is_home else "home") or {}
+        out.append({"id": f["fixture"]["id"], "ts": f["fixture"]["timestamp"], "home": is_home, "gf": gf, "ga": ga,
+                    "res": "W" if gf > ga else "D" if gf == ga else "L", "opp": opp.get("name"),
+                    "league_id": (f.get("league") or {}).get("id")})
+    out.sort(key=lambda x: -x["ts"])
+    return out
+
+
+def parse_h2h(fixtures, home_id):
+    """Results from the perspective of the current home team."""
+    out = []
+    for f in fixtures or []:
+        if ((f.get("fixture") or {}).get("status") or {}).get("short") not in PLAYED_OK:
+            continue
+        h, a = _ft_goals(f)
+        if h is None or a is None:
+            continue
+        was_home = ((f.get("teams") or {}).get("home") or {}).get("id") == home_id
+        gf, ga = (h, a) if was_home else (a, h)
+        out.append({"ts": f["fixture"]["timestamp"], "gf": gf, "ga": ga})
+    out.sort(key=lambda x: -x["ts"])
+    return out[:8]
+
+
+def parse_standings(resp):
+    out = {}
+    for item in resp or []:
+        for group in (item.get("league") or {}).get("standings") or []:
+            size = len(group)
+            for row in group:
+                tid = (row.get("team") or {}).get("id")
+                if tid is not None and tid not in out:
+                    out[tid] = {"rank": row.get("rank"), "pts": row.get("points"), "of": size,
+                                "played": (row.get("all") or {}).get("played"), "desc": row.get("description")}
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Team profile (form, goals, corners, xG, player form, injuries, lineup)
+# ═════════════════════════════════════════════════════════════════════════════
+def _stat_val(stats_list, name):
+    for s in stats_list or []:
+        if s.get("type") == name:
+            return _f(s.get("value"))
+    return None
+
+
+def team_history_stats(team_id, ids, hist):
+    cor_f, cor_a, sot, xg_f, xg_a = [], [], [], [], []
+    players = defaultdict(lambda: {"name": "", "pos": None, "r": [], "m": [], "g": 0, "ast": 0, "games": 0})
+    for fid in ids:
+        f = hist.get(fid)
+        if not f:
+            continue
+        own = opp = None
+        for s in f.get("statistics") or []:
+            if (s.get("team") or {}).get("id") == team_id:
+                own = s.get("statistics")
+            else:
+                opp = s.get("statistics")
+        if own and opp:
+            c1, c2 = _stat_val(own, "Corner Kicks"), _stat_val(opp, "Corner Kicks")
+            if c1 is not None and c2 is not None:
+                cor_f.append(c1)
+                cor_a.append(c2)
+            v = _stat_val(own, "Shots on Goal")
+            if v is not None:
+                sot.append(v)
+            x1, x2 = _stat_val(own, "expected_goals"), _stat_val(opp, "expected_goals")
+            if x1 is not None and x2 is not None:
+                xg_f.append(x1)
+                xg_a.append(x2)
+        for tp in f.get("players") or []:
+            if (tp.get("team") or {}).get("id") != team_id:
+                continue
+            for p in tp.get("players") or []:
+                st_ = (p.get("statistics") or [{}])[0]
+                gm = st_.get("games") or {}
+                mins, rt = _f(gm.get("minutes"), 0), _f(gm.get("rating"))
+                if not mins:
+                    continue
+                pid = (p.get("player") or {}).get("id")
+                e = players[pid]
+                e["name"] = (p.get("player") or {}).get("name") or e["name"]
+                e["pos"] = gm.get("position") or e["pos"]
+                e["m"].append(mins)
+                if rt:
+                    e["r"].append(rt)
+                e["g"] += int((st_.get("goals") or {}).get("total") or 0)
+                e["ast"] += int((st_.get("goals") or {}).get("assists") or 0)
+                e["games"] += 1
+    avg = lambda l: float(np.mean(l)) if l else None
+    return {"cor_for": avg(cor_f), "cor_against": avg(cor_a), "cor_n": len(cor_f), "sot": avg(sot),
+            "xg_for": avg(xg_f), "xg_against": avg(xg_a), "players": dict(players)}
+
+
+def build_profile(team_id, results, hs, injuries, lineup):
+    r10 = results[:10]
+    w = np.array([0.88 ** i for i in range(len(r10))]) if r10 else np.array([])
+    prof = {"n": len(r10)}
+    if r10:
+        gf = np.array([x["gf"] for x in r10], float)
+        ga = np.array([x["ga"] for x in r10], float)
+        pts = np.array([3 if x["res"] == "W" else 1 if x["res"] == "D" else 0 for x in r10], float)
+        prof.update({
+            "gf_w": float((w * gf).sum() / w.sum()), "ga_w": float((w * ga).sum() / w.sum()),
+            "ppg5": float(pts[:5].mean()), "ppg10": float(pts.mean()),
+            "form5": "".join(x["res"] for x in reversed(r10[:5])),
+            "cs": float((ga == 0).mean()), "fts": float((gf == 0).mean()),
+            "o25": float(((gf + ga) > 2.5).mean()), "o15": float(((gf + ga) > 1.5).mean()),
+            "btts": float(((gf > 0) & (ga > 0)).mean()),
+            "form_score": float(100 * (w * pts / 3).sum() / w.sum()),
+        })
+    prof.update({k: hs.get(k) for k in ("cor_for", "cor_against", "cor_n", "sot", "xg_for", "xg_against")})
+    # ── individual players ──
+    pl = hs.get("players") or {}
+    ngames = max([e["games"] for e in pl.values()] + [1])
+    rows = []
+    for pid, e in pl.items():
+        if not e["r"]:
+            continue
+        rows.append({"id": pid, "name": e["name"], "pos": e["pos"], "rating": float(np.mean(e["r"])),
+                     "mins": float(np.mean(e["m"])), "games": e["games"], "goals": e["g"], "ast": e["ast"]})
+    key = [r for r in rows if r["games"] >= max(2, int(0.6 * ngames)) and r["mins"] >= 55 and r["rating"] >= 6.7]
+    key.sort(key=lambda r: -(r["rating"] * math.log(r["mins"] + 1)))
+    prof["key"] = key[:9]
+    prof["key_ids"] = {r["id"] for r in prof["key"]}
+    prof["stars"] = sorted([r for r in rows if r["games"] >= 2], key=lambda r: -(r["rating"] + 0.25 * r["goals"] + 0.1 * r["ast"]))[:2]
+    mm = [(r["rating"], r["mins"]) for r in rows if r["mins"] >= 30]
+    prof["team_rating"] = float(sum(a * b for a, b in mm) / sum(b for _, b in mm)) if mm else None
+    # ── injuries ──
+    inj = []
+    pos_by_name = {r["name"]: r["pos"] for r in rows}
+    for i in injuries or []:
+        p = i.get("player") or {}
+        typ = p.get("type") or ""
+        pid, nm = p.get("id"), p.get("name")
+        is_key = pid in prof["key_ids"]
+        inj.append({"name": nm, "type": typ, "reason": p.get("reason"), "key": is_key,
+                    "pos": next((r["pos"] for r in rows if r["id"] == pid), pos_by_name.get(nm))})
+    prof["inj"] = inj
+    # ── lineup ──
+    prof["lineup"] = None
+    if lineup:
+        xi = {((x.get("player") or {}).get("id")) for x in lineup.get("startXI") or []}
+        kin = len(prof["key_ids"] & xi)
+        prof["lineup"] = {"formation": lineup.get("formation"), "key_in_xi": kin, "key_n": len(prof["key_ids"]),
+                          "rotation": bool(len(prof["key_ids"]) >= 5 and kin <= len(prof["key_ids"]) - 3)}
+    return prof
+
+
+def injury_impact(prof):
+    att = dfn = 0.0
+    for i in prof.get("inj") or []:
+        wgt = 1.0 if i["type"] == "Missing Fixture" else 0.4
+        base = 0.045 if i["key"] else 0.012
+        pos = i.get("pos")
+        if pos in ("F", "M", None):
+            att += base * wgt * (1.0 if pos == "F" else 0.7 if pos == "M" else 0.5)
+        if pos in ("D", "G", None):
+            dfn += base * wgt * (1.2 if pos == "G" else 1.0 if pos == "D" else 0.5)
+    return min(att, 0.14), min(dfn, 0.14)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Expected goals / corners
+# ═════════════════════════════════════════════════════════════════════════════
+def estimate_lambdas(pred, ph, pa):
+    prior_h, prior_a = 1.45, 1.15
+    season_h = season_a = None
+    n_season = 0
+    if pred:
+        H, A = pred["home"], pred["away"]
+        v = [H["gf_h"], H["ga_h"], A["gf_a"], A["ga_a"]]
+        if None not in v and sum(v) > 0:
+            season_h, season_a = (v[0] + v[3]) / 2, (v[2] + v[1]) / 2
+            n_season = min(H["played_h"] or 0, A["played_a"] or 0)
+    rec_h = rec_a = None
+    n_rec = min(ph.get("n", 0), pa.get("n", 0))
+    if n_rec >= 3:
+        rec_h = (ph["gf_w"] + pa["ga_w"]) / 2
+        rec_a = (pa["gf_w"] + ph["ga_w"]) / 2
+    if season_h is not None and rec_h is not None:
+        ws = 0.5 if n_season >= 6 else 0.3
+        lh, la, m = ws * season_h + (1 - ws) * rec_h, ws * season_a + (1 - ws) * rec_a, max(n_season, n_rec)
+    elif season_h is not None:
+        lh, la, m = season_h, season_a, n_season
+    elif rec_h is not None:
+        lh, la, m = rec_h, rec_a, n_rec
+    else:
+        lh, la, m = prior_h, prior_a, 0
+    lh = (m * lh + 3 * prior_h) / (m + 3)
+    la = (m * la + 3 * prior_a) / (m + 3)
+    (ah, dh), (aa, da) = injury_impact(ph), injury_impact(pa)
+    lh *= (1 - ah) * (1 + da)
+    la *= (1 - aa) * (1 + dh)
+    return float(np.clip(lh, 0.25, 3.8)), float(np.clip(la, 0.25, 3.8)), (ah, dh, aa, da)
+
+
+def estimate_corners(ph, pa, lh, la):
+    prior_h, prior_a = 5.0 + 0.9 * (lh - 1.45), 4.3 + 0.9 * (la - 1.15)
+    n = 0
+    mu_h, mu_a = prior_h, prior_a
+    if None not in (ph.get("cor_for"), pa.get("cor_against"), pa.get("cor_for"), ph.get("cor_against")):
+        n = min(ph.get("cor_n", 0), pa.get("cor_n", 0))
+        mu_h = (n * (ph["cor_for"] + pa["cor_against"]) / 2 + 3 * prior_h) / (n + 3)
+        mu_a = (n * (pa["cor_for"] + ph["cor_against"]) / 2 + 3 * prior_a) / (n + 3)
+    return float(mu_h), float(mu_a), n
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Monte Carlo
+# ═════════════════════════════════════════════════════════════════════════════
+def monte_carlo(lam_h, lam_a, mu_ch, mu_ca, n=40000, seed=0):
+    rng = np.random.default_rng(seed)
+    tempo = rng.gamma(28.0, 1 / 28.0, n)                        # shared game-tempo -> goal correlation/overdispersion
+    lh = lam_h * tempo * np.exp(rng.normal(-0.005, 0.10, n))    # parameter uncertainty
+    la = lam_a * tempo * np.exp(rng.normal(-0.005, 0.10, n))
+    h1, h2 = rng.poisson(lh * 0.45), rng.poisson(lh * 0.55)
+    a1, a2 = rng.poisson(la * 0.45), rng.poisson(la * 0.55)
+    h, a, hh, ah = h1 + h2, a1 + a2, h1, a1
+    rho = -0.06                                                 # Dixon-Coles low-score correction as sim weights
+    w = np.ones(n)
+    m00, m01, m10, m11 = (h == 0) & (a == 0), (h == 0) & (a == 1), (h == 1) & (a == 0), (h == 1) & (a == 1)
+    w[m00] = 1 - lh[m00] * la[m00] * rho
+    w[m01] = 1 + lh[m01] * rho
+    w[m10] = 1 + la[m10] * rho
+    w[m11] = 1 - rho
+    w = np.clip(w, 0.2, None)
+    ws = w.sum()
+    P = lambda mask: float((w * mask).sum() / ws)
+    tot, p = h + a, {}
+    p["1"], p["X"], p["2"] = P(h > a), P(h == a), P(h < a)
+    p["1X"], p["X2"], p["12"] = p["1"] + p["X"], p["X"] + p["2"], p["1"] + p["2"]
+    p["BTTS_Y"] = P((h > 0) & (a > 0))
+    p["BTTS_N"] = 1 - p["BTTS_Y"]
+    for L in GOAL_LINES:
+        p[f"O{L:g}"] = P(tot > L)
+        p[f"U{L:g}"] = 1 - p[f"O{L:g}"]
+    for L in TEAM_LINES:
+        p[f"H_O{L:g}"], p[f"H_U{L:g}"] = P(h > L), 1 - P(h > L)
+        p[f"A_O{L:g}"], p[f"A_U{L:g}"] = P(a > L), 1 - P(a > L)
+    for L in HT_LINES:
+        p[f"HT_O{L:g}"] = P((hh + ah) > L)
+        p[f"HT_U{L:g}"] = 1 - p[f"HT_O{L:g}"]
+    r = 35.0
+    tc = rng.gamma(40.0, 1 / 40.0, n)
+    ch = rng.negative_binomial(r, r / (r + mu_ch * tc))
+    ca = rng.negative_binomial(r, r / (r + mu_ca * tc))
+    ct = ch + ca
+    for L in CORNER_LINES:
+        p[f"C_O{L:g}"] = P(ct > L)
+        p[f"C_U{L:g}"] = 1 - p[f"C_O{L:g}"]
+    code = np.clip(h, 0, 9) * 10 + np.clip(a, 0, 9)
+    cnt = np.bincount(code, weights=w, minlength=100)
+    top = np.argsort(-cnt)[:3]
+    return {"p": p, "exp_goals": float((w * tot).sum() / ws), "exp_corners": float((w * ct).sum() / ws),
+            "top_scores": [f"{int(c // 10)}-{int(c % 10)}" for c in top]}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Market blending, trap analysis, legs
+# ═════════════════════════════════════════════════════════════════════════════
+def _devig(odds_map, keys):
+    if all(k in odds_map for k in keys):
+        inv = [1 / odds_map[k]["odds"] for k in keys]
+        s = sum(inv)
+        return {k: i / s for k, i in zip(keys, inv)}
+    return None
+
+
+def blend_probs(model_p, odds_map, w_model):
+    p, mkt_1x2 = dict(model_p), None
+    d = _devig(odds_map, ["1", "X", "2"])
+    if d:
+        b = {k: w_model * model_p[k] + (1 - w_model) * d[k] for k in ("1", "X", "2")}
+        s = sum(b.values())
+        b = {k: v / s for k, v in b.items()}
+        p.update(b)
+        p["1X"], p["X2"], p["12"] = b["1"] + b["X"], b["X"] + b["2"], b["1"] + b["2"]
+        mkt_1x2 = d
+    pairs = [("BTTS_Y", "BTTS_N")]
+    for pre, lines in (("", GOAL_LINES), ("H_", TEAM_LINES), ("A_", TEAM_LINES), ("HT_", HT_LINES), ("C_", CORNER_LINES)):
+        pairs += [(f"{pre}O{L:g}", f"{pre}U{L:g}") for L in lines]
+    for a_, b_ in pairs:
+        if a_ in model_p:
+            dd = _devig(odds_map, [a_, b_])
+            if dd:
+                p[a_] = w_model * model_p[a_] + (1 - w_model) * dd[a_]
+                p[b_] = 1 - p[a_]
+    return p, mkt_1x2
+
+
+def h2h_summary(h2h):
+    if len(h2h) < 3:
+        return None
+    w = sum(1 for x in h2h if x["gf"] > x["ga"])
+    d = sum(1 for x in h2h if x["gf"] == x["ga"])
+    return {"n": len(h2h), "w": w, "d": d, "l": len(h2h) - w - d, "g": float(np.mean([x["gf"] + x["ga"] for x in h2h]))}
+
+
+def trap_analysis(m):
+    mp, mk = m["model_p"], m.get("mkt_1x2")
+    ref = mk or {k: mp[k] for k in ("1", "X", "2")}
+    fav = max(("1", "2"), key=lambda k: ref[k])
+    fp = ref[fav]
+    if fp < 0.52:
+        return {"risk": 8, "fav": None, "reasons": ["no clear favourite"]}
+    fav_home = fav == "1"
+    pf, pu = (m["ph"], m["pa"]) if fav_home else (m["pa"], m["ph"])
+    risk, why = 0, []
+    gap = fp - mp[fav]
+    if gap >= 0.14:
+        risk += 35; why.append(f"mkt{_pct(fp)}/mdl{_pct(mp[fav])}")
+    elif gap >= 0.08:
+        risk += 22; why.append(f"mkt{_pct(fp)}/mdl{_pct(mp[fav])}")
+    elif gap >= 0.05:
+        risk += 10; why.append(f"mkt{_pct(fp)}/mdl{_pct(mp[fav])}")
+    if pf.get("n", 0) >= 4 and pf["ppg5"] < 1.4 and fp >= 0.6:
+        risk += 15; why.append(f"fav ppg{pf['ppg5']:.1f}")
+    if pu.get("n", 0) >= 4 and pu["ppg5"] >= 1.8:
+        risk += 10; why.append(f"dog ppg{pu['ppg5']:.1f}")
+    keyout = [i for i in pf.get("inj", []) if i["key"] and i["type"] == "Missing Fixture"]
+    if keyout:
+        risk += min(20, 8 * len(keyout)); why.append(f"{len(keyout)} fav key out")
+    if (pf.get("lineup") or {}).get("rotation"):
+        risk += 15; why.append("fav rotated XI")
+    h = m.get("h2h")
+    if h and h["n"] >= 4:
+        fav_unbeaten = (h["w"] + h["d"]) if fav_home else (h["l"] + h["d"])
+        dog_unbeaten = h["n"] - (h["w"] if fav_home else h["l"])
+        if dog_unbeaten / h["n"] >= 0.6:
+            risk += 10; why.append(f"H2H dog unbeaten {dog_unbeaten}/{h['n']}")
+    if not fav_home and fp >= 0.6:
+        risk += 8; why.append("away fav")
+    if mp["X"] >= 0.27:
+        risk += 10; why.append(f"X{_pct(mp['X'])}%")
+    lam_f = m["lam_h"] if fav_home else m["lam_a"]
+    if lam_f < 1.5 and fp >= 0.62:
+        risk += 10; why.append("fav low xG")
+    dog_st = m.get("st_a") if fav_home else m.get("st_h")
+    if fav_home is False and dog_st and dog_st.get("rank") and dog_st.get("of") and dog_st["rank"] > dog_st["of"] - 4:
+        risk += 8; why.append("home dog in drop zone")
+    lname = (m.get("league") or "").lower()
+    if "friendl" in lname:
+        risk += 20; why.append("friendly")
+    elif "cup" in lname or "copa" in lname or "pokal" in lname or "coppa" in lname:
+        risk += 8; why.append("cup rotation")
+    return {"risk": int(min(100, risk)), "fav": fav, "reasons": why[:4]}
+
+
+def data_quality(m):
+    dq = 0.0
+    dq += 0.25 if m.get("odds") else 0
+    dq += 0.20 if m.get("pred") else 0
+    dq += 0.20 if m["ph"].get("n", 0) >= 5 and m["pa"].get("n", 0) >= 5 else (0.10 if m["ph"].get("n", 0) >= 3 else 0)
+    dq += 0.10 if m.get("h2h") else 0
+    dq += 0.10 if m.get("corner_n", 0) >= 3 else 0
+    dq += 0.05 if m.get("inj_known") else 0
+    dq += 0.05 if (m["ph"].get("lineup") and m["pa"].get("lineup")) else 0
+    dq += 0.05 if m.get("st_h") else 0
+    return round(min(1.0, dq), 2)
+
+
+def leg_label(key, m):
+    h, a = m["home"], m["away"]
+    fixed = {"1": f"{h} to win", "X": "Draw", "2": f"{a} to win", "1X": f"{h} or Draw", "X2": f"Draw or {a}",
+             "12": "Either team to win", "BTTS_Y": "Both teams score - Yes", "BTTS_N": "Both teams score - No"}
+    if key in fixed:
+        return fixed[key]
+    m_ = re.match(r"(H_|A_|HT_|C_)?(O|U)([\d.]+)$", key)
+    if m_:
+        pre, ou, line = m_.groups()
+        word = "Over" if ou == "O" else "Under"
+        return {None: f"{word} {line} goals", "H_": f"{h} {word} {line} goals", "A_": f"{a} {word} {line} goals",
+                "HT_": f"1st half {word} {line} goals", "C_": f"{word} {line} corners"}[pre]
+    return key
+
+
+def _family(key):
+    if key in ("1", "X", "2", "1X", "X2", "12"):
+        return "RES"
+    if key.startswith("BTTS"):
+        return "BTTS"
+    pre = re.match(r"(H_|A_|HT_|C_)?", key).group(1) or "G"
+    return pre + ("O" if "O" in key.split("_")[-1][:1] else "U")
+
+
+def build_legs(m, allow_est=False, corners_ok_min=3):
+    fav, risk = m["trap"]["fav"], m["trap"]["risk"]
+    dq = m["dq"]
+    legs = []
+    for key, p in m["p"].items():
+        if key.startswith("C_") and m.get("corner_n", 0) < corners_ok_min:
+            continue
+        o = m["odds"].get(key)
+        src = "book"
+        if o:
+            odds = o["odds"]
+        elif allow_est:
+            odds, src = round(max(1.05, 0.93 / max(p, 0.05)), 2), "est"
+        else:
+            continue
+        if not (MIN_LEG_ODDS <= odds <= MAX_LEG_ODDS):
+            continue
+        pen = 0.05 * (1 - dq)
+        if fav and key == fav:
+            pen += 0.25 * risk / 100
+        elif fav and key == ("1X" if fav == "1" else "X2"):
+            pen += 0.10 * risk / 100
+        elif risk:
+            pen += 0.03 * risk / 100
+        if "friendl" in (m.get("league") or "").lower():
+            pen += 0.03
+        p_adj = p - pen
+        if p_adj < MIN_LEG_P:
+            continue
+        edge = p * odds - 1
+        eadj = float(np.clip(p_adj * odds - 1, -0.2, 0.15))
+        legs.append({"key": key, "label": leg_label(key, m), "p": float(p), "p_adj": float(p_adj), "odds": float(odds),
+                     "edge": float(edge), "src": src, "rank": float(p_adj + 0.5 * eadj), "fam": _family(key)})
+    legs.sort(key=lambda x: -x["rank"])
+    chosen, fams = [], set()
+    for lg in legs:
+        if lg["fam"] in fams:
+            continue
+        chosen.append(lg)
+        fams.add(lg["fam"])
+        if len(chosen) >= 6:
+            break
+    return chosen
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Data collection pipeline
+# ═════════════════════════════════════════════════════════════════════════════
+def shortlist_matches(cands, max_n, force_leagues):
+    buckets = defaultdict(list)
+    forced = [c for c in cands if c["league_id"] in force_leagues]
+    for c in cands:
+        if c not in forced:
+            buckets[c["cat"]].append(c)
+    order = list(TOP_LEAGUES)
+    for cat, lst in buckets.items():
+        lst.sort(key=lambda c: (order.index(c["league_id"]) if c["league_id"] in order else 99, c["ts"]))
+    picked = list(forced)[:max_n]
+    for cat in ("TOP", "INTL", "MID", "LOW"):
+        take = math.ceil(CAT_QUOTA[cat] * max_n)
+        for c in buckets[cat][:take]:
+            if len(picked) < max_n:
+                picked.append(c)
+    for cat in ("TOP", "MID", "INTL", "LOW"):
+        for c in buckets[cat]:
+            if len(picked) >= max_n:
+                break
+            if c not in picked:
+                picked.append(c)
+    return picked
+
+
+def estimate_calls(matches, deep):
+    leagues = len({m["league_id"] for m in matches})
+    return 2 + leagues * (2 if deep else 1) + len(matches) * (3.7 if deep else 3.2)
+
+
+def collect_day(api, cfg, log, progress):
+    out = {"warnings": [], "matches": [], "raw_count": 0, "cat_counts": {}, "plan": None}
+    date_str, tz, force = cfg["date"], cfg["tz"], cfg["force"]
+    ttl = lambda t: 0 if force else t
+
+    stt = api.status()
+    out["plan"] = stt
+    if stt.get("errors") and not stt.get("plan"):
+        out["warnings"].append(f"API status problem: {stt.get('errors')}")
+    if api.remaining is not None and api.remaining <= 5:
+        out["warnings"].append("API daily quota almost exhausted - results will be cached-only.")
+    budget = min(cfg["max_calls"], api.remaining if api.remaining is not None else cfg["max_calls"])
+
+    log(f"📥 Fetching all fixtures for {date_str} ({tz})...")
+    fx_raw = api.resp("/fixtures", {"date": date_str, "timezone": tz}, ttl=ttl(900))
+    out["raw_count"] = len(fx_raw)
+    fixtures = [parse_fixture(f) for f in fx_raw]
+    fixtures = [f for f in fixtures if f["status"] in UPCOMING_OK and f["home_id"] and f["away_id"]]
+    if cfg["exclude_minor"]:
+        fixtures = [f for f in fixtures if not LEAGUE_EXCLUDE_RE.search(f["league"] or "")
+                    and not TEAM_EXCLUDE_RE.search(f["home"] or "") and not TEAM_EXCLUDE_RE.search(f["away"] or "")]
+    out["cat_counts"] = dict(pd.Series([f["cat"] for f in fixtures]).value_counts()) if fixtures else {}
+    log(f"   {out['raw_count']} fixtures on the day, {len(fixtures)} upcoming & eligible {out['cat_counts']}")
+    if not fixtures:
+        out["warnings"].append("No eligible upcoming fixtures found. " + ("; ".join(api.errors[-3:]) if api.errors else ""))
+        return out
+    progress(0.06)
+
+    # ── budget-aware shortlist ──
+    deep = cfg["depth"] == "Full" or (cfg["depth"] == "Auto" and budget >= 150)
+    n = min(cfg["max_matches"], len(fixtures))
+    sl = shortlist_matches(fixtures, n, cfg["force_leagues"])
+    while n > 6 and estimate_calls(sl, deep) > budget * 0.95:
+        n -= 1
+        sl = shortlist_matches(fixtures, n, cfg["force_leagues"])
+    if estimate_calls(sl, deep) > budget * 0.95 and deep:
+        deep = False
+        n = min(cfg["max_matches"], len(fixtures))
+        sl = shortlist_matches(fixtures, n, cfg["force_leagues"])
+        while n > 6 and estimate_calls(sl, deep) > budget * 0.95:
+            n -= 1
+            sl = shortlist_matches(fixtures, n, cfg["force_leagues"])
+    out["deep"], out["budget"] = deep, budget
+    log(f"🎯 Shortlisted {len(sl)} matches | depth={'FULL' if deep else 'LITE'} | est. API calls ~{estimate_calls(sl, deep):.0f} of budget {budget}")
+    if len(sl) < 15:
+        out["warnings"].append(f"Only {len(sl)} matches fit the API budget/eligibility; 3 distinct 5-leg tickets need 15 - some matches may be reused across tickets.")
+
+    # ── bulk: injuries by date ──
+    log("🩹 Fetching injuries & suspensions...")
+    inj_by = defaultdict(list)
+    inj_raw = api.resp("/injuries", {"date": date_str, "timezone": tz}, ttl=ttl(3600))
+    for i in inj_raw:
+        inj_by[((i.get("fixture") or {}).get("id"), (i.get("team") or {}).get("id"))].append(i)
+    inj_known = bool(inj_raw)
+    progress(0.10)
+
+    # ── bulk: odds per league ──
+    log("💰 Fetching bookmaker odds (all bookmakers, median/preferred)...")
+    odds_by = {}
+    leagues = {(m["league_id"], m["season"]) for m in sl}
+    with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+        futs = {ex.submit(api.pages, "/odds", {"league": lid, "season": s, "date": date_str, "timezone": tz}, ttl(1200), 3): lid
+                for lid, s in leagues}
+        for fu in as_completed(futs):
+            try:
+                for item in fu.result():
+                    fid = (item.get("fixture") or {}).get("id")
+                    if fid:
+                        odds_by[fid] = parse_odds_item(item, cfg["bookmaker"])
+            except Exception as e:
+                api.errors.append(f"odds: {e}")
+    log(f"   odds found for {sum(1 for m in sl if m['id'] in odds_by)}/{len(sl)} matches")
+    progress(0.20)
+
+    # ── per-match core: predictions + last-10 (both teams) ──
+    log("📊 Fetching predictions, form (last 10) and H2H for each match...")
+    core = {}
+
+    def fetch_core(m):
+        pred = parse_predictions(api.resp("/predictions", {"fixture": m["id"]}, ttl=ttl(6 * 3600)))
+        rh = parse_results(api.resp("/fixtures", {"team": m["home_id"], "last": 10, "timezone": tz}, ttl=ttl(3 * 3600)), m["home_id"])
+        ra = parse_results(api.resp("/fixtures", {"team": m["away_id"], "last": 10, "timezone": tz}, ttl=ttl(3 * 3600)), m["away_id"])
+        h2h = parse_h2h(pred["h2h"], m["home_id"]) if pred else []
+        return m["id"], {"pred": pred, "rh": rh, "ra": ra, "h2h": h2h}
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+        futs = [ex.submit(fetch_core, m) for m in sl]
+        for fu in as_completed(futs):
+            try:
+                fid, c = fu.result()
+                core[fid] = c
+            except Exception as e:
+                api.errors.append(f"core: {e}")
+            done += 1
+            progress(0.20 + 0.35 * done / len(sl))
+    # H2H fallback only when budget remains
+    if deep:
+        for m in sl:
+            c = core.get(m["id"])
+            if c and len(c["h2h"]) < 3 and (api.remaining is None or api.remaining > 40) and not api.quota_out:
+                resp = api.resp("/fixtures/headtohead", {"h2h": f"{m['home_id']}-{m['away_id']}", "last": 8}, ttl=ttl(24 * 3600))
+                c["h2h"] = parse_h2h(resp, m["home_id"])
+
+    # ── batched history stats (corners, shots, xG, player ratings) + upcoming lineups ──
+    hist, upc = {}, {}
+    if deep:
+        log("🧮 Batch-fetching statistics, player ratings & lineups (fixtures?ids=)...")
+        hist_ids, up_ids = set(), [m["id"] for m in sl]
+        for c in core.values():
+            for r in (c["rh"][:5] + c["ra"][:5]):
+                hist_ids.add(r["id"])
+        def batch(ids, ttl_s):
+            ids = sorted(ids)
+            chunks = [ids[i:i + 20] for i in range(0, len(ids), 20)]
+            res = {}
+            with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+                for fu in as_completed([ex.submit(api.resp, "/fixtures", {"ids": "-".join(map(str, c_))}, ttl_s) for c_ in chunks]):
+                    for f in fu.result():
+                        res[f["fixture"]["id"]] = f
+            return res
+        hist = batch(hist_ids, ttl(6 * 3600))
+        progress(0.75)
+        upc = batch(up_ids, ttl(600))
+        # ── standings ──
+        st_by = {}
+        with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+            futs = {ex.submit(api.resp, "/standings", {"league": lid, "season": s}, ttl(12 * 3600)): lid for lid, s in leagues}
+            for fu in as_completed(futs):
+                try:
+                    st_by[futs[fu]] = parse_standings(fu.result())
+                except Exception:
+                    st_by[futs[fu]] = {}
+    else:
+        st_by = {}
+    progress(0.85)
+
+    # ── build match objects ──
+    log("🧠 Building profiles and running Monte Carlo simulations...")
+    for m in sl:
+        c = core.get(m["id"]) or {"pred": None, "rh": [], "ra": [], "h2h": []}
+        hs_h = team_history_stats(m["home_id"], [r["id"] for r in c["rh"][:5]], hist)
+        hs_a = team_history_stats(m["away_id"], [r["id"] for r in c["ra"][:5]], hist)
+        lus = {((l.get("team") or {}).get("id")): l for l in (upc.get(m["id"]) or {}).get("lineups") or []}
+        ph = build_profile(m["home_id"], c["rh"], hs_h, inj_by.get((m["id"], m["home_id"])), lus.get(m["home_id"]))
+        pa = build_profile(m["away_id"], c["ra"], hs_a, inj_by.get((m["id"], m["away_id"])), lus.get(m["away_id"]))
+        lam_h, lam_a, _ = estimate_lambdas(c["pred"], ph, pa)
+        mu_ch, mu_ca, cn = estimate_corners(ph, pa, lam_h, lam_a)
+        seed = int(m["id"]) % (2 ** 31)
+        mc = monte_carlo(lam_h, lam_a, mu_ch, mu_ca, n=cfg["sims"], seed=seed)
+        odds = odds_by.get(m["id"], {})
+        p_bl, mkt = blend_probs(mc["p"], odds, cfg["w_model"])
+        sth = (st_by.get(m["league_id"]) or {}).get(m["home_id"])
+        sta = (st_by.get(m["league_id"]) or {}).get(m["away_id"])
+        rec = dict(m, ph=ph, pa=pa, pred=c["pred"], h2h=h2h_summary(c["h2h"]), lam_h=lam_h, lam_a=lam_a,
+                   model_p=mc["p"], p=p_bl, mkt_1x2=mkt, odds=odds, exp_goals=mc["exp_goals"],
+                   exp_corners=mc["exp_corners"], top_scores=mc["top_scores"], corner_n=cn,
+                   st_h=sth, st_a=sta, inj_known=inj_known)
+        rec["trap"] = trap_analysis(rec)
+        rec["dq"] = data_quality(rec)
+        out["matches"].append(rec)
+    progress(0.90)
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Evidence pack for the AI (hard token budget)
+# ═════════════════════════════════════════════════════════════════════════════
+SYSTEM_PROMPT = """You are two people at once: head of trading at a sharp sportsbook (you know exactly how prices are shaded to punish public money) and a professional quantitative analyst. Python already collected the day's football data and ran a 40,000-run Monte Carlo per match (Poisson goals, shared-tempo variance, Dixon-Coles correction, negative-binomial corners), then blended it with de-vigged bookmaker prices. Audit that evidence and build THREE separate accumulators of 5 legs.
+
+DATA KEY: xG=model expected goals home-away; mdl=model 1X2 %; mkt=bookmaker 1/X/2 prices; API=third-party win %; BTTS/O/U/corners = blended probabilities %; H/A lines = form (oldest>newest), ppg=points per game (last5), gf/ga=weighted goals for/against, rt=avg player rating, rk=table rank; H2H=W-D-L from home team's view + goals/game; inj=missing/doubtful (*=key starter, F/M/D/G=position); lu=formation, ? = not released, ROT=key starters benched; star=in-form players; dq=data quality 0-1; TRAP=Python trap score 0-100 + reasons. LEGS: id@decimal_odds/p=blended probability %/e=edge %.
+
+HARD RULES
+1. Pick legs ONLY by exact id from LEGS lists. Never invent legs/odds/matches. Python recomputes odds and rejects invalid picks.
+2. Exactly 3 tickets x 5 legs; 5 different matches per ticket; 15 different matches overall (no match reused) unless fewer are usable.
+3. Each ticket's combined odds (product of leg odds) must be >= 3.50; aim 3.5-4.6. Reach it with well-priced SAFE legs, never by adding a fragile leg.
+4. Maximise each ticket's win probability (product of p) subject to rule 3. Prefer p>=75; accept 65-74 only with strong evidence.
+5. Ticket 1 = safest possible, Ticket 2 = balanced, Ticket 3 = best value (positive edge) but still solid.
+
+HOW TO REASON
+- Price vs model: if mkt and mdl differ by >8 pts, explain it with hard evidence (injuries, lineups, form, motivation, rotation). No evidence = trust the market. A big + edge on a short price is usually model error, not a gift.
+- TRAP DETECTION: books profit most when the obvious favourite in a big game fails. TRAP>=45 = suspect, 30-44 = watch. Signals: favourite shorter than model says, favourite in poor form, key starters out or rotated, dangerous underdog (form/H2H), away favourite, draw prob >=27%, cups/friendlies/dead rubbers, relegation-threatened home side. For a suspect NEVER use the favourite-win leg: skip the match, or use a leg that survives the trap (draw-covering double chance on the underdog side, goals-market leg, Under/BTTS-No) only if p is high and evidence supports it. Apply your own judgement to matches Python scored low too.
+- Failure test per leg: name the scenario that loses it (early red, 1-0 low block, rotation, tempo) and judge how common it is. Reject legs whose losing scenario is common.
+- Goals logic: Over1.5 solid at total xG>=2.6; Over2.5 needs >=3.0; Under needs total xG<=2.3 with weak attacks; BTTS-No needs a side with xG<=0.9; team over1.5 needs own xG>=1.9. Corners follow attacking volume; use only with dq>=0.6.
+- Diversify market types and leagues; avoid five Overs or five favourites; do not stack legs with the same failure mode. Categories: TOP=major leagues, MID, INTL=international/continental, LOW=thin data (needs extra margin). Low dq (<0.6), unreleased lineups near kickoff, friendlies need extra margin or exclusion.
+
+OUTPUT: ONE JSON object only, no markdown, all reasoning inside these fields, terse:
+{"tickets":[{"name":"Ticket 1 - Safest","legs":[{"id":"m3.1X","why":"<=14 words of evidence"}, ...5 legs],"logic":"<=40 words: why these five together, what could break it","risk":"LOW|MED"}, ...3 tickets],"traps":[{"id":"m5","note":"<=20 words: trap read + action"}],"avoid":[{"id":"m9","why":"<=12 words"}],"summary":"<=50 words overall slate read"}"""
+
+
+def format_match_block(mid, m, n_legs, tz):
+    p = m["p"]
+    ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
+    ph, pa = m["ph"], m["pa"]
+    mk = m.get("mkt_1x2")
+    mk_txt = "/".join(f"{m['odds'][k]['odds']:.2f}" for k in ("1", "X", "2")) if all(k in m["odds"] for k in ("1", "X", "2")) else "n/a"
+    api_txt = "/".join(str(int(x)) if x is not None else "?" for x in (m["pred"] or {}).get("pct", [None] * 3)) if m["pred"] else "n/a"
+
+    def side(pr, lab):
+        if not pr.get("n"):
+            return f"{lab} n/a"
+        rt = f" rt{pr['team_rating']:.1f}" if pr.get("team_rating") else ""
+        return f"{lab} {pr['form5']} ppg{pr['ppg5']:.1f} gf{pr['gf_w']:.1f} ga{pr['ga_w']:.1f}{rt}"
+
+    def inj(pr):
+        items = [f"{_short((i['name'] or '?').split(' ')[-1], 10)}{'*' if i['key'] else ''}({i['pos'] or '?'}){'?' if i['type'] != 'Missing Fixture' else ''}" for i in pr.get("inj", [])[:4]]
+        return ",".join(items) if items else "-"
+
+    def lu(pr):
+        l = pr.get("lineup")
+        return "?" if not l else (l["formation"] or "ok") + ("ROT" if l["rotation"] else "")
+
+    def star(pr):
+        return ",".join(f"{_short(s['name'].split(' ')[-1], 9)}{s['rating']:.1f}" for s in pr.get("stars", [])[:1]) or "-"
+
+    rk = f" rk{m['st_h']['rank']}/{m['st_a']['rank']}" if m.get("st_h") and m.get("st_a") else ""
+    h2 = f"H2H{m['h2h']['n']} {m['h2h']['w']}-{m['h2h']['d']}-{m['h2h']['l']} g{m['h2h']['g']:.1f}" if m.get("h2h") else "H2H n/a"
+    corn = f" | crn{m['exp_corners']:.1f} O9.5:{_pct(p['C_O9.5'])}" if m.get("corner_n", 0) >= 3 else ""
+    t = m["trap"]
+    trap = f"TRAP{t['risk']}: {', '.join(t['reasons'])}" if t["risk"] >= 25 else f"TRAP{t['risk']}"
+    legs = " ; ".join(f"{mid}.{l['key']}@{l['odds']:.2f}/p{_pct(l['p'])}/e{l['edge'] * 100:+.0f}" for l in m["legs"][:n_legs])
+    return (f"#{mid} {m['cat']}|{_short(m['league'], 18)} {_short(m['home'], 15)} v {_short(m['away'], 15)} {ko} dq{m['dq']}\n"
+            f"xG {m['lam_h']:.2f}-{m['lam_a']:.2f} mdl {_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])} mkt {mk_txt} API {api_txt}"
+            f" | BTTS{_pct(p['BTTS_Y'])} O1.5:{_pct(p['O1.5'])} O2.5:{_pct(p['O2.5'])} O3.5:{_pct(p['O3.5'])}{corn}\n"
+            f"{side(ph, 'H')} | {side(pa, 'A')}{rk} | {h2}\n"
+            f"inj H:{inj(ph)} A:{inj(pa)} | lu H:{lu(ph)} A:{lu(pa)} | star H:{star(ph)} A:{star(pa)}\n"
+            f"{trap}\nLEGS {legs}")
+
+
+def est_tokens(text, cpt):
+    return int(len(text) / cpt) + 1
+
+
+def build_ai_pack(matches, tz, cpt, n_ai):
+    """Choose matches + legs-per-match so that prompt + reserved completion <= 8,000 tokens."""
+    usable = [m for m in matches if m["legs"]]
+    usable.sort(key=lambda m: -(sum(l["rank"] for l in m["legs"][:2]) / min(2, len(m["legs"]))))
+    top = usable[:n_ai]
+    # make sure trap-suspect matches are visible to the AI even if their legs rank low
+    flagged = sorted([m for m in matches if m["trap"]["risk"] >= 45 and m not in top], key=lambda m: -m["trap"]["risk"])[:2]
+    prompt_cap = TOTAL_TOKEN_BUDGET - OUTPUT_RESERVE - TOKEN_SAFETY
+    sys_tok = est_tokens(SYSTEM_PROMPT, cpt)
+    for n_legs in (5, 4, 3, 2):
+        for n in range(len(top), max(0, min(15, len(top)) - 1), -1):
+            sel = top[:n]
+            if flagged and n >= 4:
+                sel = top[:n - len(flagged)] + flagged
+            ids = {id(m): f"m{i + 1}" for i, m in enumerate(sel)}
+            blocks = [format_match_block(ids[id(m)], m, n_legs, tz) for m in sel]
+            head = f"SLATE: {len(sel)} pre-screened matches (of {len(matches)} analysed). Build 3 tickets from these LEGS only.\n\n"
+            user = head + "\n\n".join(blocks)
+            if sys_tok + est_tokens(user, cpt) <= prompt_cap:
+                return sel, {ids[id(m)]: m for m in sel}, user, n_legs
+    sel = top[:12]
+    ids = {id(m): f"m{i + 1}" for i, m in enumerate(sel)}
+    user = "SLATE:\n\n" + "\n\n".join(format_match_block(ids[id(m)], m, 2, tz) for m in sel)
+    return sel, {ids[id(m)]: m for m in sel}, user, 2
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Groq (budgeted, model fallback)
+# ═════════════════════════════════════════════════════════════════════════════
+class TokenBudget:
+    def __init__(self, total):
+        self.total, self.used = total, 0
+
+    @property
+    def remaining(self):
+        return self.total - self.used
+
+
+def _parse_json(content):
+    content = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.I)
+    content = re.sub(r"\s*```$", "", content).strip()
+    for cand in (content, content[content.find("{"): content.rfind("}") + 1] if "{" in content else ""):
+        if not cand:
+            continue
+        try:
+            return json.loads(re.sub(r",\s*([}\]])", r"\1", cand))
+        except Exception:
+            continue
+    return None
+
+
+def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None):
+    api_key = get_secret("GROQ_API_KEY", "").strip()
+    log = []
+    if not api_key:
+        return None, {"status": "MISSING_KEY", "attempts": log, "prompt_tokens": 0, "completion_tokens": 0}
+    est_prompt = est_tokens(system_prompt + user_prompt, cpt)
+    info = {"attempts": log, "model": None, "prompt_tokens": 0, "completion_tokens": 0}
+    for model in GROQ_MODELS:
+        cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
+        cap = min(cfg["max_completion_tokens"], budget.remaining - est_prompt - 60)
+        if cap < MIN_COMPLETION:
+            log.append({"model": model, "status": f"SKIPPED_BUDGET(cap={cap})"})
+            continue
+        for attempt in range(2):
+            payload = {"model": model, "temperature": 0.2, "max_completion_tokens": int(cap),
+                       "response_format": {"type": "json_object"},
+                       "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]}
+            eff = effort or cfg.get("reasoning_effort")
+            if cfg.get("supports_reasoning_effort") and eff:
+                payload["reasoning_effort"] = eff if model.startswith("openai/") or eff == "none" else "none"
+                if model.startswith("openai/"):
+                    payload["include_reasoning"] = False
+            try:
+                r = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=GROQ_TIMEOUT)
+            except Exception as e:
+                log.append({"model": model, "status": f"NETWORK {str(e)[:60]}"})
+                time.sleep(2)
+                continue
+            if r.status_code == 429:
+                log.append({"model": model, "status": "RATE_LIMIT_429"})
+                break
+            if r.status_code in NON_RETRYABLE:
+                log.append({"model": model, "status": f"HTTP_{r.status_code} {r.text[:80]}"})
+                break
+            if r.status_code != 200:
+                log.append({"model": model, "status": f"HTTP_{r.status_code}_RETRY"})
+                time.sleep(2.5 * (attempt + 1))
+                continue
+            d = r.json()
+            u = d.get("usage") or {}
+            pt, ct = u.get("prompt_tokens", est_prompt), u.get("completion_tokens", 0)
+            budget.used += u.get("total_tokens", pt + ct)
+            info["prompt_tokens"] += pt
+            info["completion_tokens"] += ct
+            info["actual_cpt"] = len(system_prompt + user_prompt) / max(1, pt)
+            ch = (d.get("choices") or [{}])[0]
+            content = (ch.get("message") or {}).get("content") or ""
+            parsed = _parse_json(content) if content else None
+            if parsed and parsed.get("tickets"):
+                log.append({"model": model, "status": "SUCCESS"})
+                info["model"], info["status"] = model, "SUCCESS"
+                return parsed, info
+            log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')}"})
+            break
+    info["status"] = "FAILED"
+    return None, info
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Ticket validation / repair / deterministic optimiser
+# ═════════════════════════════════════════════════════════════════════════════
+def _tprod(legs, k="odds"):
+    return float(np.prod([l[k] for l in legs])) if legs else 0.0
+
+
+def optimize_tickets(match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, min_odds=MIN_TICKET_ODDS, iters=6000, seed=11):
+    """Deterministic fallback: maximise joint probability subject to ticket odds >= min_odds."""
+    mids = [m for m, l in match_legs.items() if l]
+    mids.sort(key=lambda m: -match_legs[m][0]["rank"])
+    if len(mids) < per:
+        return []
+    need = n_tickets * per
+    strict = len(mids) >= need
+    pool = mids[: need + 6] if strict else mids
+    rnd = random.Random(seed)
+    tickets = []
+    for t in range(n_tickets):
+        if strict:
+            tickets.append([[pool[i], 0] for i in range(t, need, n_tickets)][:per])
+        else:
+            tickets.append([[pool[(t * per + j) % len(pool)], 0] for j in range(per)])
+    used = {e[0] for t in tickets for e in t}
+    def tscore(t):
+        legs = [match_legs[m][i] for m, i in t]
+        lp = sum(math.log(l["p_adj"]) for l in legs)
+        lo = sum(math.log(l["odds"]) for l in legs)
+        fam = defaultdict(int)
+        for l in legs:
+            fam[l["fam"]] += 1
+        div = -0.06 * sum(max(0, c - 2) for c in fam.values())
+        return lp - 40 * max(0.0, math.log(min_odds) - lo) + div
+    def total():
+        return sum(tscore(t) for t in tickets)
+    best = total()
+    for _ in range(iters):
+        mv = rnd.random()
+        a = rnd.randrange(len(tickets))
+        ia = rnd.randrange(len(tickets[a]))
+        old = [list(map(list, t)) for t in tickets]
+        if mv < 0.4 and len(tickets) > 1:
+            b = rnd.randrange(len(tickets))
+            ib = rnd.randrange(len(tickets[b]))
+            tickets[a][ia], tickets[b][ib] = tickets[b][ib], tickets[a][ia]
+            if len({e[0] for e in tickets[a]}) < len(tickets[a]) or len({e[0] for e in tickets[b]}) < len(tickets[b]):
+                tickets = old
+                continue
+        elif mv < 0.75:
+            m_ = tickets[a][ia][0]
+            tickets[a][ia][1] = rnd.randrange(len(match_legs[m_]))
+        else:
+            free = [m for m in pool if m not in used] if strict else [m for m in pool if m not in {e[0] for e in tickets[a]}]
+            if not free:
+                continue
+            new = rnd.choice(free)
+            tickets[a][ia] = [new, 0]
+        sc = total()
+        if sc >= best:
+            best = sc
+            used = {e[0] for t in tickets for e in t}
+        else:
+            tickets = old
+    return [[dict(match_legs[m][i], mid=m) for m, i in t] for t in tickets]
+
+
+def enforce_min_odds(legs, match_legs, used, min_odds=MIN_TICKET_ODDS):
+    fixed = False
+    for _ in range(12):
+        if _tprod(legs) >= min_odds:
+            break
+        cur = {l["mid"] for l in legs}
+        best, best_s = None, 0
+        for i, l in enumerate(legs):
+            opts = [dict(x, mid=l["mid"]) for x in match_legs.get(l["mid"], []) if x["odds"] > l["odds"]]
+            for mid, lst in match_legs.items():
+                if mid not in used and mid not in cur:
+                    opts += [dict(x, mid=mid) for x in lst if x["odds"] > l["odds"]]
+            for o in opts:
+                gain = math.log(o["odds"] / l["odds"])
+                loss = max(1e-4, math.log(l["p_adj"]) - math.log(o["p_adj"])) + 0.02
+                s = gain / loss
+                if s > best_s:
+                    best, best_s = (i, o), s
+        if not best:
+            break
+        legs[best[0]] = dict(best[1], why=legs[best[0]].get("why", ""), swapped=True)
+        fixed = True
+    return legs, fixed
+
+
+def finalize_tickets(ai, leg_index, match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET):
+    raw = (ai or {}).get("tickets") or []
+    fallback = None
+    used, tickets = set(), []
+    for ti in range(n_tickets):
+        t = raw[ti] if ti < len(raw) and isinstance(raw[ti], dict) else {}
+        legs, repaired = [], False
+        for it in t.get("legs") or []:
+            lid = (it.get("id") if isinstance(it, dict) else str(it)) or ""
+            lg = leg_index.get(lid.strip().lower())
+            if not lg or lg["mid"] in used or lg["mid"] in {l["mid"] for l in legs}:
+                repaired = True
+                continue
+            legs.append(dict(lg, why=(it.get("why", "") if isinstance(it, dict) else "")))
+        legs = legs[:per]
+        if len(legs) < per:
+            repaired = True
+            if fallback is None:
+                fallback = optimize_tickets(match_legs)
+            pool_ = [l for tk in fallback for l in tk]
+            pool_ += [dict(x, mid=k) for k, v in match_legs.items() for x in v[:3]]
+            while len(legs) < per:
+                cur_m = {x["mid"] for x in legs}
+                avail = [c for c in pool_ if c["mid"] not in used and c["mid"] not in cur_m]
+                if not avail:
+                    break
+                cur, need = max(_tprod(legs), 1.0), per - len(legs)
+                target = (MIN_TICKET_ODDS * 1.03 / cur) ** (1 / need) if cur < MIN_TICKET_ODDS * 1.03 else 1.15
+                c = max(avail, key=lambda x: x["rank"] - 0.4 * max(0.0, math.log(x["odds"] / (target * 1.15))))
+                legs.append(dict(c, why="Python fill-in (AI leg invalid/duplicate)"))
+        legs, up = enforce_min_odds(legs, match_legs, used)
+        repaired = repaired or up
+        used |= {l["mid"] for l in legs}
+        tickets.append({"name": t.get("name") or TICKET_LABELS[ti], "legs": legs, "logic": t.get("logic", ""),
+                        "risk": t.get("risk", ""), "repaired": repaired, "odds": _tprod(legs),
+                        "p_joint": _tprod(legs, "p"), "valid": len(legs) == per and _tprod(legs) >= MIN_TICKET_ODDS})
+    return tickets
+
+
+def python_only_tickets(match_legs):
+    tks = optimize_tickets(match_legs)
+    out = []
+    for i, legs in enumerate(tks):
+        for l in legs:
+            l["why"] = f"p{_pct(l['p'])}% odds {l['odds']:.2f}"
+        out.append({"name": TICKET_LABELS[i], "legs": legs, "risk": "", "repaired": False, "odds": _tprod(legs),
+                    "p_joint": _tprod(legs, "p"), "valid": _tprod(legs) >= MIN_TICKET_ODDS,
+                    "logic": "Deterministic Python optimiser (AI unavailable): maximises joint probability with trap/data-quality penalties and odds >= 3.5."})
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Telegram
+# ═════════════════════════════════════════════════════════════════════════════
+def send_telegram(text):
+    tok, chat = get_secret("TELEGRAM_BOT_TOKEN"), get_secret("TELEGRAM_CHAT_ID")
+    if not tok or not chat:
+        return False, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing"
+    chunks, cur = [], ""
+    for para in text.split("\n\n"):
+        if len(cur) + len(para) + 2 > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += (("\n\n" if cur else "") + para)
+    chunks.append(cur)
+    for c in chunks:
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                              json={"chat_id": chat, "text": c, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
+            if r.status_code != 200:
+                return False, f"HTTP {r.status_code}: {r.text[:120]}"
+        except Exception as e:
+            return False, str(e)
+        time.sleep(0.4)
+    return True, "sent"
+
+
+def build_telegram_message(res, tz):
+    nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    L = [f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])} | {res['n_analysed']} matches analysed | {res['n_ai']} sent to AI"]
+    for t in res["tickets"]:
+        ok = "✅" if t["valid"] else "⚠️"
+        s = f"🎟 <b>{_esc(t['name'])}</b> {ok}\nOdds <b>{t['odds']:.2f}</b> | joint prob ~{_pct(t['p_joint'])}% | risk {_esc(t.get('risk') or '-')}"
+        for i, l in enumerate(t["legs"]):
+            m = l["match"]
+            ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
+            s += (f"\n{nums[i]} <i>{_esc(_short(m['league'], 22))}</i> {ko}\n   {_esc(m['home'])} v {_esc(m['away'])}\n"
+                  f"   ➜ <b>{_esc(l['label'])}</b> @{l['odds']:.2f} (p {_pct(l['p'])}%{' est.odds' if l.get('src') == 'est' else ''})")
+            if l.get("why"):
+                s += f"\n   💡 {_esc(l['why'])}"
+        if t.get("logic"):
+            s += f"\n\n🧠 {_esc(t['logic'])}"
+        if t.get("repaired"):
+            s += "\n🔧 Python adjusted this ticket (invalid/duplicate leg or odds<3.5)."
+        L.append(s)
+    ai = res.get("ai") or {}
+    if ai.get("traps"):
+        L.append("🪤 <b>Trap watch</b>\n" + "\n".join(f"• {_esc(res['id_map'][x['id']]['home'])} v {_esc(res['id_map'][x['id']]['away'])}: {_esc(x.get('note'))}"
+                                                    for x in ai["traps"][:4] if x.get("id") in res["id_map"]))
+    if ai.get("avoid"):
+        L.append("🚫 <b>Avoid</b>\n" + "\n".join(f"• {_esc(res['id_map'][x['id']]['home'])} v {_esc(res['id_map'][x['id']]['away'])}: {_esc(x.get('why'))}"
+                                                 for x in ai["avoid"][:4] if x.get("id") in res["id_map"]))
+    if ai.get("summary"):
+        L.append(f"📝 <b>Slate read</b>\n{_esc(ai['summary'])}")
+    foot = (f"🤖 {_esc(res.get('model') or 'Python optimiser')} | tokens {res.get('tokens', 0)}/{TOTAL_TOKEN_BUDGET} | "
+            f"API calls {res.get('api_calls', 0)} | ⚠️ Odds shown are bookmaker snapshots; betting carries risk.")
+    L.append(foot)
+    return "\n\n".join(L)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Ticket ledger (settlement + calibration)
+# ═════════════════════════════════════════════════════════════════════════════
+def load_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {"history": [], "cpt": DEFAULT_CHARS_PER_TOKEN}
+
+
+def save_state(s):
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(s, fh)
+    except Exception:
+        pass
+
+
+def evaluate_leg(key, f):
+    h, a = _ft_goals(f)
+    if h is None or a is None:
+        return None
+    tot = h + a
+    if key == "1": return h > a
+    if key == "X": return h == a
+    if key == "2": return h < a
+    if key == "1X": return h >= a
+    if key == "X2": return h <= a
+    if key == "12": return h != a
+    if key == "BTTS_Y": return h > 0 and a > 0
+    if key == "BTTS_N": return not (h > 0 and a > 0)
+    mm = re.match(r"(H_|A_|HT_|C_)?(O|U)([\d.]+)$", key)
+    if not mm:
+        return None
+    pre, ou, line = mm.groups()
+    line = float(line)
+    if pre == "HT_":
+        ht = (f.get("score") or {}).get("halftime") or {}
+        if ht.get("home") is None:
+            return None
+        val = ht["home"] + ht["away"]
+    elif pre == "C_":
+        c = []
+        for s in f.get("statistics") or []:
+            v = _stat_val(s.get("statistics"), "Corner Kicks")
+            if v is None:
+                return None
+            c.append(v)
+        if len(c) < 2:
+            return None
+        val = sum(c)
+    else:
+        val = {None: tot, "H_": h, "A_": a}[pre]
+    return val > line if ou == "O" else val < line
+
+
+def settle_history(api, state):
+    ids = sorted({l["fid"] for e in state["history"] if e.get("status") != "SETTLED" for t in e["tickets"] for l in t["legs"] if l.get("result") is None})
+    fx = {}
+    for i in range(0, len(ids), 20):
+        for f in api.resp("/fixtures", {"ids": "-".join(map(str, ids[i:i + 20]))}, ttl=0):
+            if ((f.get("fixture") or {}).get("status") or {}).get("short") in PLAYED_OK:
+                fx[f["fixture"]["id"]] = f
+    for e in state["history"]:
+        alive = False
+        for t in e["tickets"]:
+            for l in t["legs"]:
+                if l.get("result") is None and l["fid"] in fx:
+                    l["result"] = evaluate_leg(l["key"], fx[l["fid"]])
+            res = [l.get("result") for l in t["legs"]]
+            t["outcome"] = "LOST" if any(r is False for r in res) else "WON" if all(r is True for r in res) else "PENDING"
+            alive |= t["outcome"] == "PENDING"
+        e["status"] = "PENDING" if alive else "SETTLED"
+    return state
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Orchestrator (runs on the Analyse click)
+# ═════════════════════════════════════════════════════════════════════════════
+def run_full_analysis(cfg, log, progress):
+    t0 = time.time()
+    api_key = get_secret("API_FOOTBALL_KEY") or get_secret("APISPORTS_KEY")
+    if not api_key:
+        return {"error": "API_FOOTBALL_KEY is not set (get one at https://dashboard.api-football.com)."}
+    # determine per-minute limit from plan
+    api = ApiFootball(api_key, per_minute=10)
+    stt = api.status()
+    plan = (stt.get("plan") or "Free")
+    per_min = 10 if str(plan).lower() == "free" else 280
+    api.rate = RateLimiter(cfg["rate_override"] or per_min)
+    cfg = dict(cfg, workers=3 if per_min <= 10 else 8)
+    log(f"🔑 API-Football plan: {plan} | used {stt.get('used')}/{stt.get('limit')} today")
+
+    data = collect_day(api, cfg, log, progress)
+    if not data["matches"]:
+        return {"error": "No matches could be analysed.", "warnings": data["warnings"], "api_errors": api.errors[-6:]}
+    matches = data["matches"]
+
+    # ── legs (book odds; estimated odds only if the slate has no odds at all) ──
+    for m in matches:
+        m["legs"] = build_legs(m)
+    est_mode = False
+    if not any(m["odds"] for m in matches):
+        est_mode = True
+        data["warnings"].append("No bookmaker odds returned - legs use MODEL-ESTIMATED odds (fair odds x 0.93). Verify real prices before betting.")
+        for m in matches:
+            m["legs"] = build_legs(m, allow_est=True)
+    for m in matches:
+        m["legs"] = [dict(l) for l in m["legs"]]
+    if sum(1 for m in matches if m["legs"]) < LEGS_PER_TICKET:
+        return {"error": "Fewer than 5 matches have safe legs with usable odds today.", "warnings": data["warnings"],
+                "matches": matches, "api_calls": api.calls}
+
+    state = load_state()
+    cpt = float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN))
+    cpt = min(max(cpt * 0.95, 2.4), 3.6)
+    sel, id_map, user_prompt, n_legs = build_ai_pack(matches, cfg["tz"], cpt, cfg["n_ai"])
+    match_legs, leg_index = {}, {}
+    for mid, m in id_map.items():
+        lst = []
+        for l in m["legs"]:
+            l2 = dict(l, mid=mid, fid=m["id"], match=m, id=f"{mid}.{l['key']}")
+            lst.append(l2)
+            leg_index[l2["id"].lower()] = l2
+        match_legs[mid] = lst
+    log(f"📦 AI pack: {len(sel)} matches x {n_legs} legs | est. prompt {est_tokens(SYSTEM_PROMPT + user_prompt, cpt)} tokens (hard cap {TOTAL_TOKEN_BUDGET} incl. completion)")
+    progress(0.93)
+
+    ai, info, model_used = None, {"attempts": []}, None
+    budget = TokenBudget(TOTAL_TOKEN_BUDGET)
+    if cfg["use_ai"]:
+        log("🤖 AI bookmaker/quant is reasoning over the evidence pack...")
+        ai, info = call_groq_budgeted(SYSTEM_PROMPT, user_prompt, budget, cpt, cfg.get("effort"))
+        model_used = info.get("model")
+        if info.get("actual_cpt"):
+            state["cpt"] = round(0.7 * cpt + 0.3 * info["actual_cpt"], 3)
+    if ai:
+        tickets = finalize_tickets(ai, leg_index, match_legs)
+    else:
+        tickets = python_only_tickets(match_legs)
+        if cfg["use_ai"]:
+            data["warnings"].append(f"AI unavailable ({info.get('status')}); tickets built by the deterministic Python optimiser.")
+    progress(0.97)
+
+    res = {"date": cfg["date"], "tickets": tickets, "ai": ai, "model": model_used, "info": info,
+           "tokens": budget.used, "n_analysed": len(matches), "n_ai": len(sel), "matches": matches, "id_map": id_map,
+           "api_calls": api.calls, "cache_hits": api.cache_hits, "warnings": data["warnings"], "est_mode": est_mode,
+           "user_prompt": user_prompt, "cat_counts": data["cat_counts"], "plan": data["plan"], "deep": data.get("deep"),
+           "api_errors": api.errors[-6:], "seconds": round(time.time() - t0, 1)}
+    # persist to ledger
+    state.setdefault("history", []).append({
+        "created": datetime.now(timezone.utc).isoformat(), "date": cfg["date"], "status": "PENDING",
+        "tickets": [{"name": t["name"], "odds": round(t["odds"], 2), "outcome": "PENDING",
+                     "legs": [{"fid": l["fid"], "key": l["key"], "label": l["label"], "odds": round(l["odds"], 2),
+                               "p": round(l["p"], 3), "match": f"{l['match']['home']} v {l['match']['away']}", "result": None}
+                              for l in t["legs"]]} for t in tickets]})
+    state["history"] = state["history"][-60:]
+    save_state(state)
+    return res
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Streamlit UI
+# ═════════════════════════════════════════════════════════════════════════════
+def render_results(res, tz):
+    for w in res.get("warnings", []):
+        st.warning(w)
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Matches analysed", res["n_analysed"])
+    c2.metric("Sent to AI", res["n_ai"])
+    c3.metric("AI tokens (cap 8000)", res["tokens"])
+    c4.metric("API calls", res["api_calls"], f"cache {res['cache_hits']}")
+    c5.metric("Model", (res.get("model") or "Python optimiser").split("/")[-1])
+    for t in res["tickets"]:
+        st.markdown(f"### 🎟 {t['name']} — odds **{t['odds']:.2f}** {'✅' if t['valid'] else '⚠️ below 3.5'} · joint prob ~{_pct(t['p_joint'])}%")
+        rows = []
+        for l in t["legs"]:
+            m = l["match"]
+            rows.append({"Kick-off": datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M"), "League": m["league"],
+                         "Match": f"{m['home']} v {m['away']}", "Pick": l["label"], "Odds": round(l["odds"], 2),
+                         "Prob %": _pct(l["p"]), "Trap": m["trap"]["risk"], "Why": l.get("why", "")})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if t.get("logic"):
+            st.info(t["logic"])
+        if t.get("repaired"):
+            st.caption("🔧 Python corrected this ticket (invalid/duplicate leg or odds below 3.5).")
+    ai = res.get("ai") or {}
+    if ai.get("traps"):
+        st.markdown("#### 🪤 Trap watch")
+        for x in ai["traps"]:
+            m = res["id_map"].get(x.get("id"))
+            if m:
+                st.write(f"**{m['home']} v {m['away']}** — {x.get('note')}")
+    if ai.get("avoid"):
+        st.markdown("#### 🚫 Avoid")
+        for x in ai["avoid"]:
+            m = res["id_map"].get(x.get("id"))
+            if m:
+                st.write(f"**{m['home']} v {m['away']}** — {x.get('why')}")
+    if ai.get("summary"):
+        st.markdown(f"#### 📝 Slate read\n{ai['summary']}")
+    with st.expander("📋 All analysed matches (Monte Carlo + market blend)"):
+        rows = []
+        for m in res["matches"]:
+            p = m["p"]
+            rows.append({"Cat": m["cat"], "League": m["league"], "Match": f"{m['home']} v {m['away']}",
+                         "KO": datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M"),
+                         "xG": f"{m['lam_h']:.2f}-{m['lam_a']:.2f}", "1": _pct(p["1"]), "X": _pct(p["X"]), "2": _pct(p["2"]),
+                         "1X": _pct(p["1X"]), "X2": _pct(p["X2"]), "BTTS": _pct(p["BTTS_Y"]), "O1.5": _pct(p["O1.5"]),
+                         "O2.5": _pct(p["O2.5"]), "Corners": round(m["exp_corners"], 1) if m["corner_n"] >= 3 else None,
+                         "Trap": m["trap"]["risk"], "DQ": m["dq"], "Likely": ",".join(m["top_scores"])})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    with st.expander("🔎 Exact evidence pack sent to the AI"):
+        st.code(res["user_prompt"], language="text")
+    with st.expander("🛠 Model attempts / API errors"):
+        for a in (res.get("info") or {}).get("attempts", []):
+            st.caption(f"{a['model']} → {a['status']}")
+        for e in res.get("api_errors", []):
+            st.caption(f"API: {e}")
+
+
+def main():
+    st.set_page_config(page_title="Der-AI | Football Quant Desk", page_icon="⚽", layout="wide")
+    st.markdown("""<style>
+      .stButton>button{background:linear-gradient(90deg,#065f46 0%,#10b981 100%);color:white;border:none;padding:10px 24px;border-radius:8px;font-weight:bold;font-size:16px;width:100%}
+      .stButton>button:hover{background:linear-gradient(90deg,#047857 0%,#059669 100%)}
+    </style>""", unsafe_allow_html=True)
+    for k, v in (("notifications", []), ("last_result", None)):
+        st.session_state.setdefault(k, v)
+
+    tab1, tab2, tab3, tab4 = st.tabs(["⚽ Match Analysis", "📜 Ticket Ledger", "🔔 Notifications", "⚙️ Settings"])
+
+    with tab4:
+        st.header("⚙️ Settings")
+        st.info("Secrets needed: `API_FOOTBALL_KEY`, `GROQ_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.")
+        s1, s2 = st.columns(2)
+        tz = s1.text_input("Time zone", DEFAULT_TZ)
+        max_matches = s1.slider("Max matches to collect deep data for", 10, 60, 30)
+        n_ai = s1.slider("Max matches sent to AI (auto-trimmed to fit 8,000 tokens)", 15, 24, 18)
+        max_calls = s1.number_input("Max API-Football calls per run", 30, 5000, 300, step=10,
+                                    help="Free plan = 100/day. Pro = 7,500/day. The app auto-shrinks the shortlist to fit.")
+        depth = s1.selectbox("Data depth", ["Auto", "Full", "Lite"], help="Full adds corners/shots/xG history, player ratings, lineups and standings via batched calls.")
+        sims = s2.select_slider("Monte Carlo simulations per match", [10000, 20000, 40000, 80000], 40000)
+        w_model = s2.slider("Weight of Monte Carlo model vs bookmaker price", 0.2, 0.8, 0.5, 0.05)
+        bookmaker = s2.number_input("Preferred bookmaker id (8 = Bet365, 11 = 1xBet, 4 = Pinnacle)", 1, 500, 8)
+        effort = s2.selectbox("AI reasoning effort (gpt-oss)", ["low", "medium"], help="'medium' thinks more but risks running out of the 8,000-token cap.")
+        exclude_minor = s2.checkbox("Exclude youth / women / reserve teams", True)
+        force_leagues = {int(x) for x in re.findall(r"\d+", s2.text_input("Always include league ids (comma separated)", ""))}
+        rate_override = int(s2.number_input("Requests/minute override (0 = auto by plan)", 0, 900, 0))
+        send_tg = st.checkbox("Send tickets to Telegram automatically", True)
+        use_ai = st.checkbox("Use AI (Groq)", True)
+        st.markdown(f"**AI order:** {' → '.join(GROQ_MODELS)} · **Hard cap:** {TOTAL_TOKEN_BUDGET} tokens per analysis (prompt + completion, all attempts)")
+        if st.button("🧹 Clear API cache"):
+            try:
+                for fn in os.listdir(CACHE_DIR):
+                    os.remove(os.path.join(CACHE_DIR, fn))
+                st.success("Cache cleared.")
+            except Exception as e:
+                st.error(str(e))
+
+    with tab1:
+        st.header("🚀 Football Quant Desk")
+        local_today = datetime.now(ZoneInfo(tz)).date()
+        d = st.date_input("Match day to analyse", local_today)
+        force = st.checkbox("Ignore cache (fresh API data - costs more calls)", False)
+        if st.button("🧠 Analyse Football Matches Now", type="primary"):
+            cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "n_ai": n_ai, "max_calls": int(max_calls),
+                   "depth": depth, "sims": int(sims), "w_model": w_model, "bookmaker": int(bookmaker), "effort": effort,
+                   "exclude_minor": exclude_minor, "force_leagues": force_leagues, "rate_override": rate_override,
+                   "force": force, "use_ai": use_ai}
+            bar = st.progress(0.0)
+            box = st.status("Running full analysis...", expanded=True)
+            def log(m): box.write(m)
+            def prog(x): bar.progress(min(1.0, float(x)))
+            try:
+                res = run_full_analysis(cfg, log, prog)
+            except Exception:
+                res = {"error": "Unexpected error:\n" + traceback.format_exc()}
+            bar.progress(1.0)
+            if "error" in res:
+                box.update(label="Analysis stopped", state="error")
+                st.error(res["error"])
+                for w in res.get("warnings", []) + res.get("api_errors", []):
+                    st.caption(w)
+            else:
+                box.update(label=f"Done in {res['seconds']}s", state="complete")
+                st.session_state.last_result = res
+                st.session_state.last_tz = tz
+                if send_tg:
+                    ok, why = send_telegram(build_telegram_message(res, tz))
+                    (st.success if ok else st.warning)("✅ Tickets sent to Telegram" if ok else f"Telegram failed: {why}")
+                    st.session_state.notifications.append({"time": datetime.now().strftime("%H:%M"), "ok": ok,
+                                                           "msg": f"{cfg['date']}: 3 tickets " + ("sent" if ok else f"not sent ({why})")})
+        if st.session_state.last_result:
+            render_results(st.session_state.last_result, st.session_state.get("last_tz", tz))
+
+    with tab2:
+        st.header("📜 Ticket Ledger & Calibration")
+        state = load_state()
+        if st.button("🔄 Settle finished matches"):
+            key = get_secret("API_FOOTBALL_KEY")
+            if key:
+                save_state(settle_history(ApiFootball(key, 10), state))
+                st.success("Ledger updated.")
+                state = load_state()
+        tk = [(e["date"], t) for e in state.get("history", []) for t in e["tickets"]]
+        won, lost = sum(1 for _, t in tk if t.get("outcome") == "WON"), sum(1 for _, t in tk if t.get("outcome") == "LOST")
+        legs_ = [l for _, t in tk for l in t["legs"] if l.get("result") is not None]
+        a, b, c = st.columns(3)
+        a.metric("Tickets won / lost", f"{won} / {lost}")
+        b.metric("Ticket hit rate", f"{100 * won / (won + lost):.0f}%" if won + lost else "—")
+        c.metric("Leg hit rate", f"{100 * sum(1 for l in legs_ if l['result']) / len(legs_):.0f}%" if legs_ else "—")
+        if tk:
+            st.dataframe(pd.DataFrame([{"Date": dt, "Ticket": t["name"], "Odds": t["odds"], "Outcome": t.get("outcome"),
+                                        "Legs": " | ".join(f"{l['match']}: {l['label']}{'✅' if l.get('result') else '❌' if l.get('result') is False else '⏳'}" for l in t["legs"])}
+                                       for dt, t in reversed(tk)]), hide_index=True, width="stretch")
+
+    with tab3:
+        st.header("🔔 Notifications")
+        for n in reversed(st.session_state.notifications):
+            (st.success if n["ok"] else st.warning)(f"[{n['time']}] {n['msg']}")
+        if not st.session_state.notifications:
+            st.info("No notifications yet.")
+
+
+if __name__ == "__main__":
+    main()
