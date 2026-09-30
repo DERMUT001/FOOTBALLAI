@@ -1386,24 +1386,45 @@ def _parse_json(content):
     return None
 
 
+def _retry_after(text):
+    m = re.search(r"try again in ([0-9hms.]+)", text or "")
+    if not m:
+        return None
+    sec = 0.0
+    for val, unit in re.findall(r"([\d.]+)(ms|h|m|s)", m.group(1)):
+        v = float(val)
+        sec += v / 1000 if unit == "ms" else v * 3600 if unit == "h" else v * 60 if unit == "m" else v
+    return sec
+
+
 def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None):
+    """Calls Groq inside the hard token budget. The prompt estimate is padded, the completion cap is bounded by the chosen
+    reasoning effort, and 413/429 errors are parsed so the request is corrected instead of blindly retried."""
     api_key = get_secret("GROQ_API_KEY", "").strip()
     log = []
     if not api_key:
-        return None, {"status": "MISSING_KEY", "attempts": log, "prompt_tokens": 0, "completion_tokens": 0}
+        return None, {"status": "MISSING_KEY", "attempts": [{"model": "-", "status": "GROQ_API_KEY not set"}], "prompt_tokens": 0, "completion_tokens": 0}
+    chars = len(system_prompt + user_prompt)
     est_prompt = est_tokens(system_prompt + user_prompt, cpt)
     info = {"attempts": log, "model": None, "prompt_tokens": 0, "completion_tokens": 0}
+    too_large = False
     for model in GROQ_MODELS:
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
-        cap = min(cfg["max_completion_tokens"], budget.remaining - est_prompt - 60)
-        if cap < MIN_COMPLETION:
-            log.append({"model": model, "status": f"SKIPPED_BUDGET(cap={cap})"})
-            continue
-        for attempt in range(2):
+        eff = effort or cfg.get("reasoning_effort")
+        upper = cfg["max_completion_tokens"]
+        if model.startswith("openai/") and eff in EFFORT_RESERVE:
+            upper = min(upper, EFFORT_RESERVE[eff] + 100)
+        limit = TOTAL_TOKEN_BUDGET               # per-request token limit; refined from error messages
+        p_est = int(est_prompt * 1.15) + 60      # pessimistic prompt size until the API tells us the real one
+        for attempt in range(3):
+            cap = min(upper, budget.remaining - p_est - 60, limit - p_est - 60)
+            if cap < MIN_COMPLETION:
+                log.append({"model": model, "status": f"SKIPPED_BUDGET(prompt~{p_est}, cap={cap})"})
+                too_large = True
+                break
             payload = {"model": model, "temperature": 0.2, "max_completion_tokens": int(cap),
                        "response_format": {"type": "json_object"},
                        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]}
-            eff = effort or cfg.get("reasoning_effort")
             if cfg.get("supports_reasoning_effort") and eff:
                 payload["reasoning_effort"] = eff if model.startswith("openai/") or eff == "none" else "none"
                 if model.startswith("openai/"):
@@ -1411,36 +1432,54 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None):
             try:
                 r = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=GROQ_TIMEOUT)
             except Exception as e:
-                log.append({"model": model, "status": f"NETWORK {str(e)[:60]}"})
+                log.append({"model": model, "status": f"NETWORK {str(e)[:80]}"})
                 time.sleep(2)
                 continue
+            if r.status_code == 200:
+                d = r.json()
+                u = d.get("usage") or {}
+                pt, ct = u.get("prompt_tokens", est_prompt), u.get("completion_tokens", 0)
+                budget.used += u.get("total_tokens", pt + ct)
+                info["prompt_tokens"] += pt
+                info["completion_tokens"] += ct
+                info["actual_cpt"] = chars / max(1, pt)
+                ch = (d.get("choices") or [{}])[0]
+                content = (ch.get("message") or {}).get("content") or ""
+                parsed = _parse_json(content) if content else None
+                if parsed and parsed.get("tickets"):
+                    log.append({"model": model, "status": "SUCCESS"})
+                    info["model"], info["status"] = model, "SUCCESS"
+                    return parsed, info
+                log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')} (completion {ct} of cap {cap})"})
+                break
+            body = (r.text or "")[:240]
+            low = body.lower()
+            if r.status_code == 413 or "too large" in low:
+                lim, req = re.search(r"Limit (\d+)", body), re.search(r"Requested (\d+)", body)
+                if lim and req:
+                    limit = int(lim.group(1))
+                    real_prompt = max(1, int(req.group(1)) - int(cap))
+                    p_est = real_prompt + 20
+                    info["actual_cpt"] = chars / real_prompt
+                    log.append({"model": model, "status": f"HTTP_413 limit {limit}, real prompt ~{real_prompt} tokens -> recomputing cap"})
+                else:
+                    p_est = int(p_est * 1.2)
+                    log.append({"model": model, "status": f"HTTP_413 {body[:120]}"})
+                continue
             if r.status_code == 429:
-                log.append({"model": model, "status": "RATE_LIMIT_429"})
+                wait = _retry_after(body)
+                if "per minute" in low and wait is not None and wait <= 30 and attempt < 2:
+                    log.append({"model": model, "status": f"RATE_LIMIT_429 per-minute, waiting {wait:.0f}s"})
+                    time.sleep(wait + 0.5)
+                    continue
+                log.append({"model": model, "status": f"RATE_LIMIT_429 {body[:140]}"})
                 break
             if r.status_code in NON_RETRYABLE:
-                log.append({"model": model, "status": f"HTTP_{r.status_code} {r.text[:80]}"})
+                log.append({"model": model, "status": f"HTTP_{r.status_code} {body[:140]}"})
                 break
-            if r.status_code != 200:
-                log.append({"model": model, "status": f"HTTP_{r.status_code}_RETRY"})
-                time.sleep(2.5 * (attempt + 1))
-                continue
-            d = r.json()
-            u = d.get("usage") or {}
-            pt, ct = u.get("prompt_tokens", est_prompt), u.get("completion_tokens", 0)
-            budget.used += u.get("total_tokens", pt + ct)
-            info["prompt_tokens"] += pt
-            info["completion_tokens"] += ct
-            info["actual_cpt"] = len(system_prompt + user_prompt) / max(1, pt)
-            ch = (d.get("choices") or [{}])[0]
-            content = (ch.get("message") or {}).get("content") or ""
-            parsed = _parse_json(content) if content else None
-            if parsed and parsed.get("tickets"):
-                log.append({"model": model, "status": "SUCCESS"})
-                info["model"], info["status"] = model, "SUCCESS"
-                return parsed, info
-            log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')}"})
-            break
-    info["status"] = "FAILED"
+            log.append({"model": model, "status": f"HTTP_{r.status_code} {body[:100]} (retrying)"})
+            time.sleep(2.5 * (attempt + 1))
+    info["status"] = "PROMPT_TOO_LARGE" if too_large and not info["model"] else "FAILED"
     return None, info
 
 
@@ -1642,6 +1681,9 @@ def build_telegram_message(res, tz):
                                                  for x in ai["avoid"][:4] if x.get("id") in res["id_map"]))
     if ai.get("summary"):
         L.append(f"📝 <b>Slate read</b>\n{_esc(ai['summary'])}")
+    if not res.get("model"):
+        L.append("ℹ️ <b>AI reasoning was not applied</b> - these tickets come from the Python Monte Carlo optimiser only."
+                 + (f" ({_esc(res.get('ai_note'))[:180]})" if res.get("ai_note") else ""))
     foot = (f"🤖 {_esc(res.get('model') or 'Python optimiser')} | tokens {res.get('tokens', 0)}/{TOTAL_TOKEN_BUDGET} | "
             f"API calls {res.get('api_calls', 0)} | ⚠️ Odds shown are bookmaker snapshots; betting carries risk.")
     L.append(foot)
@@ -1792,22 +1834,26 @@ def run_full_analysis(cfg, log, progress):
     cpt = min(max(float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN)) * 0.95, 2.4), 3.6)
     sys_p = system_prompt(n_t, cfg["allow_reuse"])
     eff = cfg.get("effort") if cfg.get("effort") in EFFORT_RESERVE else "low"
-    for eff_try in [e for e in ("high", "medium", "low") if EFFORT_RESERVE[e] <= EFFORT_RESERVE[eff]]:
-        reserve = EFFORT_RESERVE[eff_try]
-        sel, id_map, user_prompt, n_legs = build_ai_pack(elig, cfg["tz"], cpt, cfg["n_ai"], sys_p, n_t * LEGS_PER_TICKET, reserve)
-        if est_tokens(sys_p + user_prompt, cpt) <= TOTAL_TOKEN_BUDGET - reserve - TOKEN_SAFETY:
-            break
+
+    def make_pack(cpt_):
+        for eff_try in [e for e in ("high", "medium", "low") if EFFORT_RESERVE[e] <= EFFORT_RESERVE[eff]]:
+            reserve = EFFORT_RESERVE[eff_try]
+            sel_, id_map_, user_, n_legs_ = build_ai_pack(elig, cfg["tz"], cpt_, cfg["n_ai"], sys_p, n_t * LEGS_PER_TICKET, reserve)
+            if est_tokens(sys_p + user_, cpt_) <= TOTAL_TOKEN_BUDGET - reserve - TOKEN_SAFETY:
+                break
+        ml_, li_ = {}, {}
+        for mid, m in id_map_.items():
+            lst = []
+            for l in m["legs"]:
+                l2 = dict(l, mid=mid, fid=m["id"], match=m, id=f"{mid}.{l['key']}")
+                lst.append(l2)
+                li_[l2["id"].lower()] = l2
+            ml_[mid] = lst
+        return sel_, id_map_, user_, n_legs_, eff_try, ml_, li_
+
+    sel, id_map, user_prompt, n_legs, eff_try, match_legs, leg_index = make_pack(cpt)
     if eff_try != eff:
         log(f"   ℹ️ '{eff}' effort needs more thinking room than the 8,000-token cap allows for this many matches - using '{eff_try}'.")
-    cfg = dict(cfg, effort=eff_try)
-    match_legs, leg_index = {}, {}
-    for mid, m in id_map.items():
-        lst = []
-        for l in m["legs"]:
-            l2 = dict(l, mid=mid, fid=m["id"], match=m, id=f"{mid}.{l['key']}")
-            lst.append(l2)
-            leg_index[l2["id"].lower()] = l2
-        match_legs[mid] = lst
     log(f"📦 AI pack: {len(sel)} matches x {n_legs} legs | est. prompt {est_tokens(sys_p + user_prompt, cpt)} tokens (hard cap {TOTAL_TOKEN_BUDGET} incl. completion)")
     progress(0.93)
 
@@ -1815,7 +1861,15 @@ def run_full_analysis(cfg, log, progress):
     budget = TokenBudget(TOTAL_TOKEN_BUDGET)
     if cfg["use_ai"]:
         log("🤖 AI bookmaker/quant is reasoning over the evidence pack...")
-        ai, info = call_groq_budgeted(sys_p, user_prompt, budget, cpt, cfg.get("effort"))
+        ai, info = call_groq_budgeted(sys_p, user_prompt, budget, cpt, eff_try)
+        if not ai and info.get("status") == "PROMPT_TOO_LARGE" and info.get("actual_cpt"):
+            new_cpt = min(max(info["actual_cpt"] * 0.97, 1.8), cpt)
+            log(f"   ℹ️ The real prompt was bigger than estimated ({info['actual_cpt']:.2f} chars/token) - rebuilding a smaller pack and retrying.")
+            sel, id_map, user_prompt, n_legs, eff_try, match_legs, leg_index = make_pack(new_cpt)
+            prev = info["attempts"]
+            ai, info = call_groq_budgeted(sys_p, user_prompt, budget, new_cpt, eff_try)
+            info["attempts"] = prev + info["attempts"]
+            cpt = new_cpt
         model_used = info.get("model")
         if info.get("actual_cpt"):
             state["cpt"] = round(0.7 * cpt + 0.3 * info["actual_cpt"], 3)
@@ -1824,7 +1878,9 @@ def run_full_analysis(cfg, log, progress):
     else:
         tickets = python_only_tickets(match_legs, n_t)
         if cfg["use_ai"]:
-            data["warnings"].append(f"AI unavailable ({info.get('status')}); tickets built by the deterministic Python optimiser.")
+            why_ = " | ".join(f"{a['model'].split('/')[-1]}: {a['status'][:110]}" for a in info.get("attempts", [])[-3:])
+            data["warnings"].append(f"AI unavailable ({info.get('status')}): {why_}. Tickets were built by the deterministic Python optimiser instead.")
+            res_note = why_
     for t in tickets:
         dqm = min([l["match"]["dq"] for l in t["legs"]] or [0])
         t["grade"] = "A" if dqm >= 0.75 and not t["repaired"] else "B" if dqm >= 0.6 else "C"
@@ -1834,7 +1890,7 @@ def run_full_analysis(cfg, log, progress):
     if est_mode:
         data["warnings"].append("Some legs use MODEL-ESTIMATED odds (fair odds x 0.93). Verify real prices before betting.")
     res = result(tickets=tickets, ai=ai, model=model_used, info=info, tokens=budget.used, n_ai=len(sel), id_map=id_map,
-                 user_prompt=user_prompt, est_mode=est_mode)
+                 user_prompt=user_prompt, est_mode=est_mode, ai_note=(locals().get("res_note") or ""))
     state.setdefault("history", []).append({
         "created": datetime.now(timezone.utc).isoformat(), "date": cfg["date"], "status": "PENDING",
         "tickets": [{"name": t["name"], "odds": round(t["odds"], 2), "outcome": "PENDING", "grade": t["grade"],
