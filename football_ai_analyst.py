@@ -930,6 +930,20 @@ def gate_reasons(m, cfg):
 # ═════════════════════════════════════════════════════════════════════════════
 # Data collection pipeline
 # ═════════════════════════════════════════════════════════════════════════════
+def fetch_coverage(api, ttl_s=86400):
+    """One call: which competitions the API covers (predictions/odds/injuries/stats) this season."""
+    cov = {}
+    for item in api.resp("/leagues", {"current": "true"}, ttl_s):
+        lid = (item.get("league") or {}).get("id")
+        seasons = item.get("seasons") or []
+        cur = next((x for x in seasons if x.get("current")), seasons[-1] if seasons else None)
+        c = (cur or {}).get("coverage") or {}
+        fxc = c.get("fixtures") or {}
+        cov[lid] = {"pred": bool(c.get("predictions")), "odds": bool(c.get("odds")), "inj": bool(c.get("injuries")),
+                    "stats": bool(fxc.get("statistics_fixtures")), "lineups": bool(fxc.get("lineups")), "standings": bool(c.get("standings"))}
+    return cov
+
+
 def shortlist_matches(cands, max_n, force_leagues):
     buckets = defaultdict(list)
     forced = [c for c in cands if c["league_id"] in force_leagues]
@@ -938,7 +952,8 @@ def shortlist_matches(cands, max_n, force_leagues):
             buckets[c["cat"]].append(c)
     order = list(TOP_LEAGUES)
     for cat, lst in buckets.items():
-        lst.sort(key=lambda c: (order.index(c["league_id"]) if c["league_id"] in order else 99, c["ts"]))
+        lst.sort(key=lambda c: (0 if c.get("cov_odds") else 1 if c.get("cov_odds") is None else 2,
+                                order.index(c["league_id"]) if c["league_id"] in order else 99, c["ts"]))
     picked = list(forced)[:max_n]
     for cat in ("TOP", "INTL", "MID", "LOW"):
         take = math.ceil(CAT_QUOTA[cat] * max_n)
@@ -994,7 +1009,9 @@ def collect_day(api, cfg, log, progress):
     if api.remaining is not None and api.remaining <= 5:
         out["warnings"].append("API daily quota almost exhausted - only cached data can be used.")
     budget = min(cfg["max_calls"], api.remaining if api.remaining is not None else cfg["max_calls"])
-
+    if api.remaining is not None and budget < 60:
+        out["warnings"].append(f"Only {api.remaining} API calls are left today (plan limit {api.limit}), so this run was limited to fit. "
+                               "The quota resets at 00:00 UTC (03:00 in Kampala); cached data from earlier runs is reused for free.")
     log(f"📥 Fetching all fixtures for {date_str} ({tz})...")
     fx_raw = api.resp("/fixtures", {"date": date_str, "timezone": tz}, ttl=ttl(900))
     out["raw_count"] = len(fx_raw)
@@ -1005,6 +1022,15 @@ def collect_day(api, cfg, log, progress):
                     and not TEAM_EXCLUDE_RE.search(f["home"] or "") and not TEAM_EXCLUDE_RE.search(f["away"] or "")]
     if cfg.get("exclude_lower", True):
         fixtures = [f for f in fixtures if not LOWER_DIV_RE.search(f["league"] or "")]
+    cov = fetch_coverage(api)
+    if cov:
+        for f in fixtures:
+            c_ = cov.get(f["league_id"])
+            f["cov_pred"], f["cov_odds"] = (c_["pred"], c_["odds"]) if c_ else (None, None)
+        n0 = len(fixtures)
+        fixtures = [f for f in fixtures if f["cov_pred"] is not False]
+        log(f"🗂 Coverage filter: dropped {n0 - len(fixtures)} fixtures in competitions the API has no predictions for; "
+            f"{sum(1 for f in fixtures if f['cov_odds'])} of {len(fixtures)} remaining have odds coverage")
     out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
     log(f"   {out['raw_count']} fixtures on the day, {len(fixtures)} upcoming & eligible {out['cat_counts']}")
     if not fixtures:
@@ -1190,7 +1216,7 @@ def collect_day(api, cfg, log, progress):
         log("💰 Fetching per-fixture bookmaker odds...")
         with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
             futs = {ex.submit(lambda mm: api.get("/odds", {"fixture": mm["id"]}, ttl(1200), True).get("response") or [], m): m
-                    for m in sl if m["id"] not in odds_by}
+                    for m in sl if m["id"] not in odds_by and m.get("cov_odds") is not False}
             for fu in as_completed(futs):
                 try:
                     store_odds(fu.result(), futs[fu]["id"])
@@ -1802,7 +1828,7 @@ def run_full_analysis(cfg, log, progress):
                 "api_calls": api.calls, "cache_hits": api.cache_hits, "warnings": data["warnings"], "est_mode": False,
                 "cat_counts": data["cat_counts"], "plan": data["plan"], "deep": data.get("deep"),
                 "api_errors": api.error_summary(), "seconds": round(time.time() - t0, 1),
-                "excluded": data["excluded"], "no_bet": False, "reason": "", "caps": data.get("caps")}
+                "excluded": data["excluded"], "no_bet": False, "reason": "", "caps": data.get("caps"), "quota": (api.remaining, api.limit)}
         base.update(kw)
         return base
 
@@ -1825,8 +1851,10 @@ def run_full_analysis(cfg, log, progress):
     if cfg["allow_reuse"] and len(elig) >= LEGS_PER_TICKET:
         n_t = N_TICKETS
     if n_t == 0:
+        tip = (f" Only ~{data.get('budget')} API calls were available this run - retry after the daily quota resets (00:00 UTC) or raise the limit."
+               if (data.get("budget") or 999) < 60 else "")
         return result(no_bet=True, reason=f"Only {len(elig)} match(es) passed the evidence gate; a 5-leg ticket needs at least 5. "
-                                          "Betting on thin data would just be guessing, so nothing is recommended.")
+                                          "Betting on thin data would just be guessing, so nothing is recommended." + tip)
     if n_t < N_TICKETS:
         data["warnings"].append(f"Only {len(elig)} matches qualified, so {n_t} ticket(s) were built instead of {N_TICKETS} (no match is reused).")
 
@@ -1914,6 +1942,8 @@ def render_results(res, tz):
     c3.metric("AI tokens (cap 8000)", res["tokens"])
     c4.metric("API calls", res["api_calls"], f"cache {res['cache_hits']}")
     c5.metric("Model", (res.get("model") or "Python optimiser").split("/")[-1] if res["tickets"] else "-")
+    if res.get("quota") and res["quota"][0] is not None:
+        st.caption(f"📶 API quota left today: **{res['quota'][0]}** of {res['quota'][1]} (resets 00:00 UTC / 03:00 Kampala)")
     if res.get("caps"):
         cp = res["caps"]
         st.caption(f"API plan capabilities detected - team history: {'✅' if cp['history'] else '❌ (using predictions last-5 form)'} · "
