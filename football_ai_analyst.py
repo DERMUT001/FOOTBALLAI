@@ -73,6 +73,7 @@ MID_LEAGUES = {88, 94, 40, 144, 203, 179, 71, 128, 262, 253, 307, 13, 11, 41, 42
 CAT_WEIGHT = {"TOP": 100, "INTL": 80, "MID": 70, "LOW": 50}
 CAT_QUOTA = {"TOP": 0.40, "INTL": 0.20, "MID": 0.30, "LOW": 0.10}
 LEAGUE_EXCLUDE_RE = re.compile(r"\b(U-?1[5-9]|U-?2[0-3]|Youth|Reserve|Reserves|Women|Feminine|Femenin|Femminile|Frauen|Junior|Juniors|Development)\b", re.I)
+LOWER_DIV_RE = re.compile(r"amateur|regionalliga|serie d\b|division [3-9]|liga alef|norrland|friendlies clubs|oberliga|landesliga|primera federaci|segunda federaci|tercera|copa federacion", re.I)
 TEAM_EXCLUDE_RE = re.compile(r"\s(II|B|U-?\d{2}|Youth|Women|W)$", re.I)
 PLAYED_OK = {"FT", "AET", "PEN"}
 UPCOMING_OK = {"NS", "TBD"}
@@ -155,6 +156,7 @@ class ApiFootball:
         self.blocked_ep = set()    # endpoints/seasons the plan refuses
         self.err_counts = {}
         self.ep_fail, self.ep_ok = {}, {}
+        self.no_history = False    # plan cannot serve team fixture history for the current season
         self.cache_dir = cache_dir
         try:
             os.makedirs(cache_dir, exist_ok=True)
@@ -212,7 +214,7 @@ class ApiFootball:
         except Exception as e:
             return {"plan": None, "errors": str(e)}
 
-    def get(self, endpoint, params=None, ttl=3600):
+    def get(self, endpoint, params=None, ttl=3600, bypass=False):
         params = {k: v for k, v in (params or {}).items() if v is not None}
         ck = endpoint + "?" + "&".join(f"{k}={params[k]}" for k in sorted(params))
         h = hashlib.md5(ck.encode()).hexdigest()
@@ -237,7 +239,7 @@ class ApiFootball:
                 pass
         if self.quota_out:
             return {"response": [], "paging": {}, "errors": {"quota": "daily quota exhausted"}}
-        if any(k in self.blocked for k in params) or (endpoint in self.blocked_ep and endpoint != "/fixtures"):
+        if any(k in self.blocked for k in params) or (endpoint in self.blocked_ep and endpoint != "/fixtures" and not bypass):
             return {"response": [], "paging": {}, "errors": {"blocked": "plan restriction (skipped, no call spent)"}}
         last_err = ""
         for attempt in range(3):
@@ -398,7 +400,9 @@ def parse_predictions(resp):
         l5 = t.get("last_5") or {}
         return {"gf_h": _f(gf.get("home")), "gf_a": _f(gf.get("away")), "ga_h": _f(ga.get("home")),
                 "ga_a": _f(ga.get("away")), "played_h": _f(pl.get("home"), 0), "played_a": _f(pl.get("away"), 0),
-                "l5_form": l5.get("form"), "season_form": L.get("form") or ""}
+                "l5_form": l5.get("form"), "season_form": L.get("form") or "", "l5_played": _f(l5.get("played"), 0),
+                "l5_form_pct": _f(l5.get("form")), "l5_gf": _f(((l5.get("goals") or {}).get("for") or {}).get("average")),
+                "l5_ga": _f(((l5.get("goals") or {}).get("against") or {}).get("average"))}
 
     pc = pr.get("percent") or {}
     return {"pct": [_f(pc.get("home")), _f(pc.get("draw")), _f(pc.get("away"))], "advice": pr.get("advice"),
@@ -575,6 +579,20 @@ def build_profile(team_id, results, hs, injuries, lineup):
         kin = len(prof["key_ids"] & xi)
         prof["lineup"] = {"formation": lineup.get("formation"), "key_in_xi": kin, "key_n": len(prof["key_ids"]),
                           "rotation": bool(len(prof["key_ids"]) >= 5 and kin <= len(prof["key_ids"]) - 3)}
+    return prof
+
+
+def enrich_profile_from_l5(prof, side):
+    """When team history is unavailable (Free plan), use the predictions endpoint's last-5 block as recent form."""
+    if prof.get("n", 0) >= 4 or not side:
+        return prof
+    n, gf, ga, fp = int(side.get("l5_played") or 0), side.get("l5_gf"), side.get("l5_ga"), side.get("l5_form_pct")
+    if n >= 3 and gf is not None and ga is not None:
+        sf = "".join(ch for ch in (side.get("season_form") or "") if ch in "WDL")[-5:]
+        ppg = (fp / 100 * 3) if fp is not None else 1.35
+        prof.update({"n": n, "gf_w": gf, "ga_w": ga, "ppg5": ppg, "ppg10": ppg,
+                     "form5": sf or (f"~{int(fp)}%" if fp is not None else "?"), "form_score": fp if fp is not None else 50.0,
+                     "src": "api_last5"})
     return prof
 
 
@@ -790,6 +808,8 @@ def data_quality(m):
     dq += 0.05 if m.get("inj_known") else 0
     dq += 0.05 if (m["ph"].get("lineup") and m["pa"].get("lineup")) else 0
     dq += 0.05 if m.get("st_h") else 0
+    if not m.get("odds"):          # odds availability is judged by the gate; here score only the team data (max 0.75)
+        dq = dq / 0.75
     return round(min(1.0, dq), 2)
 
 
@@ -944,7 +964,9 @@ def detail_cost(ms, deep):
 
 
 def team_results(api, team_id, season, date_str, tz, ttl_s):
-    """Last-10 results. Free plans block `last`, so fall back to a wide date-range query."""
+    """Last-10 results. Free plans block `last` and current-season queries, so try fallbacks once, then stop."""
+    if api.no_history:
+        return []
     if "last" not in api.blocked:
         r = api.resp("/fixtures", {"team": team_id, "last": 10, "timezone": tz}, ttl_s)
         if r:
@@ -953,8 +975,11 @@ def team_results(api, team_id, season, date_str, tz, ttl_s):
     base = {"team": team_id, "from": (d - timedelta(days=240)).isoformat(), "to": (d - timedelta(days=1)).isoformat(), "timezone": tz}
     d1 = api.get("/fixtures", base, ttl_s)
     res = parse_results(d1.get("response") or [], team_id)
-    if not res and d1.get("errors") and season:          # some plans insist on a season parameter
-        res = parse_results(api.resp("/fixtures", dict(base, season=season), ttl_s), team_id)
+    if not res and d1.get("errors") and season:
+        d2 = api.get("/fixtures", dict(base, season=season), ttl_s)
+        res = parse_results(d2.get("response") or [], team_id)
+        if not res and d2.get("errors"):
+            api.no_history = True
     return res[:10]
 
 
@@ -978,6 +1003,8 @@ def collect_day(api, cfg, log, progress):
     if cfg["exclude_minor"]:
         fixtures = [f for f in fixtures if not LEAGUE_EXCLUDE_RE.search(f["league"] or "")
                     and not TEAM_EXCLUDE_RE.search(f["home"] or "") and not TEAM_EXCLUDE_RE.search(f["away"] or "")]
+    if cfg.get("exclude_lower", True):
+        fixtures = [f for f in fixtures if not LOWER_DIV_RE.search(f["league"] or "")]
     out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
     log(f"   {out['raw_count']} fixtures on the day, {len(fixtures)} upcoming & eligible {out['cat_counts']}")
     if not fixtures:
@@ -985,17 +1012,14 @@ def collect_day(api, cfg, log, progress):
         return out
     progress(0.06)
 
-    # ── Stage 1: candidate pool -> bookmaker odds FIRST (no prices = no bet, so don't spend calls on those matches) ──
-    deep = cfg["depth"] == "Full" or (cfg["depth"] == "Auto" and budget >= 150)
+    # ── Stage 1: candidate pool ──
     pool_n = min(len(fixtures), int(cfg["max_matches"] * 1.6) + 4)
     cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"])
     odds_cap = max(6, int(budget * 0.30))
     while len({c["league_id"] for c in cand}) > odds_cap and pool_n > 8:
         pool_n -= 1
         cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"])
-    log(f"💰 Stage 1: fetching bookmaker odds for {len(cand)} candidate matches in {len({c['league_id'] for c in cand})} competitions...")
     odds_by = {}
-    lg_keys = {(c["league_id"], c["season"]) for c in cand}
 
     def fetch_league_odds(lid, s_):
         for params in ({"league": lid, "season": s_, "date": date_str, "timezone": tz}, {"league": lid, "season": s_, "date": date_str}):
@@ -1013,27 +1037,60 @@ def collect_day(api, cfg, log, progress):
                 return items
         return []
 
-    with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
-        futs = {ex.submit(fetch_league_odds, lid, s_): lid for lid, s_ in lg_keys}
-        for fu in as_completed(futs):
-            try:
-                for item in fu.result():
-                    fid = (item.get("fixture") or {}).get("id")
-                    if fid:
-                        odds_by[fid] = parse_odds_item(item, cfg["bookmaker"])
-            except Exception as e:
-                api.errors.append(f"odds: {e}")
-    if not odds_by and "/odds" not in api.blocked_ep and (api.remaining is None or api.remaining > 20):
-        log("   no odds from league queries - trying per-fixture odds for the top 4 matches...")
-        for m in cand[:4]:
-            for item in api.resp("/odds", {"fixture": m["id"]}, ttl(1200)):
-                odds_by[m["id"]] = parse_odds_item(item, cfg["bookmaker"])
-    keep = [c for c in cand if c["id"] in odds_by] if not cfg["allow_est"] else list(cand)
+    def store_odds(items, fid=None):
+        for item in items:
+            f_ = fid or (item.get("fixture") or {}).get("id")
+            if f_:
+                odds_by[f_] = parse_odds_item(item, cfg["bookmaker"])
+
+    # ── capability probe: a few calls to learn what this API plan allows, so we plan around it ──
+    log("🔬 Probing what your API plan allows (a few calls)...")
+    sample = cand[0]
+    team_results(api, sample["home_id"], sample["season"], date_str, tz, ttl(3 * 3600))
+    caps = {"history": not api.no_history, "league_odds": None, "fixture_odds": False}
+    items = fetch_league_odds(sample["league_id"], sample["season"])
+    store_odds(items)
+    if items:
+        caps["league_odds"] = True
+    elif api.ep_fail.get("/odds", 0) > 0 and not api.ep_ok.get("/odds"):
+        caps["league_odds"] = False
+    if caps["league_odds"] is False:
+        for c in cand[:2]:                                   # season-free per-fixture odds may still be allowed
+            its = api.get("/odds", {"fixture": c["id"]}, ttl(1200), True).get("response") or []
+            if its:
+                store_odds(its, c["id"])
+                caps["fixture_odds"] = True
+                break
+    out["caps"] = caps
+    log(f"   team history: {'yes' if caps['history'] else 'NO (using predictions last-5 form instead)'} | "
+        f"odds by league: {'yes' if caps['league_odds'] else 'NO' if caps['league_odds'] is False else 'unknown'} | "
+        f"odds by fixture: {'yes' if caps['fixture_odds'] else 'no'}")
+
+    log(f"💰 Stage 1: bookmaker odds for {len(cand)} candidate matches in {len({c['league_id'] for c in cand})} competitions...")
+    if caps["league_odds"] is not False:
+        todo = {(c["league_id"], c["season"]) for c in cand} - {(sample["league_id"], sample["season"])}
+        with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+            for fu in as_completed([ex.submit(fetch_league_odds, lid, s_) for lid, s_ in todo]):
+                try:
+                    store_odds(fu.result())
+                except Exception as e:
+                    api.errors.append(f"odds: {e}")
+        if not odds_by and caps["league_odds"] is None and (api.remaining is None or api.remaining > 20):
+            for c in cand[1:4]:
+                its = api.get("/odds", {"fixture": c["id"]}, ttl(1200), True).get("response") or []
+                if its:
+                    store_odds(its, c["id"])
+                    caps["fixture_odds"] = True
+    with_odds = [c for c in cand if c["id"] in odds_by]
+    if caps["fixture_odds"] or (cfg["allow_est"] and not (caps["league_odds"] and len(with_odds) >= 10)):
+        keep = list(cand)                                  # odds come per fixture later, or are estimated for matches without prices
+    else:
+        keep = with_odds
     keep_ids = {c["id"] for c in keep}
     for c in cand:
         if c["id"] not in keep_ids:
             out["excluded"].append({"league": c["league"], "match": f"{c['home']} v {c['away']}", "reason": "no bookmaker odds"})
-    log(f"   {len(odds_by)}/{len(cand)} candidates have bookmaker prices -> {len(keep)} continue")
+    log(f"   {len(odds_by)} candidates have bookmaker prices so far -> {len(keep)} continue")
     progress(0.14)
     if not keep:
         errs = [e for e in api.error_summary() if "/odds" in e][:2] or api.error_summary()[-2:]
@@ -1043,13 +1100,19 @@ def collect_day(api, cfg, log, progress):
         return out
 
     # ── budget-aware cap on how many get deep data ──
+    per = 1.0 + (2.0 if caps["history"] else 0.0) + (1.0 if caps["fixture_odds"] else 0.0)
+    deep = caps["history"] and (cfg["depth"] == "Full" or (cfg["depth"] == "Auto" and budget >= 150))
+
+    def cost(ms, dp):
+        return len(ms) * (per + (0.9 if dp else 0.0)) + (len({m["league_id"] for m in ms}) if dp else 0)
+
     left = budget - api.calls
     n = min(cfg["max_matches"], len(keep))
-    while n > 4 and detail_cost(keep[:n], deep) > left * 0.95:
+    while n > 4 and cost(keep[:n], deep) > left * 0.95:
         n -= 1
     if deep and n < min(cfg["max_matches"], len(keep)) and n < 12:
         n_l = min(cfg["max_matches"], len(keep))
-        while n_l > 4 and detail_cost(keep[:n_l], False) > left * 0.95:
+        while n_l > 4 and cost(keep[:n_l], False) > left * 0.95:
             n_l -= 1
         if n_l >= n + 4:
             deep, n = False, n_l
@@ -1058,7 +1121,9 @@ def collect_day(api, cfg, log, progress):
         out["excluded"].append({"league": c["league"], "match": f"{c['home']} v {c['away']}", "reason": "beyond API call budget"})
     out["deep"], out["budget"] = deep, budget
     leagues = {(m["league_id"], m["season"]) for m in sl}
-    log(f"🎯 Stage 2: deep data for {len(sl)} matches | depth={'FULL' if deep else 'LITE'} | est. ~{detail_cost(sl, deep):.0f} more calls (budget left ~{left:.0f})")
+    est_calls = cost(sl, deep)
+    log(f"🎯 Stage 2: data for {len(sl)} matches | depth={'FULL' if deep else 'LITE'} | est. ~{est_calls:.0f} more calls "
+        f"(budget left ~{left:.0f}) | ~{est_calls * api.rate.interval / 60:.1f} min at your plan's rate limit")
 
     # ── injuries ──
     log("🩹 Fetching injuries & suspensions...")
@@ -1082,18 +1147,29 @@ def collect_day(api, cfg, log, progress):
 
     def viable(c):
         pr = c["pred"]
-        season_ok = bool(pr) and None not in (pr["home"]["gf_h"], pr["home"]["ga_h"], pr["away"]["gf_a"], pr["away"]["ga_a"]) \
-            and min(pr["home"]["played_h"] or 0, pr["away"]["played_a"] or 0) >= 3
-        return season_ok or (len(c["rh"]) >= 4 and len(c["ra"]) >= 4)
+        if pr:
+            H, A = pr["home"], pr["away"]
+            if None not in (H["gf_h"], H["ga_h"], A["gf_a"], A["ga_a"]) and min(H["played_h"] or 0, A["played_a"] or 0) >= 3:
+                return True
+            if (H.get("l5_played") or 0) >= 3 and (A.get("l5_played") or 0) >= 3 and H.get("l5_gf") is not None and A.get("l5_gf") is not None:
+                return True
+        return len(c["rh"]) >= 4 and len(c["ra"]) >= 4
 
-    # probe the first 3 matches sequentially: if none returns usable team data, stop before wasting the daily quota
-    for m in sl[:3]:
+    # probe up to 4 matches from DIFFERENT competitions; abort only if none has usable team data
+    seen_lg, probe = set(), []
+    for m in sl:
+        if m["league_id"] not in seen_lg:
+            seen_lg.add(m["league_id"])
+            probe.append(m)
+        if len(probe) == 4:
+            break
+    for m in probe:
         fid, c = fetch_core(m)
         core[fid] = c
-    if "last" in api.blocked:
-        log("   ℹ️ Your plan blocks the `last` parameter - using date-range queries for team form instead.")
+        if sum(1 for x in core.values() if viable(x)) >= 2:
+            break
     if not any(viable(c) for c in core.values()):
-        out["reason"] = ("Team form and season statistics could not be retrieved for the first 3 matches probed (see API errors below - "
+        out["reason"] = ("Team form and season statistics could not be retrieved for the matches probed (see API errors below - "
                          "usually a plan restriction). Stopped early to protect your daily API quota; without team data any ticket would be a guess.")
         for m in sl:
             out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no team-specific data retrievable"})
@@ -1110,6 +1186,16 @@ def collect_day(api, cfg, log, progress):
                 api.errors.append(f"core: {e}")
             done += 1
             progress(0.18 + 0.37 * done / len(sl))
+    if caps["fixture_odds"]:
+        log("💰 Fetching per-fixture bookmaker odds...")
+        with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+            futs = {ex.submit(lambda mm: api.get("/odds", {"fixture": mm["id"]}, ttl(1200), True).get("response") or [], m): m
+                    for m in sl if m["id"] not in odds_by}
+            for fu in as_completed(futs):
+                try:
+                    store_odds(fu.result(), futs[fu]["id"])
+                except Exception as e:
+                    api.errors.append(f"fixture odds: {e}")
     if deep:
         for m in sl:
             c = core.get(m["id"])
@@ -1155,6 +1241,8 @@ def collect_day(api, cfg, log, progress):
         lus = {((l.get("team") or {}).get("id")): l for l in (upc.get(m["id"]) or {}).get("lineups") or []}
         ph = build_profile(m["home_id"], c["rh"], hs_h, inj_by.get((m["id"], m["home_id"])), lus.get(m["home_id"]))
         pa = build_profile(m["away_id"], c["ra"], hs_a, inj_by.get((m["id"], m["away_id"])), lus.get(m["away_id"]))
+        enrich_profile_from_l5(ph, (c["pred"] or {}).get("home"))
+        enrich_profile_from_l5(pa, (c["pred"] or {}).get("away"))
         lam_h, lam_a, _, basis = estimate_lambdas(c["pred"], ph, pa)
         mu_ch, mu_ca, cn = estimate_corners(ph, pa, lam_h, lam_a)
         mc = monte_carlo(lam_h, lam_a, mu_ch, mu_ca, n=cfg["sims"], seed=int(m["id"]) % (2 ** 31))
@@ -1672,7 +1760,7 @@ def run_full_analysis(cfg, log, progress):
                 "api_calls": api.calls, "cache_hits": api.cache_hits, "warnings": data["warnings"], "est_mode": False,
                 "cat_counts": data["cat_counts"], "plan": data["plan"], "deep": data.get("deep"),
                 "api_errors": api.error_summary(), "seconds": round(time.time() - t0, 1),
-                "excluded": data["excluded"], "no_bet": False, "reason": ""}
+                "excluded": data["excluded"], "no_bet": False, "reason": "", "caps": data.get("caps")}
         base.update(kw)
         return base
 
@@ -1770,6 +1858,10 @@ def render_results(res, tz):
     c3.metric("AI tokens (cap 8000)", res["tokens"])
     c4.metric("API calls", res["api_calls"], f"cache {res['cache_hits']}")
     c5.metric("Model", (res.get("model") or "Python optimiser").split("/")[-1] if res["tickets"] else "-")
+    if res.get("caps"):
+        cp = res["caps"]
+        st.caption(f"API plan capabilities detected - team history: {'✅' if cp['history'] else '❌ (using predictions last-5 form)'} · "
+                   f"odds by league: {'✅' if cp['league_odds'] else '❌' if cp['league_odds'] is False else '?'} · odds by fixture: {'✅' if cp['fixture_odds'] else '❌'}")
     if res.get("no_bet"):
         st.error(f"🛑 **NO BET** - {res.get('reason')}")
         if res.get("api_errors"):
@@ -1852,6 +1944,7 @@ def main():
         bookmaker = s2.number_input("Preferred bookmaker id (8 = Bet365, 11 = 1xBet, 4 = Pinnacle)", 1, 500, 8)
         effort = s2.selectbox("AI reasoning effort (gpt-oss)", ["low", "medium", "high"], help="Higher effort thinks longer, so the evidence pack is automatically shrunk (fewer matches/legs) to keep prompt + completion within 8,000 tokens. If even that cannot fit, the app steps effort down.")
         exclude_minor = s2.checkbox("Exclude youth / women / reserve teams", True)
+        exclude_lower = s2.checkbox("Exclude amateur / regional lower divisions & club friendlies", True)
         force_leagues = {int(x) for x in re.findall(r"\d+", s2.text_input("Always include league ids (comma separated)", ""))}
         rate_override = int(s2.number_input("Requests/minute override (0 = auto by plan)", 0, 900, 0))
         send_tg = st.checkbox("Send tickets to Telegram automatically", True)
@@ -1878,7 +1971,7 @@ def main():
         if st.button("🧠 Analyse Football Matches Now", type="primary"):
             cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "n_ai": n_ai, "max_calls": int(max_calls),
                    "depth": depth, "sims": int(sims), "w_model": w_model, "bookmaker": int(bookmaker), "effort": effort,
-                   "exclude_minor": exclude_minor, "force_leagues": force_leagues, "rate_override": rate_override,
+                   "exclude_minor": exclude_minor, "exclude_lower": exclude_lower, "force_leagues": force_leagues, "rate_override": rate_override,
                    "force": force, "use_ai": use_ai, "min_dq": min_dq, "allow_reuse": allow_reuse, "allow_est": allow_est}
             bar = st.progress(0.0)
             box = st.status("Running full analysis...", expanded=True)
