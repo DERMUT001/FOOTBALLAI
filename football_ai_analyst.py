@@ -42,16 +42,17 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TIMEOUT = 90
 GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3-32b"]
 GROQ_MODEL_CONFIG = {
-    "openai/gpt-oss-120b": {"max_completion_tokens": 2400, "reasoning_effort": "low", "supports_reasoning_effort": True},
-    "openai/gpt-oss-20b": {"max_completion_tokens": 2400, "reasoning_effort": "low", "supports_reasoning_effort": True},
-    "qwen/qwen3-32b": {"max_completion_tokens": 2200, "reasoning_effort": "none", "supports_reasoning_effort": True},
+    "openai/gpt-oss-120b": {"max_completion_tokens": 4000, "reasoning_effort": "low", "supports_reasoning_effort": True},
+    "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "low", "supports_reasoning_effort": True},
+    "qwen/qwen3-32b": {"max_completion_tokens": 3000, "reasoning_effort": "none", "supports_reasoning_effort": True},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
 
 # ── Token budget (HARD LIMIT per analysis: prompt + completion, across ALL attempts) ──
 TOTAL_TOKEN_BUDGET = 8000
-OUTPUT_RESERVE = 2200        # completion tokens reserved (includes hidden reasoning on gpt-oss)
+OUTPUT_RESERVE = 2200        # default completion tokens reserved (includes hidden reasoning on gpt-oss)
+EFFORT_RESERVE = {"low": 2200, "medium": 2900, "high": 3500}   # more thinking = more room reserved = smaller prompt
 TOKEN_SAFETY = 100
 MIN_COMPLETION = 900         # below this a call cannot finish the JSON -> don't start it
 DEFAULT_CHARS_PER_TOKEN = 3.0  # deliberately conservative for dense numeric text
@@ -153,6 +154,7 @@ class ApiFootball:
         self.blocked = set()       # parameters the plan refuses (e.g. 'last' on Free)
         self.blocked_ep = set()    # endpoints/seasons the plan refuses
         self.err_counts = {}
+        self.ep_fail, self.ep_ok = {}, {}
         self.cache_dir = cache_dir
         try:
             os.makedirs(cache_dir, exist_ok=True)
@@ -182,7 +184,10 @@ class ApiFootball:
         if m:
             self.blocked.add(m.group(1).lower())
         elif "plan" in msg.lower() and "access" in msg.lower():
-            self.blocked_ep.add(endpoint)
+            with self.lock:                       # block an endpoint only after 3 plan failures and zero successes
+                self.ep_fail[endpoint] = self.ep_fail.get(endpoint, 0) + 1
+                if self.ep_fail[endpoint] >= 3 and not self.ep_ok.get(endpoint):
+                    self.blocked_ep.add(endpoint)
 
     def error_summary(self):
         with self.lock:
@@ -270,6 +275,7 @@ class ApiFootball:
                 self._note_error(endpoint, msg)
                 data.setdefault("response", [])
                 return data
+            self.ep_ok[endpoint] = True
             try:
                 with open(path, "w", encoding="utf-8") as fh:
                     json.dump({"t": time.time(), "d": data}, fh)
@@ -373,7 +379,7 @@ def parse_odds_item(item, pref_bookmaker):
     out = {}
     for k, lst in store.items():
         med = float(np.median(lst))
-        out[k] = {"odds": float(pref.get(k, med)), "median": med, "best": float(max(lst)), "n": len(lst)}
+        out[k] = {"odds": float(pref.get(k, med)), "median": med, "best": float(max(lst)), "low": float(min(lst)), "n": len(lst)}
     return out
 
 
@@ -842,10 +848,12 @@ def build_legs(m, allow_est=False, corners_ok_min=3):
             continue
         o = m["odds"].get(key)
         src = "book"
+        lo = hi = None
         if o:
             odds = o["odds"]
+            lo, hi = o.get("low", odds), o.get("best", odds)
             p_mkt = market_fair_prob(key, m["odds"])
-        elif allow_est:
+        elif allow_est and not m["odds"]:           # only estimate when the match has NO bookmaker prices at all
             odds, src = round(max(1.05, 0.93 / max(p, 0.05)), 2), "est"
             p_mkt = p
         else:
@@ -871,7 +879,7 @@ def build_legs(m, allow_est=False, corners_ok_min=3):
         edge = p * odds - 1
         eadj = float(np.clip(p_adj * odds - 1, -0.2, 0.15))
         legs.append({"key": key, "label": leg_label(key, m), "p": float(p), "p_adj": float(p_adj), "p_mkt": float(p_mkt),
-                     "p_model": float(p_model), "odds": float(odds), "edge": float(edge), "src": src,
+                     "p_model": float(p_model), "odds": float(odds), "odds_lo": lo, "odds_hi": hi, "edge": float(edge), "src": src,
                      "rank": float(p_adj + 0.5 * eadj), "fam": _family(key)})
     legs.sort(key=lambda x: -x["rank"])
     chosen, fams = [], set()
@@ -988,9 +996,25 @@ def collect_day(api, cfg, log, progress):
     log(f"💰 Stage 1: fetching bookmaker odds for {len(cand)} candidate matches in {len({c['league_id'] for c in cand})} competitions...")
     odds_by = {}
     lg_keys = {(c["league_id"], c["season"]) for c in cand}
+
+    def fetch_league_odds(lid, s_):
+        for params in ({"league": lid, "season": s_, "date": date_str, "timezone": tz}, {"league": lid, "season": s_, "date": date_str}):
+            items, errs = [], False
+            for page in (1, 2, 3):
+                d = api.get("/odds", dict(params, page=page), ttl(1200))
+                items += d.get("response") or []
+                if d.get("errors"):
+                    errs = True
+                    break
+                pg = d.get("paging") or {}
+                if int(pg.get("current", page) or page) >= int(pg.get("total", 1) or 1):
+                    break
+            if items or not errs:
+                return items
+        return []
+
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
-        futs = {ex.submit(api.pages, "/odds", {"league": lid, "season": s_, "date": date_str, "timezone": tz}, ttl(1200), 3): lid
-                for lid, s_ in lg_keys}
+        futs = {ex.submit(fetch_league_odds, lid, s_): lid for lid, s_ in lg_keys}
         for fu in as_completed(futs):
             try:
                 for item in fu.result():
@@ -1012,8 +1036,10 @@ def collect_day(api, cfg, log, progress):
     log(f"   {len(odds_by)}/{len(cand)} candidates have bookmaker prices -> {len(keep)} continue")
     progress(0.14)
     if not keep:
-        out["reason"] = ("No bookmaker odds were returned for any candidate match, so ticket odds cannot be verified. "
-                         "Check the API errors below (plan restriction, or odds not yet published for this day).")
+        errs = [e for e in api.error_summary() if "/odds" in e][:2] or api.error_summary()[-2:]
+        out["reason"] = ("No bookmaker odds were returned for any candidate match. "
+                         + ("API said: " + " | ".join(e[:170] for e in errs) + ". " if errs else "No error was reported - odds may not be published yet for this day. ")
+                         + "Enable 'model-estimated odds' in Settings to continue with approximate prices.")
         return out
 
     # ── budget-aware cap on how many get deep data ──
@@ -1222,13 +1248,13 @@ def est_tokens(text, cpt):
     return int(len(text) / cpt) + 1
 
 
-def build_ai_pack(matches, tz, cpt, n_ai, sys_prompt, need):
+def build_ai_pack(matches, tz, cpt, n_ai, sys_prompt, need, reserve=OUTPUT_RESERVE):
     """Choose matches + legs-per-match so that prompt + reserved completion <= 8,000 tokens."""
     usable = [m for m in matches if m["legs"]]
     usable.sort(key=lambda m: -(sum(l["rank"] for l in m["legs"][:2]) / min(2, len(m["legs"]))))
     top = usable[:n_ai]
     flagged = sorted([m for m in usable if m["trap"]["risk"] >= 45 and m not in top], key=lambda m: -m["trap"]["risk"])[:2]
-    prompt_cap = TOTAL_TOKEN_BUDGET - OUTPUT_RESERVE - TOKEN_SAFETY
+    prompt_cap = TOTAL_TOKEN_BUDGET - reserve - TOKEN_SAFETY
     sys_tok = est_tokens(sys_prompt, cpt)
     floor = min(need, len(top))
     for n_legs in (5, 4, 3, 2):
@@ -1502,6 +1528,8 @@ def send_telegram(text):
 def build_telegram_message(res, tz):
     nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
     L = [f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])} | {res['n_analysed']} matches analysed | {res['n_ai']} sent to AI"]
+    if res.get("est_mode"):
+        L.append("⚠️ <b>Approximate odds:</b> bookmaker prices were unavailable for some legs, so odds are model-estimated. Bookmakers differ slightly - confirm the price on yours.")
     for t in res["tickets"]:
         ok = "✅" if t["valid"] else "⚠️"
         s = f"🎟 <b>{_esc(t['name'])}</b> {ok}\nOdds <b>{t['odds']:.2f}</b> | joint prob ~{_pct(t['p_joint'])}% | risk {_esc(t.get('risk') or '-')} | evidence {t.get('grade', '?')}"
@@ -1509,7 +1537,7 @@ def build_telegram_message(res, tz):
             m = l["match"]
             ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
             s += (f"\n{nums[i]} <i>{_esc(_short(m['league'], 22))}</i> {ko}\n   {_esc(m['home'])} v {_esc(m['away'])}\n"
-                  f"   ➜ <b>{_esc(l['label'])}</b> @{l['odds']:.2f} (p {_pct(l['p'])}%{' est.odds' if l.get('src') == 'est' else ''})")
+                  f"   ➜ <b>{_esc(l['label'])}</b> @{l['odds']:.2f}{' (books ' + format(l['odds_lo'], '.2f') + '-' + format(l['odds_hi'], '.2f') + ')' if l.get('odds_lo') else ''} (p {_pct(l['p'])}%{' est.odds' if l.get('src') == 'est' else ''})")
             if l.get("why"):
                 s += f"\n   💡 {_esc(l['why'])}"
         if t.get("logic"):
@@ -1675,7 +1703,15 @@ def run_full_analysis(cfg, log, progress):
     state = load_state()
     cpt = min(max(float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN)) * 0.95, 2.4), 3.6)
     sys_p = system_prompt(n_t, cfg["allow_reuse"])
-    sel, id_map, user_prompt, n_legs = build_ai_pack(elig, cfg["tz"], cpt, cfg["n_ai"], sys_p, n_t * LEGS_PER_TICKET)
+    eff = cfg.get("effort") if cfg.get("effort") in EFFORT_RESERVE else "low"
+    for eff_try in [e for e in ("high", "medium", "low") if EFFORT_RESERVE[e] <= EFFORT_RESERVE[eff]]:
+        reserve = EFFORT_RESERVE[eff_try]
+        sel, id_map, user_prompt, n_legs = build_ai_pack(elig, cfg["tz"], cpt, cfg["n_ai"], sys_p, n_t * LEGS_PER_TICKET, reserve)
+        if est_tokens(sys_p + user_prompt, cpt) <= TOTAL_TOKEN_BUDGET - reserve - TOKEN_SAFETY:
+            break
+    if eff_try != eff:
+        log(f"   ℹ️ '{eff}' effort needs more thinking room than the 8,000-token cap allows for this many matches - using '{eff_try}'.")
+    cfg = dict(cfg, effort=eff_try)
     match_legs, leg_index = {}, {}
     for mid, m in id_map.items():
         lst = []
@@ -1736,6 +1772,9 @@ def render_results(res, tz):
     c5.metric("Model", (res.get("model") or "Python optimiser").split("/")[-1] if res["tickets"] else "-")
     if res.get("no_bet"):
         st.error(f"🛑 **NO BET** - {res.get('reason')}")
+        if res.get("api_errors"):
+            st.markdown("**API messages (send these if you need help):**")
+            st.code("\n".join(res["api_errors"]), language="text")
     for t in res["tickets"]:
         st.markdown(f"### 🎟 {t['name']} — odds **{t['odds']:.2f}** {'✅' if t['valid'] else '⚠️ below 3.5'} · joint prob ~{_pct(t['p_joint'])}% · evidence grade **{t.get('grade', '?')}**")
         rows = []
@@ -1743,6 +1782,7 @@ def render_results(res, tz):
             m = l["match"]
             rows.append({"Kick-off": datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M"), "League": m["league"],
                          "Match": f"{m['home']} v {m['away']}", "Pick": l["label"], "Odds": round(l["odds"], 2),
+                         "Books range": (f"{l['odds_lo']:.2f}-{l['odds_hi']:.2f}" if l.get("odds_lo") else "est."),
                          "Model+Mkt %": _pct(l["p"]), "Market fair %": _pct(l["p_mkt"]), "Trap": m["trap"]["risk"],
                          "Data": BASIS_TAG.get(m["basis"]), "Why": l.get("why", "")})
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
@@ -1810,17 +1850,17 @@ def main():
         sims = s2.select_slider("Monte Carlo simulations per match", [10000, 20000, 40000, 80000], 40000)
         w_model = s2.slider("Weight of Monte Carlo model vs bookmaker price", 0.2, 0.8, 0.5, 0.05)
         bookmaker = s2.number_input("Preferred bookmaker id (8 = Bet365, 11 = 1xBet, 4 = Pinnacle)", 1, 500, 8)
-        effort = s2.selectbox("AI reasoning effort (gpt-oss)", ["low", "medium"], help="'medium' thinks more but risks running out of the 8,000-token cap.")
+        effort = s2.selectbox("AI reasoning effort (gpt-oss)", ["low", "medium", "high"], help="Higher effort thinks longer, so the evidence pack is automatically shrunk (fewer matches/legs) to keep prompt + completion within 8,000 tokens. If even that cannot fit, the app steps effort down.")
         exclude_minor = s2.checkbox("Exclude youth / women / reserve teams", True)
         force_leagues = {int(x) for x in re.findall(r"\d+", s2.text_input("Always include league ids (comma separated)", ""))}
         rate_override = int(s2.number_input("Requests/minute override (0 = auto by plan)", 0, 900, 0))
         send_tg = st.checkbox("Send tickets to Telegram automatically", True)
-        send_est = st.checkbox("Also send when odds are MODEL-ESTIMATED (not real prices)", False)
         use_ai = st.checkbox("Use AI (Groq)", True)
         min_dq = st.slider("Minimum data-quality score for a match to qualify", 0.3, 0.9, 0.5, 0.05,
                            help="Matches below this (or with no team-specific data / no real odds) are excluded from tickets.")
         allow_reuse = st.checkbox("Allow the same match in more than one ticket (only if too few matches qualify)", False)
-        allow_est = st.checkbox("Allow MODEL-ESTIMATED odds when the API returns none (NOT recommended)", False)
+        allow_est = st.checkbox("If the API has no odds for a match, use model-estimated approximate odds (clearly labelled)", True,
+                                help="Real bookmaker prices are always preferred (median of all bookmakers). Estimates only fill in when a match has none; trap and market-agreement checks are weaker for those matches.")
         st.markdown(f"**AI order:** {' → '.join(GROQ_MODELS)} · **Hard cap:** {TOTAL_TOKEN_BUDGET} tokens per analysis (prompt + completion, all attempts)")
         if st.button("🧹 Clear API cache"):
             try:
@@ -1858,9 +1898,7 @@ def main():
                 box.update(label=f"Done in {res['seconds']}s" + (" - NO BET" if res.get("no_bet") else ""), state="complete")
                 st.session_state.last_result = res
                 st.session_state.last_tz = tz
-                if send_tg and not res.get("no_bet") and res.get("est_mode") and not send_est:
-                    st.warning("⛔ Not sent to Telegram: odds are model-estimated, not real bookmaker prices.")
-                elif send_tg:
+                if send_tg:
                     msg = build_nobet_message(res, tz) if res.get("no_bet") else build_telegram_message(res, tz)
                     ok, why = send_telegram(msg)
                     (st.success if ok else st.warning)("✅ Sent to Telegram" if ok else f"Telegram failed: {why}")
