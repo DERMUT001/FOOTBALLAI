@@ -12,7 +12,7 @@
 #      1 / X / 2, 1X, X2, 12, BTTS Yes/No, Over/Under 0.5-4.5, team totals, 1H goals,
 #      total corners. Model probabilities are blended with de-vigged bookmaker prices.
 #   4. PYTHON scores every match for "bookmaker trap" risk and builds a safe-leg menu.
-#   5. AI (Groq, gpt-oss-120b -> gpt-oss-20b -> qwen3-32b) acts as bookmaker + quant, reads a
+#   5. AI (Groq, gpt-oss-120b -> gpt-oss-20b -> qwen3.6-27b preview) acts as bookmaker + quant, reads a
 #      compact evidence pack and returns 3 tickets x 5 legs (each ticket odds >= 3.5).
 #      The whole AI step is hard-capped at 8,000 tokens (prompt + completion, all attempts).
 #   6. PYTHON verifies the AI output (real ids, real odds, 5 distinct matches, odds >= 3.5),
@@ -40,11 +40,12 @@ STATE_PATH = os.environ.get("DERAI_FB_STATE", "derai_football_state.json")
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TIMEOUT = 90
-GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3-32b"]
+# qwen/qwen3-32b was retired by Groq on 17 Jul 2026 (replacement: gpt-oss-120b). qwen3.6-27b is a PREVIEW model, used only as a last resort.
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
 GROQ_MODEL_CONFIG = {
     "openai/gpt-oss-120b": {"max_completion_tokens": 4000, "reasoning_effort": "low", "supports_reasoning_effort": True},
     "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "low", "supports_reasoning_effort": True},
-    "qwen/qwen3-32b": {"max_completion_tokens": 3000, "reasoning_effort": "none", "supports_reasoning_effort": True},
+    "qwen/qwen3.6-27b": {"max_completion_tokens": 3000, "reasoning_effort": None, "supports_reasoning_effort": False},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
@@ -1528,6 +1529,25 @@ def _parse_json(content):
     return _parse_json_ex(content)[0]
 
 
+_GROQ_MODELS_CACHE = {"t": 0.0, "ids": None}
+
+
+def groq_available_models(api_key):
+    """Models active on this Groq account (free call). None if it cannot be determined."""
+    if _GROQ_MODELS_CACHE["ids"] is not None and time.time() - _GROQ_MODELS_CACHE["t"] < 3600:
+        return _GROQ_MODELS_CACHE["ids"]
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
+        if r.status_code == 200:
+            ids = {m.get("id") for m in (r.json().get("data") or [])}
+            if ids:
+                _GROQ_MODELS_CACHE.update(t=time.time(), ids=ids)
+                return ids
+    except Exception:
+        pass
+    return None
+
+
 def _retry_after(text):
     m = re.search(r"try again in ([0-9hms.]+)", text or "")
     if not m:
@@ -1550,7 +1570,12 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None):
     est_prompt = est_tokens(system_prompt + user_prompt, cpt)
     info = {"attempts": log, "model": None, "prompt_tokens": 0, "completion_tokens": 0}
     too_large = False
-    for model in GROQ_MODELS:
+    avail = groq_available_models(api_key)
+    chain = [m for m in GROQ_MODELS if not avail or m in avail] or list(GROQ_MODELS)
+    for m in GROQ_MODELS:
+        if m not in chain:
+            log.append({"model": m, "status": "not available on your Groq account - skipped"})
+    for model in chain:
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
         eff = effort or cfg.get("reasoning_effort")
         upper = cfg["max_completion_tokens"]
@@ -2120,7 +2145,11 @@ def test_groq_connection():
     if not key:
         return [("-", "GROQ_API_KEY is not set")]
     rows = []
+    avail = groq_available_models(key)
     for model in GROQ_MODELS:
+        if avail and model not in avail:
+            rows.append((model, "⚪ not available on your Groq account (skipped automatically)"))
+            continue
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
         payload = {"model": model, "max_completion_tokens": 120, "temperature": 0, "response_format": {"type": "json_object"},
                    "messages": [{"role": "user", "content": 'Return exactly this JSON and nothing else: {"ok": true}'}]}
