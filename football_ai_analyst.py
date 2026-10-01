@@ -992,7 +992,7 @@ def trap_analysis(m):
     fav_home = fav == "1"
     pf, pu = (m["ph"], m["pa"]) if fav_home else (m["pa"], m["ph"])
     risk, why = 0, []
-    gap = fp - mp[fav]
+    gap = 0.0 if m.get("basis") == "prior" else fp - mp[fav]     # no fake 'model vs market' traps when the model is just a prior
     if gap >= 0.14:
         risk += 35; why.append(f"{pre}{_pct(fp)}/mdl{_pct(mp[fav])}")
     elif gap >= 0.08:
@@ -1116,7 +1116,7 @@ def build_legs(m, allow_est=False, corners_ok_min=3, relax=0):
             continue
         if not (rx[2] <= odds <= rx[3]):
             continue
-        p_model = m["model_p"].get(key, p)
+        p_model = m["model_p"].get(key, p) if m.get("basis") != "prior" else p_mkt     # a prior-only model carries no information
         if min(p_model, p_mkt) < rx[1]:      # two independent sources must both back the leg
             continue
         pen = 0.05 * (1 - dq) + {"prior": 0.08, "elo": 0.02}.get(m.get("basis"), 0.0)
@@ -1338,28 +1338,39 @@ def collect_day(api, cfg, log, progress):
     elo_tab = EloTable.fetch(date_str, api.cache_dir) if cfg.get("use_elo", True) else EloTable([])
     log(f"📈 ClubElo ratings loaded for {len(elo_tab)} clubs (free, no API quota)" if len(elo_tab) else "📈 ClubElo unavailable right now - continuing without it")
     state0 = load_state()
+    real_today = datetime.now(timezone.utc).date()
+    today_d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    is_free = str(stt.get("plan") or "Free").lower() == "free"
+    # Free plans only serve dates from yesterday to tomorrow (relative to the real date): the database then grows by one day per daily run
+    max_back = state0.get("dh_max_back", 1 if is_free else cfg.get("backfill_days", 14))
     dh_blocked = False
     try:
-        dh_blocked = bool(state0.get("dh_block")) and not force and (datetime.now(timezone.utc).date() - datetime.fromisoformat(state0["dh_block"]).date()).days < 7
+        dh_blocked = bool(state0.get("dh_block")) and not force and (real_today - datetime.fromisoformat(state0["dh_block"]).date()).days < 3
     except Exception:
         pass
-    today_d = datetime.strptime(date_str, "%Y-%m-%d").date()
-    missing = [d for d in ((today_d - timedelta(days=i)).isoformat() for i in range(1, cfg.get("backfill_days", 14) + 1)) if not db.has(d)]
+    wanted = [(today_d - timedelta(days=i)).isoformat() for i in range(1, cfg.get("backfill_days", 14) + 1)]
+    missing = [d for d in wanted if not db.has(d) and (real_today - datetime.fromisoformat(d).date()).days <= max_back]
     n_bf = 0 if dh_blocked else min(len(missing), max(0, int((budget - api.calls) * 0.30)))
     if missing and n_bf:
         log(f"🗄 Building the free results database: fetching {n_bf} past day(s) (1 call = every match worldwide on that date; stored permanently)")
         for d in missing[:n_bf]:
             dd = api.get("/fixtures", {"date": d}, 30 * 86400)
             if dd.get("errors"):
-                if not api.quota_out:
+                msg = json.dumps(dd.get("errors"))
+                mw = re.search(r"try from (\d{4}-\d{2}-\d{2})", msg)
+                if mw:                                   # "Free plans do not have access to this date, try from X to Y"
+                    state0["dh_max_back"] = max(0, (real_today - datetime.fromisoformat(mw.group(1)).date()).days)
+                    save_state(state0)
+                    log(f"   ℹ️ Your plan only serves dates from {mw.group(1)} - the results database will grow by one day per daily run")
+                elif not api.quota_out:
                     state0["dh_block"] = datetime.now(timezone.utc).isoformat()
                     save_state(state0)
-                log("   ℹ️ Past-date fixture dumps are not available on your plan - skipping the results database")
+                    log("   ℹ️ Past-date fixture dumps are not available on your plan - pausing the results database for 3 days")
                 break
             db.add_day(d, dd.get("response") or [])
         db.save()
-    elif dh_blocked:
-        log("🗄 Results database skipped (your plan blocked past-date dumps recently; retried after 7 days)")
+    elif not missing:
+        log("🗄 Results database is up to date for the dates your plan allows")
     log(f"   results database: {len(db.days)} day(s), {sum(len(v) for v in db.days.values())} finished matches")
 
     state_ = load_state()
@@ -1504,11 +1515,11 @@ def collect_day(api, cfg, log, progress):
         core[fid] = c
         if sum(1 for x in core.values() if viable(x)) >= 2:
             break
-    skip_pred = not any(viable(c) for c in core.values())
-    if skip_pred:
+    skip_pred = (not any(viable(c) for c in core.values())) and ((budget - api.calls) < 2.2 * len([m for m in sl if m["id"] not in core]))
+    if not any(viable(c) for c in core.values()):
         out["warnings"].append("The API returned no usable team data for the matches probed, so the analysis continued with free fallbacks "
                                "(results database, ClubElo, competition averages). Matches resting on thin data are labelled.")
-        log("   ⚠️ No usable team data from the API for the probed matches - continuing with free fallbacks (and saving predictions calls)")
+        log("   ⚠️ No usable team data from the API for the probed matches - continuing with free fallbacks" + (" (and saving predictions calls for odds)" if skip_pred else ""))
     rest = [m for m in sl if m["id"] not in core]
     done = len(core)
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
@@ -1532,11 +1543,16 @@ def collect_day(api, cfg, log, progress):
             e["d"] = datetime.now(timezone.utc).isoformat()
     save_state(st2)
     if caps["fixture_odds"]:
-        log("💰 Fetching per-fixture bookmaker odds (only for matches that have usable team data)...")
+        cand_o = [m for m in sl if m["id"] not in odds_by and m.get("cov_odds") is not False]
+        vi_ids = {m["id"] for m in cand_o if viable(core.get(m["id"]) or {"pred": None, "rh": [], "ra": []})}
+        todo_odds = [m for m in cand_o if m["id"] in vi_ids]
+        if not cfg.get("strict_gate"):               # never-stop: odds are the strongest evidence when team data is thin -> use spare budget on them
+            spare = max(0, (budget - api.calls) - 4 - len(todo_odds))
+            todo_odds += [m for m in cand_o if m["id"] not in vi_ids][:spare]
+        log(f"💰 Fetching per-fixture bookmaker odds for {len(todo_odds)} matches (real prices are the strongest evidence when team data is thin)...")
         with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
             futs = {ex.submit(lambda mm: api.get("/odds", {"fixture": mm["id"]}, ttl(1200), True).get("response") or [], m): m
-                    for m in sl if m["id"] not in odds_by and m.get("cov_odds") is not False
-                    and viable(core.get(m["id"]) or {"pred": None, "rh": [], "ra": []})}
+                    for m in todo_odds}
             for fu in as_completed(futs):
                 try:
                     store_odds(fu.result(), futs[fu]["id"])
@@ -1596,7 +1612,8 @@ def collect_day(api, cfg, log, progress):
         mu_ch, mu_ca, cn = estimate_corners(ph, pa, lam_h, lam_a)
         mc = monte_carlo(lam_h, lam_a, mu_ch, mu_ca, n=cfg["sims"], seed=int(m["id"]) % (2 ** 31))
         odds = odds_by.get(m["id"], {})
-        p_bl, mkt = blend_probs(mc["p"], odds, cfg["w_model"])
+        w_eff = cfg["w_model"] if basis in ("season+recent", "season", "recent") else min(cfg["w_model"], 0.15)
+        p_bl, mkt = blend_probs(mc["p"], odds, w_eff)
         api_d = api_dist(c["pred"])
         elo_d = poisson_1x2(*elo_lambdas(elo[0], elo[1], prior)) if (elo and basis != "elo") else None
         ext_d, ext_name = (api_d, "api") if api_d else ((elo_d, "elo") if elo_d else (None, None))
@@ -1633,7 +1650,7 @@ DATA KEY: S+R/R/S/E/P after dq = data behind xG: season+recent form / recent for
 HARD RULES
 1. Pick legs ONLY by exact id from LEGS lists. Never invent legs/odds/matches. Python recomputes odds and rejects invalid picks.
 2. Exactly @NT@ ticket(s) x 5 legs; 5 different matches per ticket@REUSE@.
-3. Each ticket's combined odds (product of leg odds) must be >= 3.50; aim 3.5-4.6. Reach it with well-priced SAFE legs, never by adding a fragile leg.
+3. Each ticket's combined odds (product of leg odds) must be >= 3.50; aim 3.5-4.6. Reach it with well-priced SAFE legs; if safe legs cannot reach it, add the least fragile * legs and set risk HIGH. NEVER return an empty or short tickets list: thin data is expected, so build the best possible tickets and say honestly how risky they are.
 4. Maximise each ticket's win probability (product of p) subject to rule 3. Prefer p>=75; accept 65-74 only with strong evidence.
 5. Ticket 1 = safest possible, Ticket 2 (if any) = balanced, Ticket 3 (if any) = best value (positive edge) but still solid. Quality over quantity: if a leg is merely mediocre, swap it for a safer one from the list.
 
@@ -1645,7 +1662,7 @@ HOW TO REASON
 - Diversify market types and leagues; avoid five Overs or five favourites; do not stack legs with the same failure mode. Categories: TOP=major leagues, MID, INTL=international/continental, LOW=thin data (needs extra margin). Low dq (<0.6), unreleased lineups near kickoff, friendlies need extra margin or exclusion.
 
 OUTPUT: ONE JSON object only, no markdown, all reasoning inside these fields, terse:
-{"tickets":[{"name":"Ticket 1 - Safest","legs":[{"id":"m3.1X","why":"<=14 words of evidence"}, ...5 legs],"logic":"<=40 words: why these five together, what could break it","risk":"LOW|MED"}, ...@NT@ tickets],"traps":[{"id":"m5","note":"<=20 words: trap read + action"}],"avoid":[{"id":"m9","why":"<=12 words"}],"summary":"<=50 words overall slate read"}"""
+{"tickets":[{"name":"Ticket 1 - Safest","legs":[{"id":"m3.1X","why":"<=14 words of evidence"}, ...5 legs],"logic":"<=40 words: why these five together, what could break it","risk":"LOW|MED|HIGH"}, ...@NT@ tickets],"traps":[{"id":"m5","note":"<=20 words: trap read + action"}],"avoid":[{"id":"m9","why":"<=12 words"}],"summary":"<=50 words overall slate read"}"""
 
 
 def system_prompt(n_tickets, reuse):
@@ -1655,6 +1672,9 @@ def system_prompt(n_tickets, reuse):
 
 def format_match_block(mid, m, n_legs, tz):
     p = m["p"]
+    thin_model = m.get("basis") == "prior"
+    xg_txt = "xG n/a" if thin_model else f"xG {m['lam_h']:.2f}-{m['lam_a']:.2f}"
+    mdl_txt = "n/a" if thin_model else f"{_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])}"
     ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
     ph, pa = m["ph"], m["pa"]
     mk = m.get("mkt_1x2")
@@ -1686,7 +1706,7 @@ def format_match_block(mid, m, n_legs, tz):
     trap = f"TRAP{t['risk']}: {', '.join(t['reasons'])}" if t["risk"] >= 25 else f"TRAP{t['risk']}"
     legs = " ; ".join(f"{mid}.{l['key']}@{l['odds']:.2f}/p{_pct(l['p'])}{'*' if l.get('rx') else ''}/m{_pct(l['p_mkt'])}/e{l['edge'] * 100:+.0f}" for l in m["legs"][:n_legs])
     return (f"#{mid} {m['cat']}|{_short(m['league'], 18)} {_short(m['home'], 15)} v {_short(m['away'], 15)} {ko} dq{m['dq']} {BASIS_TAG.get(m['basis'], '?')}\n"
-            f"xG {m['lam_h']:.2f}-{m['lam_a']:.2f} mdl {_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])} mkt {mk_txt} {'ELO' if m.get('ext_name') == 'elo' else 'API'} {api_txt}"
+            f"{xg_txt} mdl {mdl_txt} mkt {mk_txt} {'ELO' if m.get('ext_name') == 'elo' else 'API'} {api_txt}"
             f" | BTTS{_pct(p['BTTS_Y'])} O1.5:{_pct(p['O1.5'])} O2.5:{_pct(p['O2.5'])} O3.5:{_pct(p['O3.5'])}{corn}\n"
             f"{side(ph, 'H')} | {side(pa, 'A')}{rk} | {h2}\n"
             f"inj H:{inj(ph)} A:{inj(pa)} | lu H:{lu(ph)} A:{lu(pa)} | star H:{star(ph)} A:{star(pa)}\n"
@@ -1712,7 +1732,7 @@ def build_ai_pack(matches, tz, cpt, n_ai, sys_prompt, need, reserve=OUTPUT_RESER
             if flagged and n > floor + len(flagged):
                 sel = top[:n - len(flagged)] + flagged
             ids = {id(m): f"m{i + 1}" for i, m in enumerate(sel)}
-            user = (f"SLATE: {len(sel)} pre-screened matches (of {len(matches)} analysed). Build the ticket(s) from these LEGS only.\n\n"
+            user = (f"SLATE: {len(sel)} pre-screened matches (of {len(matches)} analysed). Build exactly {need // LEGS_PER_TICKET} ticket(s) from these LEGS only. You MUST return them: thin data is expected, so choose the least-bad legs and flag the risk - never return an empty list.\n\n"
                     + "\n\n".join(format_match_block(ids[id(m)], m, n_legs, tz) for m in sel))
             if sys_tok + est_tokens(user, cpt) <= prompt_cap:
                 return sel, {ids[id(m)]: m for m in sel}, user, n_legs
@@ -1840,8 +1860,9 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None):
         for attempt in range(3):
             cap = min(upper, budget.remaining - p_est - 60, limit - p_est - 60)
             if cap < MIN_COMPLETION:
-                log.append({"model": model, "status": f"SKIPPED_BUDGET(prompt~{p_est}, cap={cap})"})
-                too_large = True
+                log.append({"model": model, "status": f"SKIPPED_BUDGET(prompt~{p_est}, cap={cap}, tokens already used {budget.used})"})
+                if budget.used == 0:
+                    too_large = True
                 break
             payload = {"model": model, "temperature": 0.2, "max_completion_tokens": int(cap),
                        "response_format": {"type": "json_object"},
@@ -1872,7 +1893,9 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None):
                     info["salvaged"] = salvaged
                     info["model"], info["status"] = model, "SUCCESS"
                     return parsed, info
-                log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')} (completion {ct} of cap {cap})"})
+                log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')} (completion {ct} of cap {cap}) reply={content[:200]!r}"})
+                if parsed is not None:
+                    info["declined"] = parsed
                 break
             body = (r.text or "")[:240]
             low = body.lower()
@@ -1901,7 +1924,12 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None):
                 break
             log.append({"model": model, "status": f"HTTP_{r.status_code} {body[:100]} (retrying)"})
             time.sleep(2.5 * (attempt + 1))
-    info["status"] = "PROMPT_TOO_LARGE" if too_large and not info["model"] else "FAILED"
+    if too_large and budget.used == 0:
+        info["status"] = "PROMPT_TOO_LARGE"
+    elif any(a["status"].startswith("BAD_OUTPUT") for a in log):
+        info["status"] = "BAD_OUTPUT"
+    else:
+        info["status"] = "FAILED"
     return None, info
 
 
@@ -2326,13 +2354,19 @@ def save_tickets_to_ledger(date_str, tickets):
     save_state(state)
 
 
-def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
+def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None, hint=""):
     """The AI gets the FIRST attempt at choosing every leg. Python only verifies/repairs. If the AI fails, no ticket is produced
     unless the user explicitly allows a Python-only fallback."""
     warnings = []
     state = load_state()
     cpt = min(max(float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN)) * 0.95, 2.4), 3.6)
     sys_p = system_prompt(n_t, cfg["allow_reuse"])
+    top_mo = sorted((max(l["odds"] for l in m["legs"]) for m in elig if m["legs"]), reverse=True)[: n_t * LEGS_PER_TICKET]
+    if top_mo and math.exp(sum(math.log(x) for x in top_mo) / len(top_mo)) ** LEGS_PER_TICKET < MIN_TICKET_ODDS * 1.08:
+        for m in elig:
+            have = {l["key"] for l in m["legs"]}
+            m["legs"] = m["legs"] + [l for l in build_legs(m, allow_est=True, relax=3) if l["key"] not in have][:4]
+        log("   ℹ️ The safe legs alone cannot reach 3.5 odds, so higher-priced '*' legs were added to the options the AI can choose from (lower confidence).")
     eff = cfg.get("effort") if cfg.get("effort") in EFFORT_RESERVE else "low"
 
     def make_pack(cpt_):
@@ -2358,6 +2392,7 @@ def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
         return sel_, id_map_, user_, n_legs_, eff_try, ml_, li_
 
     sel, id_map, user_prompt, n_legs, eff_try, match_legs, leg_index = make_pack(cpt)
+    user_prompt += ("\n\n" + hint) if hint else ""
     if eff_try != eff:
         log(f"   ℹ️ '{eff}' effort needs more thinking room than the 8,000-token cap allows for this many matches - using '{eff_try}'.")
     log(f"📦 AI pack: {len(sel)} matches x {n_legs} legs | est. prompt {est_tokens(sys_p + user_prompt, cpt)} tokens (hard cap {TOTAL_TOKEN_BUDGET} incl. completion)")
@@ -2372,6 +2407,7 @@ def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
             new_cpt = min(max(info["actual_cpt"] * 0.97, 1.8), cpt)
             log(f"   ℹ️ The real prompt was bigger than estimated ({info['actual_cpt']:.2f} chars/token) - rebuilding a smaller pack and retrying.")
             sel, id_map, user_prompt, n_legs, eff_try, match_legs, leg_index = make_pack(new_cpt)
+            user_prompt += ("\n\n" + hint) if hint else ""
             prev = info["attempts"]
             ai, info = call_groq_budgeted(sys_p, user_prompt, budget, new_cpt, eff_try)
             info["attempts"] = prev + info["attempts"]
@@ -2393,7 +2429,9 @@ def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
     else:
         draft = python_only_tickets(match_legs, n_t)
         if cfg["use_ai"]:
-            ai_note = " | ".join(f"{a['model'].split('/')[-1]}: {a['status'][:110]}" for a in info.get("attempts", [])[-3:])
+            ai_note = " | ".join(f"{a['model'].split('/')[-1]}: {a['status'][:260]}" for a in info.get("attempts", [])[-3:])
+            if (info.get("declined") or {}).get("summary"):
+                ai_note += f" | AI said: {str(info['declined']['summary'])[:200]}"
             if cfg.get("allow_py_fallback"):
                 tickets = draft
                 warnings.append(f"AI analysis failed ({info.get('status')}): {ai_note}. Python-only tickets were used because you allowed that fallback.")
@@ -2423,8 +2461,11 @@ def rerun_ai(res, cfg, log):
     n_t = plan_ticket_count(len(elig), cfg)
     if n_t == 0:
         return res
-    stage = run_ai_stage(elig, n_t, cfg, log)
-    old = [w for w in res.get("warnings", []) if not any(k in w for k in ("AI analysis failed", "AI unavailable", "MODEL-ESTIMATED", "token cap", "mostly Python-built"))]
+    prev_status = (res.get("info") or {}).get("status")
+    hint = ("IMPORTANT: your previous reply was rejected because it contained no usable tickets. Return the complete JSON with every ticket now, "
+            "choosing the least-bad legs and flagging the risk.") if prev_status == "BAD_OUTPUT" else ""
+    stage = run_ai_stage(elig, n_t, cfg, log, hint=hint)
+    old = [w for w in res.get("warnings", []) if not any(k in w for k in ("AI analysis failed", "AI unavailable", "MODEL-ESTIMATED", "token cap", "mostly Python-built", "supplied too few valid legs"))]
     new = dict(res, tickets=stage["tickets"], ai=stage["ai"], model=stage["model"], info=stage["info"], tokens=stage["tokens"], n_ai=len(stage["sel"]),
                id_map=stage["id_map"], user_prompt=stage["user_prompt"], est_mode=stage["est_mode"], ai_note=stage["ai_note"],
                ai_failed=stage["ai_failed"], python_draft=stage["python_draft"], warnings=old + stage["warnings"], cfg=cfg)
