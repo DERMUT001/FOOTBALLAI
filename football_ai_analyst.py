@@ -12,7 +12,7 @@
 #      If API-Football is unreachable / out of quota the app still analyses from free sources only.
 #   3. PYTHON runs a Monte Carlo per match and blends it with de-vigged bookmaker prices.
 #   4. PYTHON builds a WIDE leg menu (safe legs + clearly-labelled borderline legs) - the AI decides.
-#   5. AI (Groq) works in up to three passes, paced by a tokens-per-minute governor:
+#   5. AI (Groq) works in short focused calls (scout, ONE desk call per ticket, audit), paced by a tokens-per-minute governor:
 #        SCOUT  - reads a compact view of ALL qualified matches and picks the ones worth studying
 #        DESK   - full evidence on the finalists, builds 3 tickets x 5 legs with a failure scenario per leg
 #        AUDIT  - a risk officer tries to break every leg, swaps weak legs and fills any gap
@@ -41,11 +41,11 @@ CACHE_PURGE_DAYS = 8          # finished-match data never changes, so it may liv
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TIMEOUT = 90
-GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3-32b"]
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"]   # a model that answers 404 is remembered as unavailable and skipped
 GROQ_MODEL_CONFIG = {
     "openai/gpt-oss-120b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
     "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
-    "qwen/qwen3-32b": {"max_completion_tokens": 3000, "reasoning_effort": "none", "supports_reasoning_effort": True},
+    "llama-3.3-70b-versatile": {"max_completion_tokens": 2500, "reasoning_effort": None, "supports_reasoning_effort": False},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
@@ -53,16 +53,16 @@ NON_RETRYABLE = {400, 401, 403, 404, 422}
 # ── Token policy ────────────────────────────────────────────────────────────
 # Groq's free tier allows ~9,000 tokens PER MINUTE. Every single request must fit in that, and several
 # requests are spread over time by the TpmGovernor (it sleeps until the rolling 60-second window has room).
-GROQ_TPM_DEFAULT = 9000
+GROQ_TPM_DEFAULT = 8000      # Groq reported "Limit 8000" for your account: every single request (prompt + reply room) must fit in it
 TPM_MARGIN = 350              # per-request ceiling = TPM limit - margin
 WINDOW_MARGIN = 150           # rolling-window budget = TPM limit - margin (must stay > per-request ceiling)
-RUN_TOKEN_CAP_DEFAULT = 32000  # all passes of one analysis together (protects the daily token allowance)
+RUN_TOKEN_CAP_DEFAULT = 45000  # all passes of one analysis together (protects the daily token allowance)
 EFFORT_RESERVE = {"low": 2200, "medium": 3000, "high": 3800}   # completion room (incl. hidden reasoning) per effort
 SCOUT_RESERVE, AUDIT_RESERVE = 1500, 2200
 OUTPUT_RESERVE = 3000
 TOKEN_SAFETY = 100
 MIN_COMPLETION = 900
-DEFAULT_CHARS_PER_TOKEN = 3.0  # deliberately conservative for dense numeric text
+DEFAULT_CHARS_PER_TOKEN = 2.3  # measured: dense numeric evidence tokenizes at ~2.2 chars/token (the scout pass re-measures it every run)
 
 # ── Ticket rules ────────────────────────────────────────────────────────────
 N_TICKETS, LEGS_PER_TICKET, MIN_TICKET_ODDS = 3, 5, 3.5
@@ -1715,7 +1715,11 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
             continue
         p_model = m["model_p"].get(key, p)
         agree = min(p_model, p_mkt)
-        if agree >= MIN_AGREE_P:
+        if src == "est":
+            if p_model < 0.74 or p < 0.74:      # no bookmaker quote = no market check: only clear-cut legs, always shown as borderline
+                continue
+            tier = "B"
+        elif agree >= MIN_AGREE_P:
             tier = "S"
         elif wide and agree >= BORDER_AGREE_P:
             tier = "B"
@@ -1733,6 +1737,8 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
         pen += 0.5 * max(0.0, abs(p_model - p_mkt) - 0.08)   # unexplained model/market disagreement
         if tier == "B":
             pen += 0.02
+        if src == "est":
+            pen += 0.04
         p_adj = p - pen
         if p_adj < (MIN_LEG_P if tier == "S" else BORDER_MIN_P):
             continue
@@ -1764,6 +1770,8 @@ def gate_reasons(m, cfg):
         why.append("no team-specific data (league-average defaults only)")
     if not m["odds"] and not cfg.get("allow_est"):
         why.append("no real bookmaker odds")
+    if (m.get("form_age_days") or 0) > 200:
+        why.append(f"newest form result is {m['form_age_days']} days old")
     if m["dq"] < cfg.get("min_dq", 0.5):
         why.append(f"data quality {m['dq']} < {cfg.get('min_dq', 0.5)}")
     if not why:
@@ -2374,29 +2382,32 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # Evidence packs for the AI (three passes: SCOUT -> DESK -> AUDIT) under a per-minute token governor
 # ═════════════════════════════════════════════════════════════════════════════
-DESK_PROMPT = """You are two people at once: head of trading at a sharp sportsbook (you know how prices are shaded to punish public money) and a professional quant analyst. Python collected the data, ran a Monte Carlo per match (Poisson goals, shared tempo, Dixon-Coles, negative-binomial corners), blended it with de-vigged bookmaker prices (ClubElo/API % when no prices) and screened every leg. YOU decide: audit the evidence and build @NT@ accumulator(s) of 5 legs.
+DESK_PROMPT = """You are head of trading at a sharp sportsbook and a quant analyst at once. Python collected the data, ran a Monte Carlo per match (Poisson goals, shared tempo, Dixon-Coles, corners), blended it with de-vigged bookmaker prices (Elo/API % when there are no prices) and screened every leg. YOU decide: audit the evidence and build @WHAT@.
 
-DATA KEY: dq=data quality 0-1; S+R/R/S/E = data behind xG (season+recent / recent / season / Elo-only); xG=home-away expected goals; mdl=model 1X2 %; mkt=bookmaker 1/X/2 prices (fd=free-source prices); elo/API=independent win %; H/A lines: form oldest>newest, ppg=points/game last5, gf/ga=weighted goals for/against, rt=player rating, rk=table rank; last=recent scores; H2H=W-D-L from home view + goals/game; inj=missing (*=key starter, F/M/D/G, ?=doubtful), inj n/a = UNKNOWN (a risk, not a clean sheet); lu=formation, ?=not released, ROT=key starters benched; TRAP=Python trap score 0-100 + reasons; NATIONAL=national team (Elo computed from its full international history); formNd-old = the newest result behind the form numbers is N days old (squads, coaches and tournaments may have changed: demand extra margin, trust Elo/market more).
-LEGS: id@odds/p=blended prob %/m=margin-free market prob %/e=edge %. Suffix ~ = borderline (weaker safety screen: use only if no safer leg AND strong evidence), ^ = price derived/estimated, not a real quote.
+DATA: dq=quality 0-1; S+R/R/S/E=data behind xG (season+recent/recent/season/Elo only); NATIONAL=national team (Elo from its international history); formNd-old=newest result is N days old (squads/coaches may have changed: demand margin, trust Elo/market more); xG=home-away; mdl=model 1X2 %; mkt=bookmaker 1/X/2 prices (fd=free source), then independent elo/API %; H/A lines: form oldest>newest, ppg, gf/ga weighted goals, rt rating, rk table rank, last=recent scores; H2H=W-D-L home view; inj=missing (*=key,?=doubtful), inj n/a=UNKNOWN (a risk, not clean); lu=lineup (?=not out, ROT=rotation); TRAP=Python trap score 0-100.
+LEGS: id@odds/p=blended %/m=market fair %/e=edge %. ~=borderline (only if no safer leg and strong evidence). ^=derived/estimated price: no real quote and no market check, avoid unless clearly best.
 
-HARD RULES
-1. Legs ONLY by exact id from LEGS lists. Never invent legs/odds/matches; Python recomputes odds and rejects invalid picks.
-2. Exactly @NT@ ticket(s) x 5 legs, 5 different matches per ticket@REUSE@.
-3. Ticket odds (product of leg odds) >= 3.50, aim 3.5-4.6, reached with well-priced SAFE legs, never a fragile one.
-4. Maximise each ticket's win probability (product of p). Prefer p>=75; 65-74 only with strong evidence; avoid ~ legs.
-5. Ticket 1 safest possible, 2 balanced, 3 best value (positive edge) yet solid.@RELAXED@
+RULES
+1. Choose legs ONLY by exact id from the LEGS lists shown; never invent. Python recomputes odds.
+2. @STRUCT@
+3. Ticket odds (product of leg odds) >= 3.50, aim 3.5-4.6, from well-priced SAFE legs.
+4. Maximise the ticket's win probability (product of p); prefer p>=75, 65-74 only with strong evidence.
+@ROLE@
 
-HOW TO REASON (before answering)
-- Price vs model: if mkt and mdl differ >8pts, or p and m differ >8pts, explain with hard evidence (injuries, lineups, form, motivation); no evidence = trust the market. A big +edge on a short price is usually model error.
-- TRAP: TRAP>=45 suspect, 30-44 watch (favourite shorter than model, poor-form favourite, key starters out/rotated, dangerous underdog, away favourite, draw>=27%, cups/friendlies/dead rubbers). In a suspect match NEVER use the favourite-win leg; skip it, or use a leg that survives the trap (double chance, goals, Under/BTTS-No) only with high p and evidence.
-- Failure test per leg: name the scenario that loses it (early red, 1-0 low block, rotation, tempo) and judge how common it is; reject legs whose losing scenario is common.
-- Goals logic (Python lint-checks it): Over1.5 needs total xG>=2.6; Over2.5 >=3.0; Under2.5 <=2.3; BTTS-No needs a side with xG<=0.9; team Over1.5 needs own xG>=1.9; corners only with dq>=0.6.
-- Unknown injuries/lineups, dq<0.6, friendlies, Elo-only data = demand extra margin.
-- Diversify markets and leagues; never stack the same failure mode (no 4+ legs of one market type).
-- Multiply each ticket's odds and confirm the five matches are distinct before answering.
+REASONING (do it before answering)
+- If mkt vs mdl, or p vs m, differ >8pts explain with hard evidence (injuries, lineups, form, motivation); no evidence = trust the market. A big +edge on a short price is usually model error.
+- TRAP>=45 suspect, 30-44 watch (favourite shorter than model, poor-form favourite, key starters out/rotated, dangerous underdog, away favourite, draw>=27%, friendlies, dead rubbers, stale form). In a suspect match never use the favourite-win leg.
+- For every leg name the scenario that loses it and judge how common it is; reject common ones.
+- Python lint-checks: Over1.5 needs total xG>=2.6; Over2.5 >=3.0; Under2.5 <=2.3; BTTS-No needs a side xG<=0.9; team Over1.5 needs own xG>=1.9; corners only with dq>=0.6.
+- Unknown injuries/lineups, dq<0.6, friendlies, Elo-only or stale data = demand extra margin. Diversify markets; never 4+ legs of one type.
+- Multiply the odds and confirm 5 distinct matches before answering.@RELAXED@
 
-OUTPUT: ONE JSON object only, no markdown, terse:
-{"tickets":[{"name":"Ticket 1 - Safest","legs":[{"id":"m3.1X","why":"<=12 words of evidence","fail":"<=8 words: scenario that loses it","vs":"<=10 words, ONLY if p and m differ >8pts"}, ...5 legs],"logic":"<=35 words","risk":"LOW|MED"}, ...@NT@],"traps":[{"id":"m5","note":"<=16 words"}],"avoid":[{"id":"m9","why":"<=10 words"}],"summary":"<=40 words"}"""
+OUTPUT: ONE JSON object only, no markdown:
+{"tickets":[{"name":"...","legs":[{"id":"m3.1X","why":"<=12 words evidence","fail":"<=8 words: scenario that loses it","vs":"<=10 words, ONLY if p and m differ >8pts"}, ...5 legs],"logic":"<=30 words","risk":"LOW|MED"}],"traps":[{"id":"m5","note":"<=14 words"}],"avoid":[{"id":"m9","why":"<=10 words"}],"summary":"<=30 words"}"""
+
+DESK_ROLES = ["This is Ticket 1: the SAFEST possible ticket.",
+              "This is Ticket 2: BALANCED - strong probability plus some positive edge.",
+              "This is Ticket 3: VALUE - the best price-versus-evidence legs that are still solid."]
 
 SCOUT_PROMPT = """You are head of trading at a sharp sportsbook and a quant analyst. Python analysed @N@ matches (Monte Carlo + de-vigged market prices). There is room to study only @K@ of them in depth, and @NT@ accumulator(s) x 5 legs from separate matches are needed (at least @NEED@ usable matches).
 
@@ -2415,10 +2426,12 @@ ok=true keeps a leg. ok=false needs a swap: an id from that leg's ALT list (same
 OUTPUT: ONE JSON object only: {"legs":[{"id":"m3.1X","ok":true,"risk":"LOW|MED|HIGH","issue":"<=14 words"}, ...one per leg],"swaps":[{"old":"m4.O2.5","new":"m4.O1.5"}],"fills":[{"t":2,"id":"m9.1X"}],"note":"<=30 words"}"""
 
 
-def desk_prompt(n_tickets, reuse, relaxed=False):
-    return (DESK_PROMPT.replace("@NT@", str(n_tickets))
-            .replace("@REUSE@", "; a match may appear in more than one ticket only if unavoidable" if reuse else f"; {n_tickets * LEGS_PER_TICKET} different matches overall (no match reused)")
-            .replace("@RELAXED@", "\n   NOTE: the slate is thin so some safety thresholds were relaxed: be stricter yourself, prefer the best available legs and mark risk MED where honest." if relaxed else ""))
+def desk_prompt(ti, n_tickets, reuse, relaxed=False):
+    """Prompt for ONE ticket (ticket index ti, 0-based): one focused request per ticket keeps each call inside Groq's per-request limit."""
+    return (DESK_PROMPT.replace("@WHAT@", f"ticket {ti + 1} of {n_tickets}: one 5-leg accumulator")
+            .replace("@STRUCT@", "Exactly 1 ticket of 5 legs from 5 different matches." + (" Earlier tickets are listed below; avoid their legs and matches wherever possible." if reuse and ti > 0 else ""))
+            .replace("@ROLE@", DESK_ROLES[min(ti, 2)])
+            .replace("@RELAXED@", "\n- The slate is thin so some safety thresholds were relaxed: be stricter yourself, prefer the best available legs, mark risk MED where honest." if relaxed else ""))
 
 
 def scout_prompt(n, k, n_tickets, need):
@@ -2522,28 +2535,24 @@ def rank_matches(ms):
     return usable
 
 
-def build_ai_pack(matches, tz, cpt, n_ai, sys_prompt, need, reserve, ceiling):
-    """DESK pack: as many matches as the per-request ceiling allows (at least `need`), at the richest detail that fits."""
-    top = rank_matches(matches)[:n_ai]
-    flagged = sorted([m for m in rank_matches(matches) if m["trap"]["risk"] >= 45 and m not in top], key=lambda m: -m["trap"]["risk"])[:2]
+def build_ai_pack(matches, tz, cpt, sys_prompt, floor, reserve, ceiling, labels, extra=""):
+    """DESK pack for ONE ticket: as many matches as one request allows (at least `floor`), richest detail that fits.
+    `labels` maps id(match) -> global label (m1, m7, ...) so ids stay unique across the per-ticket calls."""
+    top = [m for m in matches if m["legs"]]            # keep the caller's order (the scout's best-first ranking)
     prompt_cap = ceiling - reserve - TOKEN_SAFETY
-    sys_tok = est_tokens(sys_prompt, cpt)
-    floor = min(need, len(top))
+    sys_tok = est_tokens(sys_prompt + extra, cpt)
+    floor = max(1, min(floor, len(top)))
     for detail in (3, 2, 1):
         for n_legs in (6, 5, 4, 3):
-            for n in range(len(top), max(0, floor - 1), -1):
+            for n in range(len(top), floor - 1, -1):
                 sel = top[:n]
-                if flagged and n > floor + len(flagged):
-                    sel = top[:n - len(flagged)] + flagged
-                ids = {id(m): f"m{i + 1}" for i, m in enumerate(sel)}
-                user = (f"SLATE: {len(sel)} matches (of {len(matches)} analysed). Build the ticket(s) from these LEGS only.\n\n"
-                        + "\n\n".join(format_match_block(ids[id(m)], m, n_legs, tz, detail) for m in sel))
+                user = (f"CANDIDATES: {len(sel)} matches. Build the ticket from these LEGS only.\n{extra}\n"
+                        + "\n\n".join(format_match_block(labels[id(m)], m, n_legs, tz, detail) for m in sel))
                 if sys_tok + est_tokens(user, cpt) <= prompt_cap:
-                    return sel, {ids[id(m)]: m for m in sel}, user, n_legs, detail
-    sel = top[:max(floor, 1)]
-    ids = {id(m): f"m{i + 1}" for i, m in enumerate(sel)}
-    user = "SLATE:\n\n" + "\n\n".join(format_match_block(ids[id(m)], m, 2, tz, 1) for m in sel)
-    return sel, {ids[id(m)]: m for m in sel}, user, 2, 1
+                    return sel, {labels[id(m)]: m for m in sel}, user, n_legs, detail
+    sel = top[:floor]
+    user = "CANDIDATES:\n" + "\n\n".join(format_match_block(labels[id(m)], m, 2, tz, 1) for m in sel)
+    return sel, {labels[id(m)]: m for m in sel}, user, 2, 1
 
 
 def build_scout_pack(pool, tz, cpt, sys_prompt, reserve, ceiling):
@@ -2712,10 +2721,30 @@ def _retry_after(text):
     return sec
 
 
+def _dead_models():
+    try:
+        d = load_state().get("dead_models") or {}
+        return {m for m, t in d.items() if time.time() - float(t) < 7 * 86400}
+    except Exception:
+        return set()
+
+
+def _mark_dead(model):
+    try:
+        st_ = load_state()
+        st_.setdefault("dead_models", {})[model] = time.time()
+        save_state(st_)
+    except Exception:
+        pass
+
+
 def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov=None, ceiling=None, expect="tickets", log_fn=None, label="desk"):
-    """One Groq pass inside the per-request ceiling and the run-level token cap. The prompt estimate is padded, the completion cap
-    is bounded by the reasoning effort, the TpmGovernor spaces passes out over the minute, and 413/429 messages are parsed so the
-    request is corrected (and the real tokens-per-minute limit learned) instead of blindly retried."""
+    """One Groq request inside the per-request ceiling and the run-level token cap.
+    - the TpmGovernor spaces requests over the minute;
+    - 413 'too large' replies are used to MEASURE the real prompt size and shrink the reply room (or report PROMPT_TOO_LARGE so the
+      caller can rebuild a smaller prompt);
+    - 400 'Failed to validate JSON' replies carry the model's partial output: it is salvaged, or the request is retried without JSON mode;
+    - a model that answers 404 is remembered as unavailable and skipped on later runs."""
     api_key = get_secret("GROQ_API_KEY", "").strip()
     log = []
     info = {"attempts": log, "model": None, "prompt_tokens": 0, "completion_tokens": 0, "label": label, "waited": 0.0, "fallback": False}
@@ -2727,8 +2756,11 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
     chars = len(system_prompt + user_prompt)
     est_prompt = est_tokens(system_prompt + user_prompt, cpt)
     too_large = False
+    p_real_max = 0
     valid = (lambda p: isinstance(p, dict) and isinstance(p.get("legs"), list)) if expect == "legs" else (lambda p: isinstance(p, dict) and bool(p.get(expect)))
-    for model in GROQ_MODELS:
+    dead = _dead_models()
+    models = [m for m in GROQ_MODELS if m not in dead] or GROQ_MODELS[:2]
+    for model in models:
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
         eff = effort or cfg.get("reasoning_effort")
         upper = cfg["max_completion_tokens"]
@@ -2736,10 +2768,21 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
             upper = min(upper, EFFORT_RESERVE[eff] + 100)
         limit = ceiling                              # per-request token limit; refined from error messages
         p_est = int(est_prompt * 1.15) + 60          # pessimistic prompt size until the API tells us the real one
-        for attempt in range(3):
+        cap_max, json_mode = None, True
+        for attempt in range(4):
             cap = min(upper, budget.remaining - p_est - 60, limit - p_est - 60)
+            if cap_max is not None:
+                cap = min(cap, cap_max)
             if cap < MIN_COMPLETION:
-                log.append({"model": model, "status": f"SKIPPED_BUDGET(prompt~{p_est}, cap={cap})"})
+                budget_short = budget.remaining - p_est - 60 < MIN_COMPLETION
+                log.append({"model": model, "status": ("SKIPPED_BUDGET(run token cap used up)" if budget_short else f"PROMPT_TOO_LARGE(prompt~{p_est}, reply room={cap})")})
+                if budget_short:
+                    info["status"] = "TOKEN_CAP"
+                    return None, info
+                if p_real_max:                              # the prompt itself is the problem, so another model would fail the same way
+                    info["actual_cpt"] = chars / p_real_max
+                    info["status"] = "PROMPT_TOO_LARGE"
+                    return None, info
                 too_large = True
                 break
             handle = None
@@ -2747,8 +2790,9 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
                 info["waited"] += gov.wait_for(p_est + cap, log_fn)
                 handle = gov.charge(p_est + cap)
             payload = {"model": model, "temperature": 0.2, "max_completion_tokens": int(cap),
-                       "response_format": {"type": "json_object"},
                        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]}
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
             if cfg.get("supports_reasoning_effort") and eff:
                 payload["reasoning_effort"] = eff if model.startswith("openai/") or eff == "none" else "none"
                 if model.startswith("openai/"):
@@ -2779,9 +2823,9 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
                     log.append({"model": model, "status": "SUCCESS" + (" (reply hit the token cap - recovered the complete part)" if salvaged else "")})
                     info.update({"salvaged": salvaged, "model": model, "status": "SUCCESS", "fallback": model != GROQ_MODELS[0]})
                     return parsed, info
-                log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')} (completion {ct} of cap {cap})"})
+                log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')} (completion {ct} of room {cap})"})
                 break
-            body = (r.text or "")[:240]
+            body = (r.text or "")[:300]
             low = body.lower()
             if r.status_code == 413 or "too large" in low:
                 if handle:
@@ -2790,10 +2834,13 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
                 if lim and req:
                     limit = min(limit, int(lim.group(1)) - 150)
                     info["learned_limit"] = int(lim.group(1))
-                    real_prompt = max(1, int(req.group(1)) - int(cap))
-                    p_est = real_prompt + 20
-                    info["actual_cpt"] = chars / real_prompt
-                    log.append({"model": model, "status": f"HTTP_413 limit {lim.group(1)}, real prompt ~{real_prompt} tokens -> recomputing cap"})
+                    excess = int(req.group(1)) - int(lim.group(1))
+                    p_real = max(1, int(req.group(1)) - int(cap))
+                    p_real_max = max(p_real_max, p_real)
+                    info["actual_cpt"] = chars / p_real_max
+                    cap_max = int(cap) - max(0, excess) - 150          # shrink the reply room by exactly what was too much
+                    p_est = max(p_est, p_real + 20)
+                    log.append({"model": model, "status": f"HTTP_413 limit {lim.group(1)}, requested {req.group(1)} -> real prompt ~{p_real} tokens, reply room now {max(cap_max, 0)}"})
                 else:
                     p_est = int(p_est * 1.2)
                     log.append({"model": model, "status": f"HTTP_413 {body[:120]}"})
@@ -2805,7 +2852,7 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
                     info["learned_limit"] = int(lim.group(1))
                 if handle:
                     gov.settle(handle, p_est if "per minute" in low else 0)   # a daily-limit refusal consumed no window tokens
-                if "per minute" in low and wait is not None and wait <= 40 and attempt < 2:
+                if "per minute" in low and wait is not None and wait <= 40 and attempt < 3:
                     log.append({"model": model, "status": f"RATE_LIMIT_429 per-minute, waiting {wait:.0f}s"})
                     time.sleep(wait + 0.5)
                     continue
@@ -2813,11 +2860,35 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
                 break
             if handle:
                 gov.settle(handle, 0)
+            if r.status_code == 400 and "failed_generation" in (r.text or ""):
+                fg = ""
+                try:
+                    fg = (r.json().get("error") or {}).get("failed_generation") or ""
+                except Exception:
+                    pass
+                parsed, salvaged = _parse_json_ex(fg) if fg else (None, True)
+                if valid(parsed):                                  # the model's own partial JSON still contains complete tickets/verdicts
+                    budget.used += p_est + int(len(fg) / 3)
+                    log.append({"model": model, "status": "SUCCESS (recovered from the model's partially generated JSON)"})
+                    info.update({"salvaged": True, "model": model, "status": "SUCCESS", "fallback": model != GROQ_MODELS[0]})
+                    return parsed, info
+                if json_mode:                                      # retry once without JSON mode: some models do better, the prompt still demands JSON
+                    json_mode = False
+                    log.append({"model": model, "status": "HTTP_400 JSON validation failed -> retrying without strict JSON mode"})
+                    continue
+                log.append({"model": model, "status": "HTTP_400 JSON validation failed again"})
+                break
+            if r.status_code == 404:
+                _mark_dead(model)
+                log.append({"model": model, "status": "HTTP_404 model not available on this account - skipped from now on"})
+                break
             if r.status_code in NON_RETRYABLE:
                 log.append({"model": model, "status": f"HTTP_{r.status_code} {body[:140]}"})
                 break
             log.append({"model": model, "status": f"HTTP_{r.status_code} {body[:100]} (retrying)"})
             time.sleep(2.5 * (attempt + 1))
+    if p_real_max:
+        info["actual_cpt"] = chars / p_real_max
     info["status"] = "PROMPT_TOO_LARGE" if too_large and not info["model"] else "FAILED"
     return None, info
 
@@ -3431,7 +3502,8 @@ def save_tickets_to_ledger(date_str, tickets):
 
 
 def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
-    """AI-first pipeline: SCOUT (optional) -> DESK -> AUDIT, all paced by the per-minute token governor.
+    """AI-first pipeline: SCOUT (orders the matches) -> one DESK call PER TICKET -> AUDIT, all paced by the per-minute token governor.
+    One call per ticket keeps every request inside Groq's per-request limit while the AI still sees full evidence for ~8 matches at a time.
     Python verifies, lints and labels; it supplies a leg only when the AI could not (always marked 🐍)."""
     warnings = []
     state = load_state()
@@ -3439,13 +3511,13 @@ def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
     ceiling = max(3500, tpm - TPM_MARGIN)
     gov = TpmGovernor(max(ceiling + 50, tpm - WINDOW_MARGIN))
     budget = TokenBudget(int(cfg.get("run_tokens", RUN_TOKEN_CAP_DEFAULT)))
-    cpt = min(max(float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN)) * 0.95, 2.4), 3.6)
+    cpt = min(max(float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN)) * 0.95, 1.9), 3.2)
     need, reuse = n_t * LEGS_PER_TICKET, bool(cfg["allow_reuse"])
     distinct = not reuse
-    sys_desk = desk_prompt(n_t, reuse, bool(cfg.get("relaxed_notes")))
     eff = cfg.get("effort") if cfg.get("effort") in EFFORT_RESERVE else "medium"
     use_ai = cfg["use_ai"]
-    passes, attempts, learned = [], [], []
+    n_ai = max(int(cfg.get("n_ai", 28)), need)
+    passes, attempts, learned, cpt_obs = [], [], [], []
 
     def record(label, info):
         passes.append({"pass": label, "model": info.get("model"), "prompt": info.get("prompt_tokens", 0),
@@ -3455,89 +3527,154 @@ def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
             attempts.append(dict(a, **{"pass": label}))
         if info.get("learned_limit"):
             learned.append(info["learned_limit"])
+        if info.get("actual_cpt"):
+            cpt_obs.append(info["actual_cpt"])
 
-    def make_pack(cands, cpt_, n_ai):
+    # ── PASS 1: SCOUT - the AI orders the qualified matches best-first (it also re-measures the real token density) ──
+    ordered = rank_matches(elig)
+    scout_info = None
+    k_keep = min(len(ordered), need + 6)
+    if use_ai and cfg.get("two_pass", True) and len(ordered) > need + 2:
+        pool = ordered[:max(n_ai, k_keep + 1)]
+        sys_sc = scout_prompt(len(pool), k_keep, n_t, need)
+        s_sel, s_ids, s_user = build_scout_pack(pool, cfg["tz"], cpt, sys_sc, SCOUT_RESERVE, ceiling)
+        if s_sel:
+            log(f"🔭 AI scout: reading a compact view of {len(s_sel)} qualified matches and choosing the {k_keep} best, ranked...")
+            sc, sinfo = call_groq_budgeted(sys_sc, s_user, budget, cpt, "low", gov, ceiling, "keep", log, "scout")
+            record("scout", sinfo)
+            if sinfo.get("actual_cpt"):
+                cpt = min(cpt, max(1.8, sinfo["actual_cpt"] * 0.97))
+            if sc:
+                chosen = []
+                for x in sc.get("keep") or []:
+                    mm = s_ids.get(str(x).strip().lower())
+                    if mm is not None and mm not in chosen:
+                        chosen.append(mm)
+                chosen = chosen[:k_keep]
+                topped = 0
+                for mm in rank_matches(s_sel):
+                    if len(chosen) >= need:
+                        break
+                    if mm not in chosen:
+                        chosen.append(mm)
+                        topped += 1
+                ordered = chosen
+                nm = lambda aid: (lambda mm: f"{mm['home']} v {mm['away']}" if mm else None)(s_ids.get(str(aid).strip().lower()))
+                scout_info = {"model": sinfo.get("model"), "kept": len(chosen), "of": len(s_sel), "topped_up": topped,
+                              "drops": [{"match": nm(x.get("id")), "why": x.get("why")} for x in (sc.get("drop") or []) if isinstance(x, dict) and nm(x.get("id"))][:8],
+                              "traps": [{"match": nm(x.get("id")), "note": x.get("note")} for x in (sc.get("traps") or []) if isinstance(x, dict) and nm(x.get("id"))][:6]}
+                log(f"   🔭 scout kept {len(chosen)} of {len(s_sel)} matches" + (f" (+{topped} added by Python rank to reach the {need} needed)" if topped else ""))
+            else:
+                ordered = ordered[:n_ai]
+                warnings.append("The AI scout pass failed, so the desk used Python's ranking to order the matches.")
+        else:
+            ordered = ordered[:n_ai]
+    else:
+        ordered = ordered[:n_ai]
+    progress(0.92)
+
+    # global labels/legs: ids stay unique across the per-ticket calls
+    labels = {id(m): f"m{i + 1}" for i, m in enumerate(ordered)}
+    match_legs, leg_index, id_map = {}, {}, {}
+    for m in ordered:
+        mid = labels[id(m)]
+        id_map[mid] = m
+        lst = [dict(l, mid=mid, fid=m["id"], match=m, id=f"{mid}.{l['key']}") for l in m["legs"]]
+        match_legs[mid] = lst
+        for l2 in lst:
+            leg_index[l2["id"].lower()] = l2
+
+    def pack_for_call(avail, sys_i, cpt_, extra):
+        floor = min(8, len(avail))
         for eff_try in [e for e in ("high", "medium", "low") if EFFORT_RESERVE[e] <= EFFORT_RESERVE[eff]]:
             reserve = EFFORT_RESERVE[eff_try]
-            sel_, id_map_, user_, n_legs_, detail_ = build_ai_pack(cands, cfg["tz"], cpt_, n_ai, sys_desk, need, reserve, ceiling)
-            if est_tokens(sys_desk + user_, cpt_) <= ceiling - reserve - TOKEN_SAFETY:
+            sel_, idm_, user_, n_legs_, detail_ = build_ai_pack(avail, cfg["tz"], cpt_, sys_i, floor, reserve, ceiling, labels, extra)
+            if est_tokens(sys_i + user_, cpt_) <= ceiling - reserve - TOKEN_SAFETY:
                 break
-        ml_, li_ = {}, {}
-        for mid, m in id_map_.items():
-            lst = []
-            for l in m["legs"]:
-                l2 = dict(l, mid=mid, fid=m["id"], match=m, id=f"{mid}.{l['key']}")
-                lst.append(l2)
-                li_[l2["id"].lower()] = l2
-            ml_[mid] = lst
-        return sel_, id_map_, user_, n_legs_, detail_, eff_try, ml_, li_
+        return sel_, idm_, user_, n_legs_, detail_, eff_try
 
-    # ── PASS 1: SCOUT - the AI, not Python's ranking, chooses which matches deserve the full desk analysis ──
-    cands, scout_info = elig, None
-    if use_ai and cfg.get("two_pass", True) and len(elig) > need:
-        capacity = max(need, len(make_pack(elig, cpt, len(elig))[0]))
-        pool = rank_matches(elig)[:max(int(cfg.get("n_ai", 28)), capacity + 1)]
-        if len(pool) > capacity:
-            sys_sc = scout_prompt(len(pool), capacity, n_t, need)
-            s_sel, s_ids, s_user = build_scout_pack(pool, cfg["tz"], cpt, sys_sc, SCOUT_RESERVE, ceiling)
-            if s_sel:
-                log(f"🔭 AI scout: reading a compact view of {len(s_sel)} qualified matches and choosing the {capacity} worth a full analysis...")
-                sc, sinfo = call_groq_budgeted(sys_sc, s_user, budget, cpt, "low", gov, ceiling, "keep", log, "scout")
-                record("scout", sinfo)
-                if sc:
-                    chosen = []
-                    for x in sc.get("keep") or []:
-                        mm = s_ids.get(str(x).strip().lower())
-                        if mm is not None and mm not in chosen:
-                            chosen.append(mm)
-                    chosen = chosen[:capacity]
-                    topped = 0
-                    for mm in rank_matches(s_sel):
-                        if len(chosen) >= need:
-                            break
-                        if mm not in chosen:
-                            chosen.append(mm)
-                            topped += 1
-                    cands = chosen
-                    nm = lambda aid: (lambda mm: f"{mm['home']} v {mm['away']}" if mm else None)(s_ids.get(str(aid).strip().lower()))
-                    scout_info = {"model": sinfo.get("model"), "kept": len(chosen), "of": len(s_sel), "topped_up": topped,
-                                  "drops": [{"match": nm(x.get("id")), "why": x.get("why")} for x in (sc.get("drop") or []) if isinstance(x, dict) and nm(x.get("id"))][:8],
-                                  "traps": [{"match": nm(x.get("id")), "note": x.get("note")} for x in (sc.get("traps") or []) if isinstance(x, dict) and nm(x.get("id"))][:6]}
-                    log(f"   🔭 scout kept {len(chosen)} of {len(s_sel)} matches" + (f" (+{topped} added by Python rank to reach the {need} needed)" if topped else ""))
-                else:
-                    warnings.append("The AI scout pass failed, so the desk used Python's ranking to choose which matches to study.")
-        progress(0.92)
-
-    # ── PASS 2: DESK ──
-    sel, id_map, user_prompt, n_legs, detail, eff_try, match_legs, leg_index = make_pack(cands, cpt, max(int(cfg.get("n_ai", 28)), need) if cands is elig else len(cands))
-    if eff_try != eff:
-        log(f"   ℹ️ '{eff}' effort needs more thinking room than one {tpm}-token request allows for this many matches - using '{eff_try}'.")
-    log(f"📦 AI desk pack: {len(sel)} matches x {n_legs} legs (detail {detail}/3) | est. prompt {est_tokens(sys_desk + user_prompt, cpt)} tokens (per-request ceiling {ceiling})")
-    progress(0.93)
-    ai, info = None, {"attempts": []}
+    # ── PASS 2: DESK - one focused call per ticket ──
+    ai_tickets, ai_traps, ai_avoid, ai_summ, shown, prompts = [], [], [], [], [], []
+    used_labels, model_used, last_info = set(), None, {"attempts": []}
     if use_ai:
-        log("🤖 The AI desk is choosing the legs (Python only verifies afterwards)...")
-        ai, info = call_groq_budgeted(sys_desk, user_prompt, budget, cpt, eff_try, gov, ceiling, "tickets", log, "desk")
-        record("desk", info)
-        if not ai and info.get("status") == "PROMPT_TOO_LARGE" and info.get("actual_cpt"):
-            new_cpt = min(max(info["actual_cpt"] * 0.97, 1.8), cpt)
-            log(f"   ℹ️ The real prompt was bigger than estimated ({info['actual_cpt']:.2f} chars/token) - rebuilding a smaller pack and retrying.")
-            sel, id_map, user_prompt, n_legs, detail, eff_try, match_legs, leg_index = make_pack(cands, new_cpt, len(cands) if cands is not elig else max(int(cfg.get("n_ai", 28)), need))
-            ai, info = call_groq_budgeted(sys_desk, user_prompt, budget, new_cpt, eff_try, gov, ceiling, "tickets", log, "desk")
-            record("desk (retry)", info)
-            cpt = new_cpt
-        if info.get("actual_cpt"):
-            state["cpt"] = round(0.7 * cpt + 0.3 * info["actual_cpt"], 3)
+        for ti in range(n_t):
+            avail = ([m for m in ordered if labels[id(m)] not in used_labels] if distinct
+                     else sorted(ordered, key=lambda m: labels[id(m)] in used_labels))
+            if len(avail) < LEGS_PER_TICKET:
+                warnings.append(f"Ticket {ti + 1}: fewer than {LEGS_PER_TICKET} unused matches were left, so the AI could not build it; it was completed/verified by Python.")
+                ai_tickets.append({})
+                continue
+            extra = ""
+            if reuse and ti > 0:
+                extra = "EARLIER TICKETS (do not copy): " + "; ".join(f"T{k + 1}: " + ",".join(x["id"] for x in tk.get("_legs", [])) for k, tk in enumerate(ai_tickets) if tk) + "\n"
+            sys_i = desk_prompt(ti, n_t, reuse, bool(cfg.get("relaxed_notes")))
+            log(f"🤖 AI desk - ticket {ti + 1} of {n_t}: studying the best candidate matches in full detail (Python only verifies afterwards)...")
+            ai_i, info_i, sel_i, idm_i, user_i = None, {"attempts": []}, [], {}, ""
+            for rebuild in range(2):
+                sel_i, idm_i, user_i, n_legs, detail, eff_try = pack_for_call(avail, sys_i, cpt, extra)
+                if rebuild == 0:
+                    log(f"   📦 pack: {len(sel_i)} matches x {n_legs} legs (detail {detail}/3), est. prompt {est_tokens(sys_i + user_i, cpt)} tokens, effort '{eff_try}'")
+                ai_i, info_i = call_groq_budgeted(sys_i, user_i, budget, cpt, eff_try, gov, ceiling, "tickets", log, f"desk{ti + 1}")
+                record(f"desk{ti + 1}" + (" (retry)" if rebuild else ""), info_i)
+                if info_i.get("actual_cpt"):
+                    cpt = min(cpt, max(1.8, info_i["actual_cpt"] * 0.97))
+                if ai_i or info_i.get("status") != "PROMPT_TOO_LARGE":
+                    break
+                log("   ℹ️ The real prompt was bigger than estimated - rebuilding a smaller pack and retrying once.")
+            last_info = info_i
+            if not ai_i and info_i.get("attempts") and all(("per day" in a["status"].lower() or "(tpd)" in a["status"].lower() or a["status"].startswith("HTTP_404"))
+                                                         for a in info_i["attempts"]):
+                warnings.append("Groq's DAILY token allowance is used up for every available model (it resets daily; the error message says when). "
+                                "The remaining AI calls were skipped instead of retrying - press 'Re-run AI analysis' later, it needs no API-Football calls.")
+                ai_tickets += [{}] * (n_t - len(ai_tickets))
+                break
+            shown += [m for m in sel_i if m not in shown]
+            prompts.append(f"===== desk call {ti + 1} (ticket {ti + 1}) =====\n{user_i}")
+            if ai_i:
+                model_used = model_used or info_i.get("model")
+                t0 = next((t for t in (ai_i.get("tickets") or []) if isinstance(t, dict)), {})
+                legs_ok = []
+                for it in t0.get("legs") or []:
+                    d = it if isinstance(it, dict) else {"id": str(it)}
+                    lid = str(d.get("id") or "").strip().lower()
+                    if lid in leg_index and lid.split(".")[0] in idm_i and leg_index[lid]["mid"] not in {leg_index[x["id"].lower()]["mid"] for x in legs_ok}:
+                        legs_ok.append(d)
+                t0 = dict(t0, legs=legs_ok, name=TICKET_LABELS[min(ti, 2)])
+                t0["_legs"] = legs_ok
+                ai_tickets.append(t0)
+                if distinct:
+                    used_labels |= {str(x["id"]).strip().lower().split(".")[0] for x in legs_ok}
+                else:
+                    used_labels |= {str(x["id"]).strip().lower().split(".")[0] for x in legs_ok}
+                ai_traps += [x for x in (ai_i.get("traps") or []) if isinstance(x, dict) and x.get("id") in id_map]
+                ai_avoid += [x for x in (ai_i.get("avoid") or []) if isinstance(x, dict) and x.get("id") in id_map]
+                if ai_i.get("summary"):
+                    ai_summ.append(str(ai_i["summary"]))
+                if info_i.get("salvaged"):
+                    warnings.append(f"Ticket {ti + 1}: the AI reply was cut short; the complete part was recovered and the rest verified/completed.")
+            else:
+                ai_tickets.append({})
+                warnings.append(f"Ticket {ti + 1}: the AI desk call failed ({info_i.get('status')}); it will be completed by the audit / Python.")
+        if cpt_obs:
+            state["cpt"] = round(0.6 * min(cpt_obs) + 0.4 * (sum(cpt_obs) / len(cpt_obs)), 3)
         if learned:
             state["tpm_limit"] = int(min(learned))
         save_state(state)
-    model_used = info.get("model")
+    ai = None
+    if any(t.get("legs") for t in ai_tickets):
+        seen, traps_u = set(), []
+        for x in ai_traps:
+            if x["id"] not in seen:
+                seen.add(x["id"])
+                traps_u.append(x)
+        ai = {"tickets": ai_tickets, "traps": traps_u[:6], "avoid": ai_avoid[:6], "summary": " ".join(ai_summ)[:320]}
+    sel = shown or ordered
+    user_prompt = "\n\n".join(prompts)
+    info = dict(last_info, attempts=attempts)
 
     python_draft, ai_note, audit_changes, rule_fixes = None, "", [], []
     if ai:
         tickets = parse_ai_tickets(ai, leg_index, n_t, LEGS_PER_TICKET, distinct)
-        if info.get("salvaged"):
-            warnings.append("The AI desk reply reached the token cap; the complete tickets were recovered and the rest was completed/verified.")
         # ── PASS 3: AUDIT - a risk officer tries to break every leg, swaps weak legs, fills gaps ──
         if cfg.get("audit", True):
             if budget.remaining >= AUDIT_RESERVE + 1800:
@@ -3589,13 +3726,12 @@ def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
         t["grade"] = "A" if dqm >= 0.75 and not t["repaired"] and not cfg.get("relaxed_notes") else "B" if dqm >= 0.6 else "C"
     est_mode = any(l.get("src") == "est" for t in tickets for l in t["legs"])
     if est_mode:
-        warnings.append("Some legs use MODEL-ESTIMATED odds (fair odds x 0.93). Bookmakers differ slightly - confirm the price on yours.")
+        warnings.append("Some legs use MODEL-ESTIMATED odds (fair odds x 0.93, no market check). Bookmakers differ slightly - confirm the price on yours.")
     fallback_model = any(p["fallback"] for p in passes)
     if fallback_model:
         warnings.append("⚠️ At least one AI pass ran on a smaller FALLBACK model (the top model was rate-limited or unavailable). Analysis quality may be lower - "
                         "consider pressing 'Re-run AI analysis' after a minute.")
-    all_info = dict(info, attempts=attempts)
-    return {"tickets": tickets, "ai": ai, "model": model_used, "info": all_info, "tokens": budget.used, "sel": sel, "id_map": id_map,
+    return {"tickets": tickets, "ai": ai, "model": model_used, "info": info, "tokens": budget.used, "sel": sel, "id_map": id_map,
             "user_prompt": user_prompt, "est_mode": est_mode, "ai_failed": bool(use_ai and not ai), "python_draft": python_draft,
             "ai_note": ai_note, "warnings": warnings, "passes": passes, "fallback_model": fallback_model, "scout": scout_info,
             "audit_changes": audit_changes, "rule_fixes": rule_fixes}
@@ -3806,9 +3942,9 @@ def main():
         tpm = a1.number_input("Groq tokens-per-minute limit", 4000, 30000, GROQ_TPM_DEFAULT, step=500,
                               help="Every Groq request is kept below this, and the passes (scout -> desk -> audit) are spaced so the rolling 60-second window never overflows. The app also learns the real limit from Groq's error messages.")
         run_tokens = a2.number_input("Max AI tokens per analysis (all passes)", 10000, 120000, RUN_TOKEN_CAP_DEFAULT, step=2000,
-                                     help="Protects your daily Groq token allowance. One full analysis (scout + desk + audit) normally uses 15-25k.")
-        two_pass = a1.checkbox("Pass 1 - AI scout chooses which matches get the full analysis", True)
-        audit = a2.checkbox("Pass 3 - AI risk-officer audit (tries to break every leg, swaps weak legs, fills gaps)", True)
+                                     help="Protects your daily Groq token allowance. One full analysis (scout + 3 desk calls + audit) normally uses 25-35k.")
+        two_pass = a1.checkbox("AI scout first: rank the qualified matches best-first before the per-ticket desk calls", True)
+        audit = a2.checkbox("Final AI risk-officer audit (tries to break every leg, swaps weak legs, fills gaps)", True)
         rule_fix = a1.checkbox("Python rule-fix: replace a leg that breaks the AI's own hard rules with the best clean alternative", True)
         min_ai_legs = a2.slider("Minimum AI-chosen legs per ticket (matters only if Python-built tickets are not allowed)", 3, 5, 3)
         wide_menu = a1.checkbox("Widen the leg menu with clearly-flagged borderline legs (the AI decides)", True)
@@ -3818,7 +3954,7 @@ def main():
         f1, f2 = st.columns(2)
         use_free = f1.checkbox("Use free sources (football-data.co.uk, ClubElo, ESPN) first and as fallback - costs 0 API-Football calls", True)
         save_calls = f2.checkbox("Skip API-Football predictions when free sources already cover the match (saves ~1 call per match)", True)
-        st.markdown(f"**AI order:** {' → '.join(GROQ_MODELS)} · Passes: scout → desk → audit")
+        st.markdown(f"**AI order:** {' → '.join(GROQ_MODELS)} · Calls: scout → desk (one per ticket) → audit")
         if st.button("📶 Check API quota now (free - does not use quota)"):
             key_ = get_secret("API_FOOTBALL_KEY")
             if key_:
@@ -3839,7 +3975,7 @@ def main():
         local_today = datetime.now(ZoneInfo(tz)).date()
         d = st.date_input("Match day to analyse", local_today)
         force = st.checkbox("Ignore cache (fresh API data - costs more calls)", False)
-        st.caption("Free API plan: one run now needs fewer calls because free sources are used first. The AI works in up to 3 passes spaced to respect Groq's per-minute token limit, so expect a few extra minutes. Re-running the same day reuses cached data; the API quota resets 00:00 UTC (03:00 Kampala).")
+        st.caption("Free API plan: one run now needs fewer calls because free sources are used first. The AI works in short focused calls (scout, one per ticket, audit) spaced to respect Groq's per-minute token limit, so expect several extra minutes. Re-running the same day reuses cached data; the API quota resets 00:00 UTC (03:00 Kampala).")
         if st.button("🧠 Analyse Football Matches Now", type="primary"):
             cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "n_ai": n_ai, "max_calls": int(max_calls),
                    "depth": depth, "sims": int(sims), "w_model": w_model, "bookmaker": int(bookmaker), "effort": effort,
