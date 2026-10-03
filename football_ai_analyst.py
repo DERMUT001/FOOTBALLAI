@@ -1837,9 +1837,9 @@ class EspnClient:
         with self.lock:
             return [f"{k}  (x{v})" if v > 1 else k for k, v in self.err.items()]
 
-    def scoreboard(self, slug, d1, d2=None, ttl=900):
-        """Returns (data|None, http_status). d1/d2 are date objects; a range uses ESPN's YYYYMMDD-YYYYMMDD form."""
-        dates = d1.strftime("%Y%m%d") + (("-" + d2.strftime("%Y%m%d")) if d2 else "")
+    def scoreboard(self, slug, dates, ttl=900):
+        """Returns (data|None, http_status). `dates` is YYYYMMDD (a day) or YYYYMM (a month). Date RANGES are rejected by ESPN (HTTP 400)
+        since Sep 2026, and limit values above ~500 are silently truncated, so neither is used."""
         url = f"{ESPN_BASE}/{slug}/scoreboard"
         path = os.path.join(self.cache_dir, "espn_" + hashlib.md5(f"{slug}{dates}".encode()).hexdigest() + ".json")
         if ttl > 0:
@@ -1854,7 +1854,7 @@ class EspnClient:
         code = None
         for attempt in range(2):
             try:
-                r = self.session.get(url, params={"dates": dates, "limit": 1000}, timeout=(6, 25))
+                r = self.session.get(url, params={"dates": dates, "limit": 500}, timeout=(6, 25))
             except Exception as e:
                 self.note(f"network: {str(e)[:80]}")
                 time.sleep(1)
@@ -1880,38 +1880,52 @@ class EspnClient:
             if code in (429, 503):
                 time.sleep(2 * (attempt + 1))
                 continue
-            self.note(f"HTTP {code} on {slug}")
+            self.note(f"HTTP {code} from ESPN: {(r.text or '')[:110]}")
             return None, code
         return None, code
 
 
-def espn_collect_fixtures(client, slugs, d, tz, log=lambda m: None, bad_out=None):
-    d1, d2 = d - timedelta(days=1), d + timedelta(days=1)
-    fixtures, odds_by, seen, valid = [], {}, set(), 0
-    with ThreadPoolExecutor(max_workers=client.workers) as ex:
-        futs = {ex.submit(client.scoreboard, s_, d1, d2, 900): s_ for s_ in slugs}
-        for fu in as_completed(futs):
-            slug = futs[fu]
-            if getattr(client, "net_errors", 0) >= 10 and valid == 0:      # ESPN unreachable from this machine: stop early instead of waiting for 100+ timeouts
-                for f_ in futs:
-                    f_.cancel()
-                client.note("ESPN is not reachable from this machine (aborted early)")
-                break
-            try:
-                data, code = fu.result()
-            except Exception as e:
-                client.note(f"{slug}: {str(e)[:60]}")
+def espn_months(d1, d2):
+    """'YYYYMM' strings covering d1..d2 (inclusive)."""
+    out, y, m = [], d1.year, d1.month
+    while (y, m) <= (d2.year, d2.month):
+        out.append(f"{y}{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def espn_sync(client, db, slugs, d, tz, extra=frozenset(), log=lambda m: None):
+    """ONE pass gives both the upcoming fixtures and the finished results.
+    ESPN dropped date-range queries in Sep 2026 (HTTP 400), but single days, whole months and years still work, so we read
+    monthly scoreboards. ESPN assigns matches to days in US Eastern time, so the Eastern dates spanned by the local day are covered."""
+    ET = ZoneInfo("America/New_York")
+    start = datetime.combine(d, datetime.min.time(), tzinfo=ZoneInfo(tz)).astimezone(ET).date()
+    end = datetime.combine(d, datetime.max.time().replace(microsecond=0), tzinfo=ZoneInfo(tz)).astimezone(ET).date()
+    meta, bad = db.meta.setdefault("espn", {}), db.meta.setdefault("espn_invalid", {})
+    skipped = [s_ for s_ in slugs if s_ in bad and s_ not in extra and (d - date.fromisoformat(bad[s_])).days < 7]
+    jobs = {}
+    for slug in slugs:
+        if slug in skipped:
+            continue
+        last = meta.get(slug)
+        first = (date.fromisoformat(last) + timedelta(days=1)) if last else d - timedelta(days=45)
+        jobs[slug] = espn_months(min(first, start), end)
+    n_req = sum(len(v) for v in jobs.values())
+    log(f"   ESPN: up to {n_req} monthly scoreboard request(s) for {len(jobs)} competitions"
+        + (f" ({len(skipped)} known-invalid codes skipped)" if skipped else ""))
+    fixtures, odds_by, seen, rows_by_day = [], {}, set(), defaultdict(list)
+    ok_slugs, notfound, ok, bad_req, aborted = set(), defaultdict(int), 0, 0, False
+    stats = {"valid": 0, "rows": 0, "mode": "month", "tasks": n_req}
+    cur_ym = f"{end.year}{end.month:02d}"
+
+    def handle(slug, data):
+        for e in espn_events(data):
+            if e["ts"] is None or any(b in e["status_name"] for b in ESPN_BAD_STATUS):
                 continue
-            if not data:
-                if code == 404 and bad_out is not None:
-                    bad_out[slug] = d.isoformat()
-                continue
-            valid += 1
-            for e in espn_events(data):
-                if e["state"] != "pre" or e["ts"] is None or e["eid"] in seen or any(b in e["status_name"] for b in ESPN_BAD_STATUS):
-                    continue
-                if datetime.fromtimestamp(e["ts"], ZoneInfo(tz)).date() != d:
-                    continue
+            if e["completed"] and e["gh"] is not None and e["ga"] is not None:
+                rows_by_day[datetime.fromtimestamp(e["ts"], timezone.utc).date().isoformat()].append(
+                    [e["eid"], e["ts"], espn_lid(slug), e["hid"], e["aid"], e["gh"], e["ga"]])
+            elif e["state"] == "pre" and e["eid"] not in seen and datetime.fromtimestamp(e["ts"], ZoneInfo(tz)).date() == d:
                 seen.add(e["eid"])
                 fixtures.append({"id": e["eid"], "ts": e["ts"], "status": "NS", "league_id": espn_lid(slug), "league": e["league_name"] or slug,
                                  "country": espn_country(slug), "season": e["season"], "round": None, "home_id": e["hid"], "home": e["home"],
@@ -1919,45 +1933,74 @@ def espn_collect_fixtures(client, slugs, d, tz, log=lambda m: None, bad_out=None
                                  "cov_odds": bool(e["odds"]), "cov_pred": None})
                 if e["odds"]:
                     odds_by[e["eid"]] = espn_odds_map(e["odds"])
-    log(f"   ESPN answered for {valid}/{len(slugs)} competitions; {len(fixtures)} upcoming matches on {d}, {len(odds_by)} with bookmaker odds")
-    return fixtures, odds_by
 
+    def job(slug, months):                       # months of ONE competition run in sequence; an unknown code (404) stops after one request
+        outs = []
+        for ym in months:
+            data, code = client.scoreboard(slug, ym, 900 if ym == cur_ym else 6 * 3600)
+            outs.append((ym, data, code))
+            if code in (404, 400):
+                break
+        return slug, outs
 
-def espn_update_results(client, db, slugs, today_d, days_back=60, log=lambda m: None):
-    """Incremental results database: one date-range call per competition, then only the new days on later runs."""
-    meta = db.meta.setdefault("espn", {})
-    bad = db.meta.setdefault("espn_invalid", {})
-    end = today_d - timedelta(days=1)
-    todo = []
-    for slug in dict.fromkeys(slugs):
-        if slug in bad and (today_d - date.fromisoformat(bad[slug])).days < 7:
-            continue
-        last = meta.get(slug)
-        start = (date.fromisoformat(last) + timedelta(days=1)) if last else (today_d - timedelta(days=days_back))
-        if start <= end:
-            todo.append((slug, start))
-    added = 0
     with ThreadPoolExecutor(max_workers=client.workers) as ex:
-        futs = {ex.submit(client.scoreboard, s_, st_, end, 0): (s_, st_) for s_, st_ in todo}
+        futs = {ex.submit(job, s_, m_): s_ for s_, m_ in jobs.items()}
         for fu in as_completed(futs):
-            slug, _ = futs[fu]
+            if ok == 0 and (getattr(client, "net_errors", 0) >= 10 or bad_req >= 12):     # nothing works: stop early
+                for f_ in futs:
+                    f_.cancel()
+                aborted = True
+                break
             try:
-                data, code = fu.result()
-            except Exception:
+                slug, outs = fu.result()
+            except Exception as e:
+                client.note(f"{futs[fu]}: {str(e)[:60]}")
                 continue
-            if code == 404:
-                bad[slug] = today_d.isoformat()
-                continue
-            if not data:
-                continue
-            rows = defaultdict(list)
-            for e in espn_events(data):
-                if e["completed"] and e["gh"] is not None and e["ga"] is not None and e["ts"] and not any(b in e["status_name"] for b in ESPN_BAD_STATUS):
-                    rows[datetime.fromtimestamp(e["ts"], timezone.utc).date().isoformat()].append([e["eid"], e["ts"], espn_lid(slug), e["hid"], e["aid"], e["gh"], e["ga"]])
-            added += db.add_rows(rows)
-            meta[slug] = end.isoformat()
-    log(f"   results database: +{added} finished matches from {len(todo)} competition call(s); now {db.total_matches()} matches over {len(db.days)} day-buckets")
-    return added
+            for ym, data, code in outs:
+                if data:
+                    ok += 1
+                    ok_slugs.add(slug)
+                    handle(slug, data)
+                elif code == 404:
+                    notfound[slug] += 1
+                elif code == 400:
+                    bad_req += 1
+    stats["valid"] = len(ok_slugs)
+    if aborted and ok == 0 and bad_req >= 12:                         # month queries refused too: fall back to single days (fixtures only)
+        stats["mode"] = "single-day"
+        log("   ⚠️ ESPN refused monthly queries - falling back to single-day queries (fixtures only; results history cannot be refreshed)")
+        days = sorted({start, end})
+        t2 = [(s_, dd.strftime("%Y%m%d")) for s_ in slugs if s_ not in skipped and s_ not in notfound for dd in days]
+        ok2 = bad2 = 0
+        with ThreadPoolExecutor(max_workers=client.workers) as ex:
+            futs = {ex.submit(client.scoreboard, s_, dstr, 900): (s_, dstr) for s_, dstr in t2}
+            for fu in as_completed(futs):
+                slug, _ = futs[fu]
+                if ok2 == 0 and bad2 >= 12:
+                    for f_ in futs:
+                        f_.cancel()
+                    break
+                try:
+                    data, code = fu.result()
+                except Exception:
+                    continue
+                if data:
+                    ok2 += 1
+                    ok_slugs.add(slug)
+                    handle(slug, data)
+                elif code == 400:
+                    bad2 += 1
+        stats["valid"] = len(ok_slugs)
+    else:
+        for slug in ok_slugs:
+            meta[slug] = (d - timedelta(days=1)).isoformat()
+        for slug, n_ in notfound.items():
+            if slug not in ok_slugs:
+                bad[slug] = d.isoformat()
+    stats["rows"] = db.add_rows(rows_by_day)
+    log(f"   ESPN answered for {stats['valid']} competitions ({stats['mode']} mode): {len(fixtures)} upcoming matches on {d}, {len(odds_by)} with bookmaker odds; "
+        f"+{stats['rows']} finished matches added (database now {db.total_matches()})")
+    return fixtures, odds_by, stats
 
 
 def collect_day_espn(cfg, log, progress):
@@ -1968,29 +2011,22 @@ def collect_day_espn(cfg, log, progress):
     extra = [x.strip() for x in str(cfg.get("extra_slugs", "")).split(",") if x.strip()]
     slugs = list(dict.fromkeys(ESPN_SLUGS + extra))
     db = ResultsDB()
-    bad_old = db.meta.setdefault("espn_invalid", {})        # competition codes ESPN does not know: skipped for 7 days (saves ~100 calls per run)
-    skipped = [x for x in slugs if x in bad_old and (d - date.fromisoformat(bad_old[x])).days < 7 and x not in extra]
-    slugs = [x for x in slugs if x not in skipped]
-    log(f"🌐 ESPN (free, no key): scanning {len(slugs)} competitions for {d} ({tz})" + (f" - {len(skipped)} known-invalid codes skipped" if skipped else "") + "...")
-    bad_new = {}
-    fixtures, odds_by = espn_collect_fixtures(client, slugs, d, tz, log, bad_new)
-    bad_old.update(bad_new)
+    log(f"🌐 ESPN (free, no key): syncing {len(slugs)} competitions - monthly scoreboards give fixtures AND results in one pass ({tz})...")
+    fixtures, odds_by, st = espn_sync(client, db, slugs, d, tz, frozenset(extra), log)
+    db.save()
     out["raw_count"] = len(fixtures)
+    if st["mode"] == "single-day":
+        out["warnings"].append("ESPN only accepted single-day queries, so the results history could not be refreshed; form comes from whatever was stored earlier.")
     if cfg.get("exclude_minor", True):
         fixtures = [f for f in fixtures if not LEAGUE_EXCLUDE_RE.search(f["league"] or "") and not TEAM_EXCLUDE_RE.search(f["home"] or "")
                     and not TEAM_EXCLUDE_RE.search(f["away"] or "")]
     out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
-    progress(0.15)
+    progress(0.5)
     if not fixtures:
         out["reason"] = ("ESPN returned no upcoming matches for this date. " + ("Messages: " + "; ".join(client.error_summary()[:3]) if client.err else
                          "It may be a very quiet day, or ESPN could not be reached from this machine (use Settings -> Test data sources)."))
         out["calls"], out["errors"] = client.calls, client.error_summary()
         return out
-    res_slugs = list(dict.fromkeys([f["slug"] for f in fixtures] + ESPN_DOMESTIC_RESULTS))
-    log(f"🗄 Updating the free results database from ESPN ({len(res_slugs)} competitions, incremental)...")
-    espn_update_results(client, db, res_slugs, d, 60, log)
-    db.save()
-    progress(0.5)
     elo_tab = EloTable.fetch(cfg["date"], client.cache_dir) if cfg.get("use_elo", True) else EloTable([])
     log(f"📈 ClubElo ratings loaded for {len(elo_tab)} clubs" if len(elo_tab) else "📈 ClubElo unavailable - continuing without it")
     n = min(len(fixtures), max(cfg["max_matches"], 40))
@@ -2014,16 +2050,18 @@ def test_data_sources(tz="Africa/Kampala", api_key=""):
     """Reachability check from THIS machine: shows exactly which free sources work here."""
     rows, today = [], datetime.now(ZoneInfo(tz)).date()
     ymd = today.strftime("%Y%m%d")
-    try:
-        r = requests.get(f"{ESPN_BASE}/eng.1/scoreboard", params={"dates": ymd + "-" + (today + timedelta(days=7)).strftime("%Y%m%d")},
-                         headers=ESPN_HEADERS, timeout=20)
-        if r.status_code == 200:
-            evs = espn_events(r.json())
-            rows.append(("ESPN scoreboard", f"✅ HTTP 200 - {len(evs)} Premier League events in the next 7 days, {sum(1 for e in evs if e['odds'])} with 1X2 odds"))
-        else:
-            rows.append(("ESPN scoreboard", f"❌ HTTP {r.status_code}"))
-    except Exception as e:
-        rows.append(("ESPN scoreboard", f"❌ {str(e)[:120]}"))
+    ET_today = datetime.now(ZoneInfo("America/New_York")).date()
+    for label, dates in (("single day", ET_today.strftime("%Y%m%d")), ("whole month", ET_today.strftime("%Y%m")),
+                         ("date range (ESPN dropped this in Sep 2026)", ET_today.strftime("%Y%m%d") + "-" + (ET_today + timedelta(days=3)).strftime("%Y%m%d"))):
+        try:
+            r = requests.get(f"{ESPN_BASE}/eng.1/scoreboard", params={"dates": dates, "limit": 500}, headers=ESPN_HEADERS, timeout=20)
+            if r.status_code == 200:
+                evs = espn_events(r.json())
+                rows.append((f"ESPN {label}", f"✅ HTTP 200 - {len(evs)} Premier League events ({sum(1 for e in evs if e['odds'])} with 1X2 odds)"))
+            else:
+                rows.append((f"ESPN {label}", f"❌ HTTP {r.status_code}: {(r.text or '')[:100]}"))
+        except Exception as e:
+            rows.append((f"ESPN {label}", f"❌ {str(e)[:120]}"))
     hdr = {"User-Agent": ESPN_HEADERS["User-Agent"], "X-Requested-With": "XMLHttpRequest", "Referer": "https://www.sofascore.com/", "Accept": "application/json"}
     for label, url in (("SofaScore (api. host)", f"https://api.sofascore.com/api/v1/sport/football/scheduled-events/{today}"),
                        ("SofaScore (www host)", f"https://www.sofascore.com/api/v1/sport/football/scheduled-events/{today}")):
@@ -3112,7 +3150,7 @@ def main():
         local_today = datetime.now(ZoneInfo(tz)).date()
         d = st.date_input("Match day to analyse", local_today)
         force = st.checkbox("Ignore cache (fresh API data - costs more calls)", False)
-        st.caption("ESPN source (default): free, no key, no daily quota - the first run builds a 60-day results database (a minute or two), later runs are quick. API-Football (optional): Free plan = 100 calls/day.")
+        st.caption("ESPN source (default): free, no key, no daily quota - the first run builds a 45-day results database from monthly scoreboards (a minute or two), later runs are quick. API-Football (optional): Free plan = 100 calls/day.")
         if st.button("🧠 Analyse Football Matches Now", type="primary"):
             cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "n_ai": n_ai, "max_calls": int(max_calls),
                    "depth": depth, "sims": int(sims), "w_model": w_model, "bookmaker": int(bookmaker), "effort": effort,
