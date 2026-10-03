@@ -1,5 +1,5 @@
 # =============================================================================
-# Der-AI | Football Quant Desk — V3.0 (AI Match Selector - No Tickets)
+# Der-AI | Football Quant Desk — V3.1 (Crash-proof, AI Match Selector)
 # =============================================================================
 import os, re, json, math, time, html, hashlib, threading, random, traceback, csv, io, unicodedata, difflib
 from collections import defaultdict
@@ -401,7 +401,7 @@ ELO_COUNTRIES = {"england", "spain", "italy", "germany", "france", "netherlands"
 ELO_LEAGUE_IDS = {2, 3, 848}
 INTL_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 FREE_TTL_S = 6 * 3600
-FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/3.0)"}
+FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/3.1)"}
 _STOP = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "fk", "sk", "bk", "if", "fsv", "vfb", "vfl", "sv", "cd", "ud", "sd",
          "ca", "club", "de", "the", "calcio", "and"}
 _TOKEN_FIX = {"st": "saint", "utd": "united"}
@@ -1519,7 +1519,7 @@ def collect_free_only(api, free, cfg, log, progress, out):
     for e in fx:
         lid = e["league_id"]
         name, country = LEAGUE_INFO.get(lid, (f"League {lid}", ""))
-        if cfg["exclude_minor"] and (TEAM_EXCLUDE_RE.search(e["home"]) or TEAM_EXCLUDE_RE.search(e["away"])): continue
+        if cfg.get("exclude_minor", True) and (TEAM_EXCLUDE_RE.search(e["home"]) or TEAM_EXCLUDE_RE.search(e["away"])): continue
         fixtures.append({"id": -_syn_id(f"F:{date_str}:{e['home']}:{e['away']}"), "ts": e["ts"], "status": "NS", "league_id": lid,
                          "league": name, "country": country, "season": None, "round": None,
                          "home_id": _syn_id("T:" + e["home"]), "home": e["home"], "away_id": _syn_id("T:" + e["away"]), "away": e["away"],
@@ -1527,7 +1527,9 @@ def collect_free_only(api, free, cfg, log, progress, out):
     if not fixtures:
         out["reason"] = "No fixtures were found by API-Football or by the free sources for this date."
         return out
-    cand = shortlist_matches(fixtures, min(len(fixtures), cfg["max_matches"]), cfg["force_leagues"])
+    
+    # FIX: Use .get() with default to prevent KeyError if key is missing
+    cand = shortlist_matches(fixtures, min(len(fixtures), cfg.get("max_matches", 30)), cfg.get("force_leagues", set()))
     out["warnings"].append("API-Football returned nothing usable, so this analysis was built ONLY from free sources (football-data.co.uk, ESPN, ClubElo). Injuries, lineups and API predictions are unavailable.")
     with ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(lambda lid: free.rows_for(lid, date_str), {c["league_id"] for c in cand}))
@@ -1582,7 +1584,7 @@ def collect_day(api, cfg, log, progress, free=None):
     if api.remaining is not None and api.remaining <= 5:
         out["warnings"].append("API daily quota almost exhausted - only cached data and free sources can be used.")
     
-    budget = min(cfg["max_calls"], api.remaining if api.remaining is not None else cfg["max_calls"])
+    budget = min(cfg.get("max_calls", 95), api.remaining if api.remaining is not None else cfg.get("max_calls", 95))
     if api.remaining is not None and budget < 60:
         out["warnings"].append(f"Only {api.remaining} API calls are left today. The quota resets at 00:00 UTC.")
 
@@ -1594,7 +1596,7 @@ def collect_day(api, cfg, log, progress, free=None):
     out["raw_count"] = len(fx_raw)
     fixtures = [parse_fixture(f) for f in fx_raw]
     fixtures = [f for f in fixtures if f["status"] in UPCOMING_OK and f["home_id"] and f["away_id"]]
-    if cfg["exclude_minor"]:
+    if cfg.get("exclude_minor", True):
         fixtures = [f for f in fixtures if not LEAGUE_EXCLUDE_RE.search(f["league"] or "")
                     and not TEAM_EXCLUDE_RE.search(f["home"] or "") and not TEAM_EXCLUDE_RE.search(f["away"] or "")]
     if cfg.get("exclude_lower", True):
@@ -1619,7 +1621,7 @@ def collect_day(api, cfg, log, progress, free=None):
     
     if not force:
         n0 = len(fixtures)
-        fixtures = [f for f in fixtures if not mem_bad(f["league_id"]) or f["league_id"] in cfg["force_leagues"] or (free.enabled and (f["league_id"] in FD_ALL or str(f.get("country") or "").lower() == "world"))]
+        fixtures = [f for f in fixtures if not mem_bad(f["league_id"]) or f["league_id"] in cfg.get("force_leagues", set()) or (free.enabled and (f["league_id"] in FD_ALL or str(f.get("country") or "").lower() == "world"))]
         if n0 != len(fixtures): log(f"🧠 Skipped {n0 - len(fixtures)} fixtures in competitions that returned no usable team data recently.")
     
     log(f"   {out['raw_count']} fixtures on the day, {len(fixtures)} upcoming & eligible")
@@ -1632,12 +1634,14 @@ def collect_day(api, cfg, log, progress, free=None):
         return out
     
     progress(0.06)
-    pool_n = min(len(fixtures), int(cfg["max_matches"] * 1.6) + 4)
-    cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"])
+    pool_n = min(len(fixtures), int(cfg.get("max_matches", 30) * 1.6) + 4)
+    
+    # FIX: Use .get() with default to prevent KeyError
+    cand = shortlist_matches(fixtures, pool_n, cfg.get("force_leagues", set()))
     odds_cap = max(6, int(budget * 0.30))
     while len({c["league_id"] for c in cand}) > odds_cap and pool_n > 8:
         pool_n -= 1
-        cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"])
+        cand = shortlist_matches(fixtures, pool_n, cfg.get("force_leagues", set()))
     
     odds_by, odds_src = {}, {}
     def fetch_league_odds(lid, s_):
@@ -1657,7 +1661,7 @@ def collect_day(api, cfg, log, progress, free=None):
         for item in items:
             f_ = fid or (item.get("fixture") or {}).get("id")
             if f_:
-                odds_by[f_] = parse_odds_item(item, cfg["bookmaker"])
+                odds_by[f_] = parse_odds_item(item, cfg.get("bookmaker", 8))
                 odds_src[f_] = "api"
 
     state_ = load_state()
@@ -1695,7 +1699,7 @@ def collect_day(api, cfg, log, progress, free=None):
     log(f"💰 Stage 1: bookmaker odds for {len(cand)} candidate matches...")
     if caps["league_odds"] is not False:
         todo = {(c["league_id"], c["season"]) for c in cand}
-        with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+        with ThreadPoolExecutor(max_workers=cfg.get("workers", 3)) as ex:
             for fu in as_completed([ex.submit(fetch_league_odds, lid, s_) for lid, s_ in todo]):
                 try: store_odds(fu.result())
                 except Exception as e: api.errors.append(f"odds: {e}")
@@ -1719,7 +1723,7 @@ def collect_day(api, cfg, log, progress, free=None):
                     caps["fixture_odds"] = True
 
     with_odds = [c for c in cand if c["id"] in odds_by]
-    if caps["fixture_odds"] or (cfg["allow_est"] and not (caps["league_odds"] and len(with_odds) >= 10)):
+    if caps["fixture_odds"] or (cfg.get("allow_est", True) and not (caps["league_odds"] and len(with_odds) >= 10)):
         keep = list(cand)
     else:
         keep = with_odds
@@ -1739,16 +1743,16 @@ def collect_day(api, cfg, log, progress, free=None):
 
     free_first = free.enabled
     per = ((0.6 if (free_first and cfg.get("save_calls", True)) else 1.0) + (2.0 if caps["history"] else 0.0) + (0.6 if caps["fixture_odds"] else 0.0))
-    deep = caps["history"] and (cfg["depth"] == "Full" or (cfg["depth"] == "Auto" and budget >= 150))
+    deep = caps["history"] and (cfg.get("depth", "Auto") == "Full" or (cfg.get("depth", "Auto") == "Auto" and budget >= 150))
     def cost(ms, dp):
         return len(ms) * (per + (0.9 if dp else 0.0)) + (len({m["league_id"] for m in ms}) if dp else 0)
     
     left = budget - api.calls
-    n = min(cfg["max_matches"], len(keep))
+    n = min(cfg.get("max_matches", 30), len(keep))
     if caps["history"] or not free_first:
         while n > 4 and cost(keep[:n], deep) > left * 0.95: n -= 1
-        if deep and n < min(cfg["max_matches"], len(keep)) and n < 12:
-            n_l = min(cfg["max_matches"], len(keep))
+        if deep and n < min(cfg.get("max_matches", 30), len(keep)) and n < 12:
+            n_l = min(cfg.get("max_matches", 30), len(keep))
             while n_l > 4 and cost(keep[:n_l], False) > left * 0.95: n_l -= 1
             if n_l >= n + 4: deep, n = False, n_l
 
@@ -1756,7 +1760,7 @@ def collect_day(api, cfg, log, progress, free=None):
     if free.enabled: free_cov = {c["id"] for c in keep if free.covers(c, date_str)}
     if not caps["history"]: keep.sort(key=lambda c: 0 if c["id"] in free_cov else 1)
     sl = keep[:n]
-    why_cut = (f"beyond your 'max matches' setting ({cfg['max_matches']})" if n >= min(cfg["max_matches"], len(keep)) else "beyond API call budget")
+    why_cut = (f"beyond your 'max matches' setting ({cfg.get('max_matches', 30)})" if n >= min(cfg.get("max_matches", 30), len(keep)) else "beyond API call budget")
     for c in keep[n:]: out["excluded"].append({"league": c["league"], "match": f"{c['home']} v {c['away']}", "reason": why_cut})
     out["deep"], out["budget"] = deep, budget
     leagues = {(m["league_id"], m["season"]) for m in sl}
@@ -1839,7 +1843,7 @@ def collect_day(api, cfg, log, progress, free=None):
 
     rest = [m for m in sl if m["id"] not in core]
     done = len(core)
-    with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+    with ThreadPoolExecutor(max_workers=cfg.get("workers", 3)) as ex:
         futs = [ex.submit(fetch_core, m) for m in rest if api_alive["v"] or m["id"] in free_cov]
         for m in rest:
             if not (api_alive["v"] or m["id"] in free_cov):
@@ -1865,7 +1869,7 @@ def collect_day(api, cfg, log, progress, free=None):
 
     if caps["fixture_odds"]:
         log("💰 Fetching per-fixture bookmaker odds...")
-        with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+        with ThreadPoolExecutor(max_workers=cfg.get("workers", 3)) as ex:
             futs = {ex.submit(lambda mm: api.get("/odds", {"fixture": mm["id"]}, ttl(1200), True).get("response") or [] if can_spend(1) else [], m): m
                     for m in sl if m["id"] not in odds_by and m.get("cov_odds") is not False and viable(core.get(m["id"]) or {"pred": None, "rh": [], "ra": []})}
             for fu in as_completed(futs):
@@ -1889,14 +1893,14 @@ def collect_day(api, cfg, log, progress, free=None):
             ids = sorted(i for i in ids if isinstance(i, int) and i > 0)
             chunks = [ids[i:i + 20] for i in range(0, len(ids), 20)]
             res = {}
-            with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+            with ThreadPoolExecutor(max_workers=cfg.get("workers", 3)) as ex:
                 for fu in as_completed([ex.submit(api.resp, "/fixtures", {"ids": "-".join(map(str, c_))}, ttl_s) for c_ in chunks if can_spend(1)]):
                     for f in fu.result(): res[f["fixture"]["id"]] = f
             return res
         hist = batch(hist_ids, ttl(5 * 86400))
         progress(0.75)
         upc = batch([m["id"] for m in sl], ttl(600))
-        with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
+        with ThreadPoolExecutor(max_workers=cfg.get("workers", 3)) as ex:
             futs = {ex.submit(api.resp, "/standings", {"league": lid, "season": s_}, ttl(12 * 3600)): lid for lid, s_ in leagues if can_spend(1)}
             for fu in as_completed(futs):
                 try: st_by[futs[fu]] = parse_standings(fu.result())
@@ -2256,7 +2260,7 @@ def run_full_analysis(cfg, log, progress):
     stt = api.status()
     plan = (stt.get("plan") or "Free")
     per_min = 10 if str(plan).lower() == "free" else 280
-    api.rate = RateLimiter(cfg["rate_override"] or per_min)
+    api.rate = RateLimiter(cfg.get("rate_override", 0) or per_min)
     cfg = dict(cfg, workers=3 if per_min <= 10 else 8)
     log(f"🔑 API-Football plan: {plan if api_key else 'no key (free sources only)'} | used {stt.get('used')}/{stt.get('limit')} today")
     
@@ -2417,9 +2421,13 @@ def main():
         st.caption("Free API plan: one run now needs fewer calls because free sources are used first. The AI works in short focused calls spaced to respect Groq's per-minute token limit. Re-running the same day reuses cached data; the API quota resets 00:00 UTC (03:00 Kampala).")
         
         if st.button("🧠 Analyse Football Matches Now", type="primary"):
-            cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "max_calls": int(max_calls),
-                   "depth": depth, "effort": effort, "exclude_minor": exclude_minor, "exclude_lower": exclude_lower,
-                   "force": force, "use_free": use_free, "allow_est": allow_est, "min_dq": min_dq, "w_model": 0.5, "bookmaker": 8, "sims": 40000, "rate_override": 0}
+            # FIX: Ensure all keys are present in cfg dictionary
+            cfg = {
+                "date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "max_calls": int(max_calls),
+                "depth": depth, "effort": effort, "exclude_minor": exclude_minor, "exclude_lower": exclude_lower,
+                "force": force, "use_free": use_free, "allow_est": allow_est, "min_dq": min_dq, "w_model": 0.5, 
+                "bookmaker": 8, "sims": 40000, "rate_override": 0, "force_leagues": set(), "save_calls": True
+            }
             bar = st.progress(0.0)
             box = st.status("Running full analysis...", expanded=True)
             def log(m): box.write(m)
