@@ -2291,7 +2291,7 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 AI_MATCH_PROMPT = """You are an expert football quant analyst at a sharp sportsbook. Python has collected data, run Monte Carlo simulations, and blended model probabilities with de-vigged bookmaker prices for every match below.
 
-YOUR TASK: Select the TOP {target} safest and most valuable INDIVIDUAL match predictions from the data below. Always return the best {target} picks that exist in the data, ranked safest first. Mark weaker ones with confidence "MED". Only return fewer than {target} if there are fewer matches than that, and NEVER return an empty list when matches are provided.
+YOUR TASK: Select up to {target} safest and most valuable INDIVIDUAL match predictions from the supplied qualified matches, ranked safest first. Prefer returning {target} picks when enough suitable options exist, but never invent a match, market, price, or evidence to fill the target. Return an empty list only if no supplied option is suitable. Select at most one option per match.
 
 DATA KEY:
 - xG: expected goals home-away
@@ -2304,17 +2304,16 @@ DATA KEY:
 - Options: available bets with odds and blended probability
 
 SELECTION RULES:
-1. DIVERSITY IS MANDATORY: Avoid picking the same market type for every match. Mix: match winners, double chance (1X/X2), Over/Under goals, BTTS.
+1. Prefer a mix of match winners, double chance (1X/X2), Over/Under goals, and BTTS when similarly safe options exist; safety takes priority over diversity.
 2. STRICTLY AVOID "Either team to win (12)" unless probability is above 80% AND the data overwhelmingly supports it — it offers poor value at typical odds.
 3. PREFER: Double Chance (1X or X2), Over 1.5 Goals, BTTS Yes, clear match winners with strong form evidence.
 4. Prefer matches with TRAP score below 45; a higher-trap match may be chosen only with a clear reason.
 5. Prioritize matches where the MODEL and the MARKET agree (small gap between mdl% and implied market%).
 6. For each pick, state the most likely way it LOSES (the failure scenario).
 7. 'inj:n/a' (unknown injuries) appears on every match when injury data is unavailable. Do NOT reject a match just for that; simply prefer higher-probability picks.
-8. Never pick more than 2 legs of the same market type across all your selections.
-9. Only use odds that appear in the Options list of that match.
+8. Use only a match and selection shown in the supplied data. Copy its option label and odds exactly; use the option's listed probability as "probability".
 
-OUTPUT FORMAT: A single JSON object with one key "picks" holding an array. Each array item has:
+OUTPUT FORMAT: A compact JSON object with one key "picks" holding an array. Each array item has:
 - "match": "Home v Away"
 - "league": "League name"
 - "pick": "The specific selection (e.g. 'Home Win', 'Home or Draw (1X)', 'Over 1.5 Goals', 'BTTS - Yes')"
@@ -2514,7 +2513,8 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
         if gov:
             info["waited"] = info.get("waited", 0) + gov.wait_for(p_est + cap, log_fn)
             handle = gov.charge(p_est + cap)
-        payload = {"model": model, "temperature": 0.2, "max_completion_tokens": int(cap),
+        payload = {"model": model, "temperature": 1.0 if model.startswith("openai/gpt-oss") else 0.2,
+                 "max_completion_tokens": int(cap),
                    "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]}
         payload["response_format"] = {"type": "json_object"}
         if cfg.get("supports_reasoning_effort") and eff:
@@ -2553,7 +2553,7 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                 log.append({"model": model, "status": f"{why_} finish={ch.get('finish_reason')} ({ct} tokens) raw={content.strip()[:220]!r}"})
                 if ch.get("finish_reason") == "length":
                     info["status"] = "TRUNCATED"
-                    return None, info
+                    break
                 break
             elif r.status_code == 404:
                 _mark_dead(model)
@@ -2837,7 +2837,9 @@ def test_groq_connection():
     rows = []
     for model in GROQ_MODELS:
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
-        payload = {"model": model, "max_completion_tokens": 120, "temperature": 0, "response_format": {"type": "json_object"},
+        payload = {"model": model, "max_completion_tokens": 120,
+                 "temperature": 1.0 if model.startswith("openai/gpt-oss") else 0,
+                 "response_format": {"type": "json_object"},
                    "messages": [{"role": "user", "content": 'Return exactly: {"ok": true}'}]}
         if cfg.get("supports_reasoning_effort"):
             payload["reasoning_effort"] = "low" if model.startswith("openai/") else "none"
