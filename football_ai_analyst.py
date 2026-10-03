@@ -1,29 +1,29 @@
 # =============================================================================
-# Der-AI | Football Quant Desk — V2  (AI-first, quota-safe, free-source backed)
+# Der-AI | Football Quant Desk — V1
 #
 # One click on "Analyse" runs the whole pipeline:
-#   1. PYTHON collects the day's fixtures from API-Football and spends the daily quota carefully
-#      (disk cache, call-time budget guard, no probing when the answer is already known).
-#   2. FREE SOURCES (zero API-Football calls) are used FIRST for what they cover and as a FALLBACK
-#      for whatever API-Football cannot provide:
-#        - football-data.co.uk : results, corners, shots, bookmaker 1X2 + O/U2.5 prices, H2H, table
-#        - ClubElo            : team strength (independent 1X2 opinion for European clubs)
-#        - ESPN public JSON   : fixtures + bookmaker prices (best effort)
-#      If API-Football is unreachable / out of quota the app still analyses from free sources only.
-#   3. PYTHON runs a Monte Carlo per match and blends it with de-vigged bookmaker prices.
-#   4. PYTHON builds a WIDE leg menu (safe legs + clearly-labelled borderline legs) - the AI decides.
-#   5. AI (Groq) works in short focused calls (scout, ONE desk call per ticket, audit), paced by a tokens-per-minute governor:
-#        SCOUT  - reads a compact view of ALL qualified matches and picks the ones worth studying
-#        DESK   - full evidence on the finalists, builds 3 tickets x 5 legs with a failure scenario per leg
-#        AUDIT  - a risk officer tries to break every leg, swaps weak legs and fills any gap
-#   6. PYTHON only verifies (real ids, distinct matches, odds >= 3.5, rule lint). Anything Python had
-#      to change is labelled. If the AI is down, a labelled Python-only fallback still delivers tickets.
+#   1. PYTHON collects every fixture of the chosen day from API-Football (api-sports.io)
+#      -> top leagues, mid leagues, cups, international matches, friendlies.
+#   2. PYTHON enriches a budget-aware shortlist: predictions, last-10 form, H2H, injuries,
+#      lineups, standings, odds (multi-bookmaker), corners/shots/xG history and individual
+#      player ratings (batched fixtures?ids= calls keep the request count low).
+#   3. PYTHON runs a Monte Carlo per match (Poisson goals + shared tempo variance +
+#      Dixon-Coles low-score correction + first-half split + negative-binomial corners) for:
+#      1 / X / 2, 1X, X2, 12, BTTS Yes/No, Over/Under 0.5-4.5, team totals, 1H goals,
+#      total corners. Model probabilities are blended with de-vigged bookmaker prices.
+#   4. PYTHON scores every match for "bookmaker trap" risk and builds a safe-leg menu.
+#   5. AI (Groq, gpt-oss-120b -> gpt-oss-20b -> qwen3.6-27b preview) acts as bookmaker + quant, reads a
+#      compact evidence pack and returns 3 tickets x 5 legs (each ticket odds >= 3.5).
+#      The whole AI step is hard-capped at 8,000 tokens (prompt + completion, all attempts).
+#   6. PYTHON verifies the AI output (real ids, real odds, 5 distinct matches, odds >= 3.5),
+#      repairs it if needed, falls back to a deterministic optimiser if the AI is unavailable,
+#      and pushes the tickets + reasoning to Telegram.
 # =============================================================================
 
-import os, re, json, math, time, html, hashlib, threading, random, traceback, csv, io, unicodedata, difflib
+import os, re, json, math, time, html, hashlib, threading, random, traceback, unicodedata, csv, io, difflib, zlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone, date as date_cls
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -37,40 +37,35 @@ APIF_BASE = "https://v3.football.api-sports.io"
 DEFAULT_TZ = "Africa/Kampala"
 CACHE_DIR = os.environ.get("DERAI_FB_CACHE", ".derai_fb_cache")
 STATE_PATH = os.environ.get("DERAI_FB_STATE", "derai_football_state.json")
-CACHE_PURGE_DAYS = 8          # finished-match data never changes, so it may live long (TTLs still decide freshness)
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TIMEOUT = 90
-GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"]   # a model that answers 404 is remembered as unavailable and skipped
+# qwen/qwen3-32b was retired by Groq on 17 Jul 2026 (replacement: gpt-oss-120b). qwen3.6-27b is a PREVIEW model, used only as a last resort.
+GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
 GROQ_MODEL_CONFIG = {
-    "openai/gpt-oss-120b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
-    "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
-    "llama-3.3-70b-versatile": {"max_completion_tokens": 2500, "reasoning_effort": None, "supports_reasoning_effort": False},
+    "openai/gpt-oss-120b": {"max_completion_tokens": 4000, "reasoning_effort": "low", "supports_reasoning_effort": True},
+    "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "low", "supports_reasoning_effort": True},
+    "qwen/qwen3.6-27b": {"max_completion_tokens": 3000, "reasoning_effort": None, "supports_reasoning_effort": False},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
 
-# ── Token policy ────────────────────────────────────────────────────────────
-# Groq's free tier allows ~9,000 tokens PER MINUTE. Every single request must fit in that, and several
-# requests are spread over time by the TpmGovernor (it sleeps until the rolling 60-second window has room).
-GROQ_TPM_DEFAULT = 8000      # Groq reported "Limit 8000" for your account: every single request (prompt + reply room) must fit in it
-TPM_MARGIN = 350              # per-request ceiling = TPM limit - margin
-WINDOW_MARGIN = 150           # rolling-window budget = TPM limit - margin (must stay > per-request ceiling)
-RUN_TOKEN_CAP_DEFAULT = 45000  # all passes of one analysis together (protects the daily token allowance)
-EFFORT_RESERVE = {"low": 2200, "medium": 3000, "high": 3800}   # completion room (incl. hidden reasoning) per effort
-SCOUT_RESERVE, AUDIT_RESERVE = 1500, 2200
-OUTPUT_RESERVE = 3000
+# ── Token budget (HARD LIMIT per analysis: prompt + completion, across ALL attempts) ──
+TOTAL_TOKEN_BUDGET = 8000
+OUTPUT_RESERVE = 2200        # default completion tokens reserved (includes hidden reasoning on gpt-oss)
+EFFORT_RESERVE = {"low": 2200, "medium": 2900, "high": 3500}   # more thinking = more room reserved = smaller prompt
 TOKEN_SAFETY = 100
-MIN_COMPLETION = 900
-DEFAULT_CHARS_PER_TOKEN = 2.3  # measured: dense numeric evidence tokenizes at ~2.2 chars/token (the scout pass re-measures it every run)
+MIN_COMPLETION = 900         # below this a call cannot finish the JSON -> don't start it
+DEFAULT_CHARS_PER_TOKEN = 3.0  # deliberately conservative for dense numeric text
 
 # ── Ticket rules ────────────────────────────────────────────────────────────
 N_TICKETS, LEGS_PER_TICKET, MIN_TICKET_ODDS = 3, 5, 3.5
 MIN_LEG_P, MIN_LEG_ODDS, MAX_LEG_ODDS = 0.62, 1.15, 2.00
-MIN_AGREE_P = 0.60   # SAFE legs: BOTH the raw model and the bookmaker's fair price must clear this
-BORDER_AGREE_P, BORDER_MIN_P = 0.55, 0.57   # BORDERLINE legs (shown to the AI with a '~' flag, never silently dropped)
-MAX_MENU_LEGS = 7
+MIN_AGREE_P = 0.60   # BOTH the raw model and the bookmaker's fair price must clear this for a leg to be eligible
 BASIS_TAG = {"season+recent": "S+R", "recent": "R", "season": "S", "elo": "E", "prior": "P"}
+# relax level -> (min leg p, min model/market agreement, min odds, max odds); levels 1-2 are used only to keep the analysis going
+RELAX = {0: (MIN_LEG_P, MIN_AGREE_P, MIN_LEG_ODDS, MAX_LEG_ODDS), 1: (0.58, 0.55, 1.10, 2.20), 2: (0.52, 0.50, 1.05, 2.60),
+         3: (0.45, 0.40, 1.05, 3.00)}   # level 3 = 'stretch' legs: never shown to the AI, used only to lift a ticket to the 3.5 minimum
 TICKET_LABELS = ["Ticket 1 - Safest", "Ticket 2 - Balanced", "Ticket 3 - Value"]
 
 # ── League intelligence (API-Football league ids; unknown leagues fall into LOW) ──
@@ -153,8 +148,7 @@ class RateLimiter:
 class ApiFootball:
     def __init__(self, key, per_minute=10, cache_dir=CACHE_DIR):
         self.session = requests.Session()
-        self.session.headers.update({"x-apisports-key": key or "none"})
-        self.offline = not key
+        self.session.headers.update({"x-apisports-key": key})
         self.rate = RateLimiter(per_minute)
         self.lock = threading.Lock()
         self.calls = 0
@@ -174,7 +168,7 @@ class ApiFootball:
             os.makedirs(cache_dir, exist_ok=True)
             for fn in os.listdir(cache_dir):
                 p = os.path.join(cache_dir, fn)
-                if time.time() - os.path.getmtime(p) > CACHE_PURGE_DAYS * 86400:
+                if time.time() - os.path.getmtime(p) > 2 * 86400:
                     os.remove(p)
         except Exception:
             pass
@@ -209,8 +203,6 @@ class ApiFootball:
 
     def status(self):
         """/status does not consume quota; used to read plan + remaining calls."""
-        if self.offline:
-            return {"plan": None, "errors": "no API-Football key configured"}
         try:
             r = self.session.get(f"{APIF_BASE}/status", timeout=20)
             d = r.json()
@@ -251,8 +243,8 @@ class ApiFootball:
                         return obj["d"]
             except Exception:
                 pass
-        if self.quota_out or self.offline:
-            return {"response": [], "paging": {}, "errors": {"quota": "daily quota exhausted or no API key"}}
+        if self.quota_out:
+            return {"response": [], "paging": {}, "errors": {"quota": "daily quota exhausted"}}
         if any(k in self.blocked for k in params) or (endpoint in self.blocked_ep and endpoint != "/fixtures" and not bypass):
             return {"response": [], "paging": {}, "errors": {"blocked": "plan restriction (skipped, no call spent)"}}
         last_err = ""
@@ -483,779 +475,6 @@ def parse_standings(resp):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# FREE data sources - cost ZERO API-Football calls
-#   football-data.co.uk : results + corners + shots + bookmaker prices (main leagues + 16 extra leagues)
-#   ClubElo (clubelo.com): club strength ratings (European clubs)
-#   ESPN public JSON    : fixtures + bookmaker prices (best effort, schema may change)
-# Every method fails SOFT (returns None / [] and records the reason) so a dead source never stops an analysis.
-# ═════════════════════════════════════════════════════════════════════════════
-FD_BASE = "https://www.football-data.co.uk"
-FD_MAIN = {39: "E0", 40: "E1", 41: "E2", 42: "E3", 140: "SP1", 141: "SP2", 135: "I1", 136: "I2", 78: "D1", 79: "D2",
-           61: "F1", 62: "F2", 88: "N1", 94: "P1", 144: "B1", 203: "T1", 197: "G1", 179: "SC0", 180: "SC1"}
-FD_NEW = {128: "ARG", 71: "BRA", 262: "MEX", 253: "USA", 98: "JPN", 169: "CHN", 357: "IRL", 103: "NOR", 113: "SWE",
-          244: "FIN", 119: "DNK", 106: "POL", 283: "ROU", 235: "RUS", 207: "SWZ", 218: "AUT"}
-FD_CODE_TO_LID = {v: k for k, v in FD_MAIN.items()}
-FD_ALL = set(FD_MAIN) | set(FD_NEW)
-ESPN_SLUG = {39: "eng.1", 40: "eng.2", 41: "eng.3", 42: "eng.4", 140: "esp.1", 141: "esp.2", 135: "ita.1", 136: "ita.2",
-             78: "ger.1", 79: "ger.2", 61: "fra.1", 62: "fra.2", 88: "ned.1", 94: "por.1", 144: "bel.1", 203: "tur.1",
-             179: "sco.1", 2: "uefa.champions", 3: "uefa.europa", 848: "uefa.europa.conf", 253: "usa.1", 262: "mex.1",
-             71: "bra.1", 5: "uefa.nations", 10: "fifa.friendly", 128: "arg.1", 98: "jpn.1", 218: "aut.1", 207: "sui.1", 119: "den.1", 103: "nor.1",
-             113: "swe.1", 197: "gre.1", 235: "rus.1", 169: "chn.1"}
-ESPN_SLUG_TO_LID = {v: k for k, v in ESPN_SLUG.items()}
-LEAGUE_INFO = {5: ("UEFA Nations League", "World"), 10: ("Friendlies", "World"), 39: ("Premier League", "England"), 40: ("Championship", "England"), 41: ("League One", "England"),
-               42: ("League Two", "England"), 140: ("La Liga", "Spain"), 141: ("Segunda Division", "Spain"),
-               135: ("Serie A", "Italy"), 136: ("Serie B", "Italy"), 78: ("Bundesliga", "Germany"),
-               79: ("2. Bundesliga", "Germany"), 61: ("Ligue 1", "France"), 62: ("Ligue 2", "France"),
-               88: ("Eredivisie", "Netherlands"), 94: ("Primeira Liga", "Portugal"), 144: ("Pro League", "Belgium"),
-               203: ("Super Lig", "Turkey"), 197: ("Super League 1", "Greece"), 179: ("Premiership", "Scotland"),
-               180: ("Championship", "Scotland"), 2: ("Champions League", "World"), 3: ("Europa League", "World"),
-               848: ("Conference League", "World"), 253: ("MLS", "USA"), 262: ("Liga MX", "Mexico"),
-               71: ("Serie A", "Brazil"), 128: ("Liga Profesional", "Argentina"), 98: ("J1 League", "Japan"),
-               218: ("Bundesliga", "Austria"), 207: ("Super League", "Switzerland"), 119: ("Superliga", "Denmark"),
-               103: ("Eliteserien", "Norway"), 113: ("Allsvenskan", "Sweden"), 197: ("Super League 1", "Greece"),
-               235: ("Premier League", "Russia"), 169: ("Super League", "China"), 357: ("Premier Division", "Ireland"),
-               244: ("Veikkausliiga", "Finland"), 106: ("Ekstraklasa", "Poland"), 283: ("Liga I", "Romania")}
-ELO_COUNTRIES = {"england", "spain", "italy", "germany", "france", "netherlands", "portugal", "belgium", "turkey", "scotland",
-                 "greece", "switzerland", "austria", "denmark", "norway", "sweden", "poland", "czech-republic", "croatia",
-                 "serbia", "ukraine", "russia", "romania", "hungary", "cyprus", "israel", "slovakia", "slovenia", "bulgaria",
-                 "wales", "ireland", "northern-ireland", "finland", "iceland", "bosnia", "belarus", "azerbaijan", "kazakhstan"}
-ELO_LEAGUE_IDS = {2, 3, 848}
-INTL_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
-FREE_TTL_S = 6 * 3600
-FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.0)"}
-
-_STOP = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "fk", "sk", "bk", "if", "fsv", "vfb", "vfl", "sv", "cd", "ud", "sd",
-         "ca", "club", "de", "the", "calcio", "and"}
-_TOKEN_FIX = {"st": "saint", "utd": "united"}
-_ALIAS = {"man united": "manchester united", "man utd": "manchester united", "man city": "manchester city",
-          "nottm forest": "nottingham forest", "wolves": "wolverhampton wanderers", "spurs": "tottenham",
-          "west brom": "west bromwich albion", "ath madrid": "atletico madrid", "ath bilbao": "athletic",
-          "athletic bilbao": "athletic", "athletic club": "athletic", "sociedad": "real sociedad", "betis": "real betis",
-          "vallecano": "rayo vallecano", "espanol": "espanyol", "celta": "celta vigo", "sp gijon": "sporting gijon",
-          "inter": "internazionale", "inter milan": "internazionale", "mgladbach": "monchengladbach",
-          "m gladbach": "monchengladbach", "ein frankfurt": "eintracht frankfurt", "bayern munich": "bayern munchen",
-          "paris sg": "paris saint germain", "psg": "paris saint germain", "sp lisbon": "sporting cp",
-          "sporting lisbon": "sporting cp", "sp braga": "braga", "olympique marseille": "marseille",
-          "olympique lyonnais": "lyon", "nijmegen": "nec nijmegen",
-          # national teams (API-Football naming -> international_results naming)
-          "rep of ireland": "republic of ireland", "ireland": "republic of ireland", "czechia": "czech republic",
-          "turkiye": "turkey", "usa": "united states", "united states of america": "united states",
-          "korea republic": "south korea", "republic of korea": "south korea", "korea dpr": "north korea",
-          "china pr": "china", "ir iran": "iran", "cote divoire": "ivory coast", "congo dr": "dr congo",
-          "cape verde islands": "cape verde", "cabo verde": "cape verde", "us virgin islands": "united states virgin islands",
-          "swaziland": "eswatini", "burma": "myanmar", "timor leste": "east timor", "macedonia": "north macedonia",
-          "chinese taipei": "taiwan", "brunei darussalam": "brunei", "bosnia": "bosnia herzegovina",
-          "saint kitts nevis": "saint kitts and nevis"}
-
-
-def norm_team(s):
-    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode().lower()
-    s = s.replace("&", " and ").replace("'", "").replace(".", " ")
-    s = re.sub(r"[^a-z0-9 ]+", " ", s)
-    toks = []
-    for t in s.split():
-        t = _TOKEN_FIX.get(t, t)
-        if t in _STOP or t.isdigit():
-            continue
-        toks.append(t)
-    out = " ".join(toks)
-    return _ALIAS.get(out, out)
-
-
-def _covers(a, b):
-    """Every token of `a` appears in `b` either exactly or as an abbreviation of a b-token (man -> manchester)."""
-    return all(any(t == u or (len(t) >= 3 and len(u) >= 4 and u.startswith(t)) for u in b) for t in a)
-
-
-def _sim(a, b):
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    ta, tb = a.split(), b.split()
-    if len(ta) < len(tb):
-        pairs = [(ta, tb)]
-    elif len(tb) < len(ta):
-        pairs = [(tb, ta)]
-    else:
-        pairs = [(ta, tb), (tb, ta)]
-    for short, long_ in pairs:
-        if short and _covers(short, long_) and (len(short) >= 2 or len(short[0]) >= 4):
-            return 0.92 - 0.01 * (len(long_) - len(short))
-    return difflib.SequenceMatcher(None, a, b).ratio()
-
-
-def best_match(name, names, thr=0.86):
-    """names = iterable of raw names. Returns the raw name that matches `name`, or None (ambiguous / too different)."""
-    n = norm_team(name)
-    best = second = 0.0
-    arg = None
-    for raw in names:
-        s = _sim(n, norm_team(raw))
-        if s > best:
-            second, best, arg = best, s, raw
-        elif s > second:
-            second = s
-    if arg is not None and best >= thr and (best - second >= 0.04 or best >= 0.999):
-        return arg
-    return None
-
-
-def _fd_date(s):
-    s = (s or "").strip()
-    for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except Exception:
-            pass
-    return None
-
-
-def fd_season_code(d, back=0):
-    yy = (d.year if d.month >= 7 else d.year - 1) % 100
-    yy = (yy - back) % 100
-    return f"{yy:02d}{(yy + 1) % 100:02d}"
-
-
-def _odds_entry(v):
-    return {"odds": float(v), "median": float(v), "best": float(v), "low": float(v), "n": 1}
-
-
-def fd_row_odds(row):
-    """Bookmaker prices from one CSV row, always taking all outcomes from the SAME bookmaker."""
-    out = {}
-    for cols in (("B365H", "B365D", "B365A"), ("AvgH", "AvgD", "AvgA"), ("PSH", "PSD", "PSA"), ("PH", "PD", "PA"), ("MaxH", "MaxD", "MaxA")):
-        v = [_f(row.get(c)) for c in cols]
-        if all(x and x > 1.0 for x in v):
-            out.update({"1": _odds_entry(v[0]), "X": _odds_entry(v[1]), "2": _odds_entry(v[2])})
-            break
-    for cols in (("B365>2.5", "B365<2.5"), ("Avg>2.5", "Avg<2.5"), ("P>2.5", "P<2.5"), ("Max>2.5", "Max<2.5")):
-        v = [_f(row.get(c)) for c in cols]
-        if all(x and x > 1.0 for x in v):
-            out.update({"O2.5": _odds_entry(v[0]), "U2.5": _odds_entry(v[1])})
-            break
-    return out
-
-
-def _ts_of(d, tm="12:00"):
-    try:
-        hh, mm = [int(x) for x in (tm or "12:00").split(":")[:2]]
-    except Exception:
-        hh, mm = 12, 0
-    return int(datetime(d.year, d.month, d.day, hh, mm, tzinfo=timezone.utc).timestamp())
-
-
-def _int_or_none(x):
-    v = _f(x)
-    return None if v is None else int(v)
-
-
-def fd_parse_main(text):
-    """football-data.co.uk main-league CSV (also fixtures.csv). Rows without a full-time score are fixtures."""
-    rows = []
-    if not text or "HomeTeam" not in text[:600]:
-        return rows
-    for r in csv.DictReader(io.StringIO(text)):
-        d, h, a = _fd_date(r.get("Date")), (r.get("HomeTeam") or "").strip(), (r.get("AwayTeam") or "").strip()
-        if not d or not h or not a:
-            continue
-        rows.append({"div": (r.get("Div") or "").strip(), "date": d, "ts": _ts_of(d, r.get("Time")), "time": r.get("Time"),
-                     "home": h, "away": a, "hg": _int_or_none(r.get("FTHG")), "ag": _int_or_none(r.get("FTAG")),
-                     "hthg": _int_or_none(r.get("HTHG")), "htag": _int_or_none(r.get("HTAG")),
-                     "hc": _f(r.get("HC")), "ac": _f(r.get("AC")), "hst": _f(r.get("HST")), "ast": _f(r.get("AST")),
-                     "odds": fd_row_odds(r)})
-    return rows
-
-
-def fd_parse_new(text, since):
-    """football-data.co.uk 'new leagues' CSV (Country,League,Season,Date,Time,Home,Away,HG,AG,Res,PH,PD,PA,...)."""
-    rows = []
-    if not text or "Home" not in text[:600]:
-        return rows
-    for r in csv.DictReader(io.StringIO(text)):
-        d, h, a = _fd_date(r.get("Date")), (r.get("Home") or "").strip(), (r.get("Away") or "").strip()
-        if not d or not h or not a or d < since:
-            continue
-        rows.append({"div": (r.get("League") or "").strip(), "date": d, "ts": _ts_of(d, r.get("Time")), "time": r.get("Time"),
-                     "home": h, "away": a, "hg": _int_or_none(r.get("HG")), "ag": _int_or_none(r.get("AG")),
-                     "hthg": None, "htag": None, "hc": None, "ac": None, "hst": None, "ast": None, "odds": fd_row_odds(r)})
-    return rows
-
-
-def american_to_decimal(x):
-    try:
-        s = str(x).strip().upper()
-        if s in ("EVEN", "EV", "PK"):
-            return 2.0
-        v = float(s.replace("+", ""))
-        if v == 0:
-            return None
-        return 1 + v / 100.0 if v > 0 else 1 + 100.0 / abs(v)
-    except Exception:
-        return None
-
-
-def espn_parse_odds(lst):
-    """Defensive parse of ESPN's competition.odds block -> app odds map (1X2 and, if present, the O/U line)."""
-    try:
-        o = (lst or [{}])[0] or {}
-        ml = lambda blk: american_to_decimal((blk or {}).get("moneyLine"))
-        h, d, a = ml(o.get("homeTeamOdds")), ml(o.get("drawOdds")), ml(o.get("awayTeamOdds"))
-        out = {}
-        if h and d and a and min(h, d, a) > 1.0:
-            out.update({"1": _odds_entry(h), "X": _odds_entry(d), "2": _odds_entry(a)})
-        line = _f(o.get("overUnder"))
-        ov, un = american_to_decimal(o.get("overOdds")), american_to_decimal(o.get("underOdds"))
-        if line in GOAL_LINES and ov and un and ov > 1.0 and un > 1.0:
-            out.update({f"O{line:g}": _odds_entry(ov), f"U{line:g}": _odds_entry(un)})
-        return out
-    except Exception:
-        return {}
-
-
-def elo_probs(eh, ea, hfa=65.0):
-    """ClubElo ratings -> 1/X/2 probabilities (independent strength opinion)."""
-    dr = eh + hfa - ea
-    e = 1.0 / (1.0 + 10 ** (-dr / 400.0))
-    px = max(0.12, 0.30 - 0.55 * (e - 0.5) ** 2)
-    p1, p2 = max(0.02, e - px / 2), max(0.02, 1 - e - px / 2)
-    s = p1 + px + p2
-    return {"1": p1 / s, "X": px / s, "2": p2 / s}
-
-
-class FreeData:
-    def __init__(self, enabled=True, cache_dir=CACHE_DIR):
-        self.enabled = enabled
-        self.cache_dir = cache_dir
-        self.session = requests.Session()
-        self.session.headers.update(FREE_UA)
-        self.lock = threading.RLock()
-        self.mem: Dict[str, Optional[str]] = {}
-        self.used = defaultdict(int)        # source -> number of matches it helped
-        self.saved_calls = 0                # API-Football calls avoided thanks to free data (estimate)
-        self.fails: List[str] = []
-        self._rows: Dict[Any, list] = {}
-        self._fix_main: Optional[list] = None
-        self._espn: Dict[Any, list] = {}
-        self._elo: Optional[list] = None
-        self._intl: Optional[list] = None
-        self._intl_names_c: Optional[list] = None
-        self._intl_elo_c: Optional[tuple] = None
-        self.target_date: Optional[str] = None      # day being analysed (set by the pipeline)
-        self.intl_extra = 0                         # recent results added from ESPN on top of the dataset
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-        except Exception:
-            pass
-
-    # ── transport (never raises) ──
-    def _get(self, url, ttl=FREE_TTL_S, timeout=25):
-        if not self.enabled:
-            return None
-        with self.lock:
-            if url in self.mem:
-                return self.mem[url]
-        path = os.path.join(self.cache_dir, "free_" + hashlib.md5(url.encode()).hexdigest() + ".txt")
-        txt = None
-        try:
-            if os.path.exists(path) and time.time() - os.path.getmtime(path) < ttl:
-                with open(path, "r", encoding="utf-8") as fh:
-                    txt = fh.read()
-        except Exception:
-            txt = None
-        if txt is None:
-            err = ""
-            for attempt in range(2):
-                try:
-                    r = self.session.get(url, timeout=timeout)
-                    if r.status_code == 200 and r.content:
-                        txt = r.content.decode("utf-8-sig", errors="replace")
-                        break
-                    err = f"HTTP {r.status_code}"
-                    if r.status_code in (403, 404):
-                        break
-                except Exception as e:
-                    err = str(e)[:70]
-                time.sleep(0.8)
-            if txt:
-                try:
-                    with open(path, "w", encoding="utf-8") as fh:
-                        fh.write(txt)
-                except Exception:
-                    pass
-            else:
-                self.fails.append(f"{url.split('//')[-1][:60]}: {err or 'empty'}")
-        with self.lock:
-            self.mem[url] = txt
-        return txt
-
-    # ── football-data.co.uk ──
-    def _main_rows(self, code, season):
-        key = ("main", code, season)
-        with self.lock:
-            if key in self._rows:
-                return self._rows[key]
-        rows = fd_parse_main(self._get(f"{FD_BASE}/mmz4281/{season}/{code}.csv"))
-        rows = [r for r in rows if r["hg"] is not None and r["ag"] is not None]
-        with self.lock:
-            self._rows[key] = rows
-        return rows
-
-    def _new_rows(self, code, since):
-        key = ("new", code)
-        with self.lock:
-            if key in self._rows:
-                return self._rows[key]
-        rows = fd_parse_new(self._get(f"{FD_BASE}/new/{code}.csv"), since)
-        with self.lock:
-            self._rows[key] = rows
-        return rows
-
-    def rows_for(self, league_id, date_str):
-        """Played matches of the league (current + previous season when the season is young)."""
-        if not self.enabled:
-            return []
-        d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        if league_id in FD_MAIN:
-            code = FD_MAIN[league_id]
-            rows = list(self._main_rows(code, fd_season_code(d)))
-            if len(rows) < 150:
-                rows += self._main_rows(code, fd_season_code(d, 1))
-            return rows
-        if league_id in FD_NEW:
-            rows = self._new_rows(FD_NEW[league_id], d - timedelta(days=520))
-            return [r for r in rows if r["hg"] is not None and r["ag"] is not None]
-        return []
-
-    def _names(self, rows):
-        return sorted({r["home"] for r in rows} | {r["away"] for r in rows})
-
-    def find_team(self, name, league_id, date_str):
-        rows = self.rows_for(league_id, date_str)
-        if not rows:
-            return None, rows
-        return best_match(name, self._names(rows)), rows
-
-    def team_form(self, name, league_id, date_str, n=10):
-        nm, rows = self.find_team(name, league_id, date_str)
-        if not nm:
-            return self.intl_form(name, date_str, n) if league_id not in FD_ALL else None
-        d0 = datetime.strptime(date_str, "%Y-%m-%d").date()
-        games = sorted([r for r in rows if r["date"] < d0 and nm in (r["home"], r["away"])], key=lambda r: -r["ts"])[:n]
-        if len(games) < 3:
-            return None
-        res, cf, ca, st_ = [], [], [], []
-        for i, r in enumerate(games):
-            ih = r["home"] == nm
-            gf, ga = (r["hg"], r["ag"]) if ih else (r["ag"], r["hg"])
-            res.append({"id": f"fd:{r['date'].isoformat()}:{i}", "ts": r["ts"], "home": ih, "gf": gf, "ga": ga,
-                        "res": "W" if gf > ga else "D" if gf == ga else "L", "opp": r["away" if ih else "home"], "league_id": league_id})
-            if i < 5:
-                c1, c2 = (r["hc"], r["ac"]) if ih else (r["ac"], r["hc"])
-                if c1 is not None and c2 is not None:
-                    cf.append(c1)
-                    ca.append(c2)
-                s1 = r["hst"] if ih else r["ast"]
-                if s1 is not None:
-                    st_.append(s1)
-        avg = lambda l: float(np.mean(l)) if l else None
-        hs = {"cor_for": avg(cf), "cor_against": avg(ca), "cor_n": len(cf), "sot": avg(st_), "xg_for": None, "xg_against": None, "players": {}}
-        return {"results": res, "hs": hs, "name": nm, "stale_days": (d0 - games[0]["date"]).days}
-
-    # ── national teams: martj42/international_results (all international matches, free CSV on GitHub) ──
-    def intl_rows(self):
-        with self.lock:
-            if self._intl is not None:
-                return self._intl
-        txt = self._get(INTL_URL, ttl=12 * 3600, timeout=45)
-        rows = []
-        if txt and txt[:30].lower().startswith("date"):
-            for r in csv.DictReader(io.StringIO(txt)):
-                d, hg, ag = _fd_date(r.get("date")), _int_or_none(r.get("home_score")), _int_or_none(r.get("away_score"))
-                if not d or hg is None or ag is None:
-                    continue
-                rows.append({"date": d, "ts": _ts_of(d), "home": r.get("home_team") or "", "away": r.get("away_team") or "", "hg": hg, "ag": ag,
-                             "tour": r.get("tournament") or "", "neutral": (r.get("neutral") or "").upper() == "TRUE"})
-            rows.sort(key=lambda r: r["ts"])
-        names = sorted({r["home"] for r in rows} | {r["away"] for r in rows})
-        try:
-            rows = self._intl_gap_fill(rows, names)
-        except Exception as e:
-            self.fails.append(f"espn gap-fill: {str(e)[:60]}")
-        with self.lock:
-            self._intl = rows
-            self._intl_names_c = names
-        return rows
-
-    def _intl_gap_fill(self, rows, names):
-        """The results file lags by weeks. Top it up with finished matches from ESPN's public scoreboards (best effort)."""
-        if not rows or not self.target_date:
-            return rows
-        tgt = datetime.strptime(self.target_date, "%Y-%m-%d").date()
-        last = rows[-1]["date"]
-        if (tgt - last).days <= 3:
-            return rows
-        days = [last + timedelta(days=i) for i in range(1, min((tgt - last).days, 45) + 1) if last + timedelta(days=i) < tgt]
-        jobs = [(slug, d.isoformat()) for d in days for slug in ("uefa.nations", "fifa.friendly")]
-        have = {(r["date"], r["home"], r["away"]) for r in rows[-400:]}
-        added = []
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            for evs, job in zip(ex.map(lambda j: self.espn_events(*j), jobs), jobs):
-                slug = job[0]
-                for e in evs:
-                    if e["state"] != "post" or e["hg"] is None or e["ag"] is None:
-                        continue
-                    h, a = best_match(e["home"], names, 0.95), best_match(e["away"], names, 0.95)
-                    d = datetime.fromtimestamp(e["ts"], timezone.utc).date()
-                    if h and a and h != a and (d, h, a) not in have and d < tgt:
-                        have.add((d, h, a))
-                        added.append({"date": d, "ts": e["ts"], "home": h, "away": a, "hg": e["hg"], "ag": e["ag"],
-                                      "tour": "UEFA Nations League" if slug == "uefa.nations" else "Friendly", "neutral": False})
-        if added:
-            self.intl_extra = len(added)
-            rows = sorted(rows + added, key=lambda r: r["ts"])
-        return rows
-
-    def intl_team(self, name):
-        self.intl_rows()
-        return best_match(name, self._intl_names_c or [], 0.95)      # near-exact only: a club must never be mistaken for a nation
-
-    def intl_form(self, name, date_str, n=10):
-        rows = self.intl_rows()
-        nm = self.intl_team(name) if rows else None
-        if not nm:
-            return None
-        d0 = datetime.strptime(date_str, "%Y-%m-%d").date()
-        games = []
-        for r in reversed(rows):
-            if r["date"] < d0 and nm in (r["home"], r["away"]):
-                games.append(r)
-                if len(games) >= n:
-                    break
-        if len(games) < 3:
-            return None
-        res = []
-        for i, r in enumerate(games):
-            ih = r["home"] == nm
-            gf, ga = (r["hg"], r["ag"]) if ih else (r["ag"], r["hg"])
-            res.append({"id": f"fd:intl:{r['date'].isoformat()}:{i}", "ts": r["ts"], "home": ih, "gf": gf, "ga": ga,
-                        "res": "W" if gf > ga else "D" if gf == ga else "L", "opp": r["away" if ih else "home"], "league_id": 0})
-        hs = {"cor_for": None, "cor_against": None, "cor_n": 0, "sot": None, "xg_for": None, "xg_against": None, "players": {}}
-        return {"results": res, "hs": hs, "name": nm, "stale_days": (d0 - games[0]["date"]).days, "intl": True}
-
-    def intl_h2h(self, home, away, date_str):
-        rows = self.intl_rows()
-        nh, na = (self.intl_team(home), self.intl_team(away)) if rows else (None, None)
-        if not nh or not na or nh == na:
-            return []
-        d0 = datetime.strptime(date_str, "%Y-%m-%d").date()
-        out = []
-        for r in reversed(rows):
-            if r["date"] < d0 and {r["home"], r["away"]} == {nh, na}:
-                ih = r["home"] == nh
-                out.append({"ts": r["ts"], "gf": r["hg"] if ih else r["ag"], "ga": r["ag"] if ih else r["hg"]})
-                if len(out) >= 8:
-                    break
-        return out
-
-    @staticmethod
-    def _intl_k(tour):
-        t = (tour or "").lower()
-        if "friendly" in t:
-            return 20
-        if t == "fifa world cup":
-            return 60
-        if "qualification" in t:
-            return 40
-        if any(x in t for x in ("uefa euro", "copa am", "african cup of nations", "afc asian cup", "gold cup", "confederations")):
-            return 50
-        if "nations league" in t:
-            return 40
-        return 30
-
-    def intl_elo_table(self, date_str):
-        """World-Football-Elo style ratings computed from the full results file (home edge 100, goal-difference multiplier)."""
-        with self.lock:
-            if self._intl_elo_c and self._intl_elo_c[0] == date_str:
-                return self._intl_elo_c[1]
-        d0 = datetime.strptime(date_str, "%Y-%m-%d").date()
-        elo = defaultdict(lambda: 1500.0)
-        for r in self.intl_rows():
-            if r["date"] >= d0:
-                break
-            if r["date"].year < 1990:
-                continue
-            h, a = r["home"], r["away"]
-            dr = elo[h] - elo[a] + (0 if r["neutral"] else 100.0)
-            we = 1.0 / (10 ** (-dr / 400.0) + 1.0)
-            w = 1.0 if r["hg"] > r["ag"] else 0.5 if r["hg"] == r["ag"] else 0.0
-            gd = abs(r["hg"] - r["ag"])
-            g = 1.0 if gd <= 1 else 1.5 if gd == 2 else (11 + gd) / 8.0
-            ch = self._intl_k(r["tour"]) * g * (w - we)
-            elo[h] += ch
-            elo[a] -= ch
-        tab = dict(elo)
-        with self.lock:
-            self._intl_elo_c = (date_str, tab)
-        return tab
-
-    def intl_elo(self, home, away, date_str):
-        rows = self.intl_rows()
-        nh, na = (self.intl_team(home), self.intl_team(away)) if rows else (None, None)
-        if not nh or not na or nh == na:
-            return None
-        tab = self.intl_elo_table(date_str)
-        if nh not in tab or na not in tab:
-            return None
-        return {"h": tab[nh], "a": tab[na], "p": elo_probs(tab[nh], tab[na], hfa=100.0), "intl": True}
-
-    def covers(self, m, date_str):
-        """True when free sources can supply form for BOTH teams (no API call needed)."""
-        return bool(self.enabled and self.team_form(m["home"], m["league_id"], date_str) and self.team_form(m["away"], m["league_id"], date_str))
-
-    def h2h(self, home, away, league_id, date_str):
-        if league_id not in FD_ALL:
-            return self.intl_h2h(home, away, date_str)
-        nh, rows = self.find_team(home, league_id, date_str)
-        na = best_match(away, self._names(rows)) if rows else None
-        if not nh or not na or nh == na:
-            return []
-        d0 = datetime.strptime(date_str, "%Y-%m-%d").date()
-        out = []
-        for r in sorted(rows, key=lambda r: -r["ts"]):
-            if r["date"] < d0 and {r["home"], r["away"]} == {nh, na}:
-                ih = r["home"] == nh
-                out.append({"ts": r["ts"], "gf": r["hg"] if ih else r["ag"], "ga": r["ag"] if ih else r["hg"]})
-        return out[:8]
-
-    def standing(self, name, league_id, date_str):
-        if league_id not in FD_MAIN:
-            return None
-        nm, rows = self.find_team(name, league_id, date_str)
-        if not nm:
-            return None
-        d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        start = date_cls(d.year if d.month >= 7 else d.year - 1, 7, 1)
-        tab = defaultdict(lambda: [0, 0, 0])      # pts, gd, played
-        for r in rows:
-            if start <= r["date"] < d:
-                for t, gf, ga in ((r["home"], r["hg"], r["ag"]), (r["away"], r["ag"], r["hg"])):
-                    e = tab[t]
-                    e[0] += 3 if gf > ga else 1 if gf == ga else 0
-                    e[1] += gf - ga
-                    e[2] += 1
-        if nm not in tab or len(tab) < 8 or np.mean([v[2] for v in tab.values()]) < 3:
-            return None
-        order = sorted(tab, key=lambda t: (-tab[t][0], -tab[t][1]))
-        return {"rank": order.index(nm) + 1, "pts": tab[nm][0], "of": len(order), "played": tab[nm][2], "desc": None}
-
-    def _fix_rows(self):
-        with self.lock:
-            if self._fix_main is not None:
-                return self._fix_main
-        rows = fd_parse_main(self._get(f"{FD_BASE}/fixtures.csv", ttl=3 * 3600))
-        rows = [r for r in rows if r["hg"] is None]
-        with self.lock:
-            self._fix_main = rows
-        return rows
-
-    def fd_fixtures(self, league_id, date_str):
-        """Upcoming rows (with bookmaker prices) for the league, from fixtures.csv or the new-league file."""
-        d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        if league_id in FD_MAIN:
-            return [r for r in self._fix_rows() if r["div"] == FD_MAIN[league_id] and abs((r["date"] - d).days) <= 1]
-        if league_id in FD_NEW:
-            rows = self._new_rows(FD_NEW[league_id], d - timedelta(days=520))
-            return [r for r in rows if r["hg"] is None and abs((r["date"] - d).days) <= 1]
-        return []
-
-    # ── ESPN ──
-    def espn_events(self, slug, date_str):
-        key = (slug, date_str)
-        try:
-            past = datetime.strptime(date_str, "%Y-%m-%d").date() < datetime.now(timezone.utc).date() - timedelta(days=1)
-        except Exception:
-            past = False
-        with self.lock:
-            if key in self._espn:
-                return self._espn[key]
-        out = []
-        txt = self._get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard?dates={date_str.replace('-', '')}", ttl=(7 * 86400 if past else 1800), timeout=15)
-        try:
-            data = json.loads(txt) if txt else {}
-            for ev in data.get("events") or []:
-                comp = (ev.get("competitions") or [{}])[0]
-                cs = comp.get("competitors") or []
-                hm = next((c for c in cs if c.get("homeAway") == "home"), None)
-                aw = next((c for c in cs if c.get("homeAway") == "away"), None)
-                if not hm or not aw:
-                    continue
-                state = (((ev.get("status") or {}).get("type") or {}).get("state") or "").lower()
-                ds = (ev.get("date") or "").replace("Z", "+0000")
-                ts = None
-                for fmt in ("%Y-%m-%dT%H:%M%z", "%Y-%m-%dT%H:%M:%S%z"):
-                    try:
-                        ts = int(datetime.strptime(ds, fmt).timestamp())
-                        break
-                    except Exception:
-                        pass
-                if ts is None:
-                    continue
-                out.append({"home": (hm.get("team") or {}).get("displayName") or "", "away": (aw.get("team") or {}).get("displayName") or "",
-                            "ts": ts, "state": state, "odds": espn_parse_odds(comp.get("odds")),
-                            "hg": _int_or_none(hm.get("score")), "ag": _int_or_none(aw.get("score"))})
-        except Exception as e:
-            self.fails.append(f"espn parse {slug}: {str(e)[:50]}")
-        with self.lock:
-            self._espn[key] = out
-        return out
-
-    # ── odds for one match (FD first: several markets, then ESPN) ──
-    def odds_for(self, home, away, league_id, date_str):
-        if not self.enabled:
-            return {}, None
-        rows = self.fd_fixtures(league_id, date_str)
-        if rows:
-            names = self._names(rows)
-            nh, na = best_match(home, names), best_match(away, names)
-            if nh and na:
-                for r in rows:
-                    if r["home"] == nh and r["away"] == na and r["odds"].get("1"):
-                        return dict(r["odds"]), "football-data"
-        slug = ESPN_SLUG.get(league_id)
-        if slug:
-            ev = self.espn_events(slug, date_str)
-            if ev:
-                names = sorted({e["home"] for e in ev} | {e["away"] for e in ev})
-                nh, na = best_match(home, names), best_match(away, names)
-                if nh and na:
-                    for e in ev:
-                        if e["home"] == nh and e["away"] == na and e["odds"].get("1"):
-                            return dict(e["odds"]), "espn"
-        return {}, None
-
-    # ── ClubElo ──
-    def elo_table(self, date_str):
-        with self.lock:
-            if self._elo is not None:
-                return self._elo
-        txt = self._get(f"http://api.clubelo.com/{date_str}", ttl=12 * 3600, timeout=20) or self._get(f"https://api.clubelo.com/{date_str}", ttl=12 * 3600, timeout=20)
-        tab = []
-        try:
-            for r in csv.DictReader(io.StringIO(txt or "")):
-                e = _f(r.get("Elo"))
-                if r.get("Club") and e:
-                    tab.append((r["Club"], e))
-        except Exception:
-            tab = []
-        with self.lock:
-            self._elo = tab
-        return tab
-
-    def elo_for(self, home, away, league_id, country, date_str):
-        """Returns {'h','a','p'} or None. Only used for European competitions (ClubElo covers Europe)."""
-        if not self.enabled:
-            return None
-        if not (league_id in ELO_LEAGUE_IDS or (country or "").lower() in ELO_COUNTRIES or league_id in FD_MAIN):
-            return self.intl_elo(home, away, date_str) if league_id not in FD_ALL else None
-        tab = self.elo_table(date_str)
-        if not tab:
-            return None
-        names = [c for c, _ in tab]
-        nh, na = best_match(home, names, 0.88), best_match(away, names, 0.88)
-        if not nh or not na or nh == na:
-            return None
-        e = dict(tab)
-        return {"h": e[nh], "a": e[na], "p": elo_probs(e[nh], e[na])}
-
-    # ── settlement helper ──
-    def result_for(self, home, away, league_id, date_str):
-        if league_id not in FD_ALL:
-            rows = self.intl_rows()
-            nh, na = (self.intl_team(home), self.intl_team(away)) if rows else (None, None)
-            d = datetime.strptime(date_str, "%Y-%m-%d").date()
-            for r in rows if (nh and na) else []:
-                if r["home"] == nh and r["away"] == na and abs((r["date"] - d).days) <= 1:
-                    return {"goals": {"home": r["hg"], "away": r["ag"]}, "score": {"fulltime": {"home": r["hg"], "away": r["ag"]}}}
-            return None
-        nh, rows = self.find_team(home, league_id, date_str)
-        na = best_match(away, self._names(rows)) if rows else None
-        if not nh or not na:
-            return None
-        d = datetime.strptime(date_str, "%Y-%m-%d").date()
-        for r in rows:
-            if r["home"] == nh and r["away"] == na and abs((r["date"] - d).days) <= 1:
-                f = {"goals": {"home": r["hg"], "away": r["ag"]}, "score": {"fulltime": {"home": r["hg"], "away": r["ag"]}}}
-                if r["hthg"] is not None and r["htag"] is not None:
-                    f["score"]["halftime"] = {"home": r["hthg"], "away": r["htag"]}
-                if r["hc"] is not None and r["ac"] is not None:
-                    f["statistics"] = [{"statistics": [{"type": "Corner Kicks", "value": r["hc"]}]},
-                                       {"statistics": [{"type": "Corner Kicks", "value": r["ac"]}]}]
-                return f
-        return None
-
-    # ── fixtures when API-Football gives none (free-only mode) ──
-    def free_fixtures(self, date_str, tz, workers=6):
-        if not self.enabled:
-            return []
-        zi = ZoneInfo(tz)
-        tgt = datetime.strptime(date_str, "%Y-%m-%d").date()
-        out = []
-        prev = (tgt - timedelta(days=1)).isoformat()
-        jobs = [(slug, ds) for slug in ESPN_SLUG.values() for ds in (date_str, prev)]
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs = {ex.submit(self.espn_events, s, ds): s for s, ds in jobs}
-            for fu in as_completed(futs):
-                slug = futs[fu]
-                try:
-                    evs = fu.result()
-                except Exception:
-                    continue
-                lid = ESPN_SLUG_TO_LID[slug]
-                for e in evs:
-                    if e["state"] not in ("pre", "") or datetime.fromtimestamp(e["ts"], zi).date() != tgt:
-                        continue
-                    if not any(o["league_id"] == lid and o["ts"] == e["ts"] and _sim(norm_team(o["home"]), norm_team(e["home"])) >= 0.9 for o in out):
-                        out.append({"league_id": lid, "home": e["home"], "away": e["away"], "ts": e["ts"], "odds": e["odds"], "src": "espn"})
-        london = ZoneInfo("Europe/London")
-        for lid in list(FD_MAIN) + list(FD_NEW):
-            for r in self.fd_fixtures(lid, date_str):
-                try:
-                    hh, mm = [int(x) for x in (r["time"] or "15:00").split(":")[:2]]
-                    ts = int(datetime(r["date"].year, r["date"].month, r["date"].day, hh, mm, tzinfo=london).timestamp())
-                except Exception:
-                    ts = r["ts"]
-                if datetime.fromtimestamp(ts, zi).date() != tgt:
-                    continue
-                dup = next((o for o in out if o["league_id"] == lid and best_match(r["home"], [o["home"]]) and best_match(r["away"], [o["away"]])), None)
-                if dup is not None:
-                    if not dup["odds"].get("O2.5") and r["odds"]:
-                        dup["odds"] = dict(r["odds"])          # football-data prices carry more markets than ESPN's
-                    continue
-                out.append({"league_id": lid, "home": r["home"], "away": r["away"], "ts": ts, "odds": dict(r["odds"]), "src": "football-data"})
-        return out
-
-    def summary(self):
-        return {"used": dict(self.used), "saved_calls": self.saved_calls, "fails": self.fails[:6]}
-
-
-def derive_dc_odds(odds):
-    """Double-chance prices derived from the 1X2 prices when a source does not quote them (keeps the book's margin)."""
-    if not odds or not all(k in odds for k in ("1", "X", "2")):
-        return odds
-    out = dict(odds)
-    inv = {k: 1.0 / odds[k]["odds"] for k in ("1", "X", "2")}
-    for key, parts in (("1X", ("1", "X")), ("X2", ("X", "2")), ("12", ("1", "2"))):
-        if key not in out:
-            s = sum(inv[p] for p in parts)
-            if 0 < s < 0.98:
-                v = 1.0 / s
-                out[key] = {"odds": v, "median": v, "best": v, "low": v, "n": 0, "derived": True}
-    return out
-
-
-
-# ═════════════════════════════════════════════════════════════════════════════
 # Team profile (form, goals, corners, xG, player form, injuries, lineup)
 # ═════════════════════════════════════════════════════════════════════════════
 def _stat_val(stats_list, name):
@@ -1317,7 +536,7 @@ def team_history_stats(team_id, ids, hist):
 def build_profile(team_id, results, hs, injuries, lineup):
     r10 = results[:10]
     w = np.array([0.88 ** i for i in range(len(r10))]) if r10 else np.array([])
-    prof = {"n": len(r10), "last": [f"{x['gf']}-{x['ga']}{x['res']}" for x in r10[:5]]}
+    prof = {"n": len(r10)}
     if r10:
         gf = np.array([x["gf"] for x in r10], float)
         ga = np.array([x["ga"] for x in r10], float)
@@ -1399,10 +618,239 @@ def injury_impact(prof):
 # ═════════════════════════════════════════════════════════════════════════════
 # Expected goals / corners
 # ═════════════════════════════════════════════════════════════════════════════
-def estimate_lambdas(pred, ph, pa, elo=None):
-    """Returns (lam_h, lam_a, injury_impacts, basis). `basis` records what real data the numbers rest on;
-    'elo' = only ClubElo strength was available (weak but team-specific); 'prior' = NO team data at all (match is unusable)."""
-    prior_h, prior_a = 1.45, 1.15
+# ═════════════════════════════════════════════════════════════════════════════
+# Free data layers: permanent results database + ClubElo + Elo maths
+# ═════════════════════════════════════════════════════════════════════════════
+RESULTS_DB_PATH = os.environ.get("DERAI_FB_RESULTS", "derai_results_db.json")
+
+
+class ResultsDB:
+    """Permanent local database of finished matches built from API-Football's daily fixture dumps
+    (ONE call = every match worldwide on a date, with scores). Past days never change, so each day is fetched once, ever.
+    Gives recent form for any team using team ids only - no name matching, no season/last parameters."""
+    KEEP_DAYS = 75
+
+    def __init__(self, path=None):
+        path = path or RESULTS_DB_PATH
+        self.path, self.days, self.meta, self._idx, self._lg = path, {}, {}, None, None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                blob = json.load(fh)
+            self.days, self.meta = blob.get("days", {}), blob.get("meta", {})
+        except Exception:
+            self.days, self.meta = {}, {}
+
+    def has(self, d):
+        return d in self.days
+
+    def add_day(self, d, fixtures_raw):
+        rows = []
+        for f in fixtures_raw or []:
+            if ((f.get("fixture") or {}).get("status") or {}).get("short") not in PLAYED_OK:
+                continue
+            h, a = _ft_goals(f)
+            tm = f.get("teams") or {}
+            hid, aid = (tm.get("home") or {}).get("id"), (tm.get("away") or {}).get("id")
+            if h is None or a is None or hid is None or aid is None:
+                continue
+            rows.append([f["fixture"]["id"], f["fixture"]["timestamp"], (f.get("league") or {}).get("id"), hid, aid, h, a])
+        self.days[d] = rows
+        self._idx = self._lg = None
+
+    def save(self):
+        cut = (datetime.now(timezone.utc).date() - timedelta(days=self.KEEP_DAYS)).isoformat()
+        self.days = {k: v for k, v in self.days.items() if k.split(":")[-1] >= cut}
+        try:
+            with open(self.path, "w", encoding="utf-8") as fh:
+                json.dump({"days": self.days, "meta": self.meta}, fh)
+        except Exception:
+            pass
+
+    def add_rows(self, rows_by_date):
+        """Add finished matches from a source other than daily dumps (e.g. ESPN). Keys are namespaced 'E:YYYY-MM-DD'."""
+        n = 0
+        for d, rows in rows_by_date.items():
+            k = "E:" + d
+            have = {r[0] for r in self.days.get(k, [])}
+            new = [r for r in rows if r[0] not in have]
+            if new:
+                self.days.setdefault(k, []).extend(new)
+                n += len(new)
+        if n:
+            self._idx = self._lg = None
+        return n
+
+    def total_matches(self):
+        return sum(len(v) for v in self.days.values())
+
+    def h2h(self, home_id, away_id, before_ts, n=8):
+        if self._idx is None:
+            self._build()
+        out = []
+        for r in sorted(self._idx.get(home_id, []), key=lambda x: -x[1]):
+            if r[1] >= before_ts or {r[3], r[4]} != {home_id, away_id}:
+                continue
+            gf, ga = (r[5], r[6]) if r[3] == home_id else (r[6], r[5])
+            out.append({"ts": r[1], "gf": gf, "ga": ga})
+            if len(out) >= n:
+                break
+        return out
+
+    def _build(self):
+        idx, lg = defaultdict(list), {}
+        for rows in self.days.values():
+            for r in rows:
+                idx[r[3]].append(r)
+                idx[r[4]].append(r)
+                e = lg.setdefault(r[2], [0, 0.0, 0.0])
+                e[0] += 1
+                e[1] += r[5]
+                e[2] += r[6]
+        self._idx, self._lg = idx, lg
+
+    def results(self, team_id, before_ts, n=10):
+        if self._idx is None:
+            self._build()
+        out = []
+        for r in sorted(self._idx.get(team_id, []), key=lambda x: -x[1]):
+            if r[1] >= before_ts:
+                continue
+            is_home = r[3] == team_id
+            gf, ga = (r[5], r[6]) if is_home else (r[6], r[5])
+            out.append({"id": r[0], "ts": r[1], "home": is_home, "gf": gf, "ga": ga,
+                        "res": "W" if gf > ga else "D" if gf == ga else "L", "opp": None, "league_id": r[2]})
+            if len(out) >= n:
+                break
+        return out
+
+    def league_prior(self, lid, default=(1.45, 1.15)):
+        """Competition-specific average home/away goals (shrunk towards the global default)."""
+        if self._lg is None:
+            self._build()
+        e = self._lg.get(lid)
+        if e and e[0] >= 15:
+            n, gh, ga = e
+            w = n / (n + 20.0)
+            return (w * gh / n + (1 - w) * default[0], w * ga / n + (1 - w) * default[1])
+        return default
+
+
+ELO_COUNTRY = {"England": "ENG", "Spain": "ESP", "Germany": "GER", "Italy": "ITA", "France": "FRA", "Netherlands": "NED",
+               "Portugal": "POR", "Belgium": "BEL", "Scotland": "SCO", "Turkey": "TUR", "Greece": "GRE", "Russia": "RUS",
+               "Ukraine": "UKR", "Austria": "AUT", "Switzerland": "SUI", "Denmark": "DEN", "Norway": "NOR", "Sweden": "SWE",
+               "Poland": "POL", "Czech-Republic": "CZE", "Croatia": "CRO", "Serbia": "SRB", "Romania": "ROU", "Hungary": "HUN",
+               "Bulgaria": "BUL", "Israel": "ISR", "Cyprus": "CYP", "Ireland": "IRL", "Slovakia": "SVK", "Slovenia": "SVN",
+               "Finland": "FIN", "Iceland": "ISL", "Wales": "WAL", "Northern-Ireland": "NIR", "Kazakhstan": "KAZ",
+               "Azerbaijan": "AZE", "Belarus": "BLR", "Bosnia-and-Herzegovina": "BIH", "Albania": "ALB", "Moldova": "MDA",
+               "Latvia": "LVA", "Lithuania": "LTU", "Estonia": "EST", "Luxembourg": "LUX", "Malta": "MLT", "Georgia": "GEO",
+               "Armenia": "ARM", "Montenegro": "MNE", "North-Macedonia": "MKD"}
+ELO_ALIASES = {"manchester city": "man city", "manchester united": "man united", "atletico madrid": "atletico",
+               "paris saint germain": "paris sg", "bayern munich": "bayern", "bayern munchen": "bayern", "borussia dortmund": "dortmund",
+               "bayer leverkusen": "leverkusen", "rb leipzig": "leipzig", "inter milan": "inter", "internazionale": "inter",
+               "ac milan": "milan", "real sociedad": "sociedad", "real betis": "betis", "athletic club": "bilbao",
+               "athletic bilbao": "bilbao", "nottingham forest": "forest", "wolverhampton wanderers": "wolves",
+               "brighton hove albion": "brighton", "newcastle united": "newcastle", "tottenham hotspur": "tottenham",
+               "west ham united": "west ham", "sporting cp": "sporting", "sporting lisbon": "sporting", "psv eindhoven": "psv"}
+
+
+def _norm_team(n):
+    n = unicodedata.normalize("NFKD", str(n or "")).encode("ascii", "ignore").decode().lower()
+    n = re.sub(r"\b(fc|cf|afc|sc|ac|as|ss|us|sk|fk|nk|if|bk|club|de|the|cd|ud|sv|vfb|vfl|tsg|fsv|ksv|kv|calcio|futbol|football)\b", " ", n)
+    n = re.sub(r"[^a-z0-9 ]", " ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+class EloTable:
+    """ClubElo ratings (free, keyless, ONE call for all clubs). Names are matched fuzzily; no match simply means no Elo."""
+
+    def __init__(self, rows):
+        self.by_norm = defaultdict(list)
+        for club, ctry, elo in rows:
+            self.by_norm[_norm_team(club)].append((ctry, elo))
+        self.keys = list(self.by_norm)
+
+    def __len__(self):
+        return len(self.keys)
+
+    def lookup(self, name, country=None):
+        if not self.keys:
+            return None
+        n = _norm_team(name)
+        n = ELO_ALIASES.get(n, n)
+        code = ELO_COUNTRY.get(str(country or "").replace(" ", "-"))
+
+        def pick(key):
+            cands = self.by_norm.get(key) or []
+            if code:
+                cands = [c for c in cands if c[0] == code]
+            return cands[0][1] if cands else None
+        v = pick(n)
+        if v is not None:
+            return v
+        for key in difflib.get_close_matches(n, self.keys, n=3, cutoff=0.86):
+            v = pick(key)
+            if v is not None:
+                return v
+        if len(n) >= 6:
+            for key in self.keys:
+                if (n in key or key in n) and len(key) >= 5:
+                    v = pick(key)
+                    if v is not None:
+                        return v
+        return None
+
+    @classmethod
+    def fetch(cls, date_str, cache_dir):
+        path = os.path.join(cache_dir, f"clubelo_{date_str}.csv")
+        text = None
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+        except Exception:
+            text = None
+        if not text:
+            try:
+                r = requests.get(f"http://api.clubelo.com/{date_str}", timeout=20)
+                if r.status_code == 200 and "Elo" in r.text[:300]:
+                    text = r.text
+                    try:
+                        with open(path, "w", encoding="utf-8") as fh:
+                            fh.write(text)
+                    except Exception:
+                        pass
+            except Exception:
+                text = None
+        rows = []
+        if text:
+            for row in csv.DictReader(io.StringIO(text)):
+                try:
+                    rows.append((row["Club"], row["Country"], float(row["Elo"])))
+                except Exception:
+                    continue
+        return cls(rows)
+
+
+def elo_lambdas(elo_h, elo_a, prior):
+    """Expected goals from an Elo gap: ~100 Elo points = ~0.45 goal difference, with home advantage (65 pts)."""
+    total = prior[0] + prior[1]
+    gd = (elo_h - elo_a + 65.0) / 220.0
+    return max(0.25, (total + gd) / 2), max(0.25, (total - gd) / 2)
+
+
+def poisson_1x2(lh, la, n=10):
+    ph = np.array([math.exp(-lh) * lh ** k / math.factorial(k) for k in range(n + 1)])
+    pa = np.array([math.exp(-la) * la ** k / math.factorial(k) for k in range(n + 1)])
+    M = np.outer(ph, pa)
+    p1, px, p2 = np.tril(M, -1).sum(), np.trace(M), np.triu(M, 1).sum()
+    t = p1 + px + p2
+    return {"1": float(p1 / t), "X": float(px / t), "2": float(p2 / t)}
+
+
+def estimate_lambdas(pred, ph, pa, elo=None, prior=(1.45, 1.15)):
+    """Returns (lam_h, lam_a, injury_impacts, basis). basis = what real data the numbers rest on:
+    season+recent / recent / season / elo (rating only) / prior (competition averages only - weakest)."""
+    prior_h, prior_a = prior
     season_h = season_a = None
     n_season = 0
     if pred:
@@ -1416,6 +864,7 @@ def estimate_lambdas(pred, ph, pa, elo=None):
     if n_rec >= 4:
         rec_h = (ph["gf_w"] + pa["ga_w"]) / 2
         rec_a = (pa["gf_w"] + ph["ga_w"]) / 2
+    elo_l = elo_lambdas(elo[0], elo[1], prior) if elo else None
     if season_h is not None and rec_h is not None:
         ws = 0.5 if n_season >= 6 else 0.3
         lh, la, m, basis = ws * season_h + (1 - ws) * rec_h, ws * season_a + (1 - ws) * rec_a, max(n_season, n_rec), "season+recent"
@@ -1423,18 +872,12 @@ def estimate_lambdas(pred, ph, pa, elo=None):
         lh, la, m, basis = season_h, season_a, n_season, "season"
     elif rec_h is not None:
         lh, la, m, basis = rec_h, rec_a, n_rec, "recent"
-    elif elo:
-        e = elo["p"]
-        share = 0.5 + 0.8 * ((e["1"] + e["X"] / 2) - 0.5)
-        tot = prior_h + prior_a
-        lh, la, m, basis = tot * share, tot * (1 - share), 4, "elo"
+    elif elo_l:
+        lh, la, m, basis = elo_l[0], elo_l[1], 6, "elo"
     else:
         lh, la, m, basis = prior_h, prior_a, 0, "prior"
-    if elo and elo.get("intl") and basis != "elo" and lh + la > 0:      # national teams: form ignores opposition strength, Elo supplies it
-        e = elo["p"]
-        es = 0.5 + 0.8 * ((e["1"] + e["X"] / 2) - 0.5)
-        sh = 0.55 * (lh / (lh + la)) + 0.45 * es
-        lh, la = (lh + la) * sh, (lh + la) * (1 - sh)
+    if elo_l and basis in ("season+recent", "season", "recent"):      # Elo as a 25% independent strength check
+        lh, la = 0.75 * lh + 0.25 * elo_l[0], 0.75 * la + 0.25 * elo_l[1]
     lh = (m * lh + 3 * prior_h) / (m + 3)
     la = (m * la + 3 * prior_a) / (m + 3)
     (ah, dh), (aa, da) = injury_impact(ph), injury_impact(pa)
@@ -1580,7 +1023,7 @@ def trap_analysis(m):
     fav_home = fav == "1"
     pf, pu = (m["ph"], m["pa"]) if fav_home else (m["pa"], m["ph"])
     risk, why = 0, []
-    gap = fp - mp[fav]
+    gap = 0.0 if m.get("basis") == "prior" else fp - mp[fav]     # no fake 'model vs market' traps when the model is just a prior
     if gap >= 0.14:
         risk += 35; why.append(f"{pre}{_pct(fp)}/mdl{_pct(mp[fav])}")
     elif gap >= 0.08:
@@ -1623,18 +1066,14 @@ def trap_analysis(m):
 def data_quality(m):
     dq = 0.0
     dq += 0.25 if m.get("odds") else 0
-    dq += 0.20 if m.get("pred") else (0.10 if m.get("elo") else 0)
+    dq += 0.20 if m.get("pred") else 0
     dq += 0.20 if m["ph"].get("n", 0) >= 5 and m["pa"].get("n", 0) >= 5 else (0.10 if m["ph"].get("n", 0) >= 3 else 0)
     dq += 0.10 if m.get("h2h") else 0
     dq += 0.10 if m.get("corner_n", 0) >= 3 else 0
     dq += 0.05 if m.get("inj_known") else 0
     dq += 0.05 if (m["ph"].get("lineup") and m["pa"].get("lineup")) else 0
     dq += 0.05 if m.get("st_h") else 0
-    age = m.get("form_age_days") or 0
-    if age > 90:                                # newest result is over 3 months old (squad/coach/tournament effects may have changed everything)
-        dq = max(0.0, dq - 0.10)
-    elif age > 30:
-        dq = max(0.0, dq - 0.05)
+    dq += 0.10 if m.get("elo") else 0
     if not m.get("odds"):          # odds availability is judged by the gate; here score only the team data (max 0.75)
         dq = dq / 0.75
     return round(min(1.0, dq), 2)
@@ -1686,12 +1125,10 @@ def market_fair_prob(key, om):
     return min(0.97, 1 / (om[key]["odds"] * 1.06))
 
 
-def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
-    """Leg menu for one match. SAFE legs (tier S) pass the strict two-source screen; BORDERLINE legs (tier B) pass a looser
-    screen and are shown to the AI with a '~' flag so it can accept or reject them with reasons instead of Python hiding them."""
+def build_legs(m, allow_est=False, corners_ok_min=3, relax=0):
+    rx = RELAX[relax]
     fav, risk = m["trap"]["fav"], m["trap"]["risk"]
     dq = m["dq"]
-    ext = m.get("ext_d") or m.get("api_1x2")
     legs = []
     for key, p in m["p"].items():
         if key.startswith("C_") and m.get("corner_n", 0) < corners_ok_min:
@@ -1701,31 +1138,19 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
         lo = hi = None
         if o:
             odds = o["odds"]
-            if o.get("derived"):
-                src = "derived"
-            else:
-                lo, hi = o.get("low", odds), o.get("best", odds)
+            lo, hi = o.get("low", odds), o.get("best", odds)
             p_mkt = market_fair_prob(key, m["odds"])
-        elif allow_est and not m["odds"]:           # only estimate when the match has NO bookmaker prices at all
+        elif allow_est and (not m["odds"] or m.get("odds_partial")):   # estimate when the match has NO prices, or the source only gives 1X2
             odds, src = round(max(1.05, 0.93 / max(p, 0.05)), 2), "est"
-            p_mkt = api_fair(key, ext, p)           # for 1X2/double-chance legs the independent model (API or Elo) must agree
+            p_mkt = api_fair(key, m.get("api_1x2"), p)     # for 1X2/double-chance legs the API's own model must agree
         else:
             continue
-        if not (MIN_LEG_ODDS <= odds <= MAX_LEG_ODDS):
+        if not (rx[2] <= odds <= rx[3]):
             continue
-        p_model = m["model_p"].get(key, p)
-        agree = min(p_model, p_mkt)
-        if src == "est":
-            if p_model < 0.74 or p < 0.74:      # no bookmaker quote = no market check: only clear-cut legs, always shown as borderline
-                continue
-            tier = "B"
-        elif agree >= MIN_AGREE_P:
-            tier = "S"
-        elif wide and agree >= BORDER_AGREE_P:
-            tier = "B"
-        else:
+        p_model = m["model_p"].get(key, p) if m.get("basis") != "prior" else p_mkt     # a prior-only model carries no information
+        if min(p_model, p_mkt) < rx[1]:      # two independent sources must both back the leg
             continue
-        pen = 0.05 * (1 - dq)
+        pen = 0.05 * (1 - dq) + {"prior": 0.08, "elo": 0.02}.get(m.get("basis"), 0.0)
         if fav and key == fav:
             pen += 0.25 * risk / 100
         elif fav and key == ("1X" if fav == "1" else "X2"):
@@ -1735,56 +1160,90 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
         if "friendl" in (m.get("league") or "").lower():
             pen += 0.03
         pen += 0.5 * max(0.0, abs(p_model - p_mkt) - 0.08)   # unexplained model/market disagreement
-        if tier == "B":
-            pen += 0.02
-        if src == "est":
-            pen += 0.04
         p_adj = p - pen
-        if p_adj < (MIN_LEG_P if tier == "S" else BORDER_MIN_P):
+        if p_adj < rx[0]:
             continue
         edge = p * odds - 1
         eadj = float(np.clip(p_adj * odds - 1, -0.2, 0.15))
         legs.append({"key": key, "label": leg_label(key, m), "p": float(p), "p_adj": float(p_adj), "p_mkt": float(p_mkt),
                      "p_model": float(p_model), "odds": float(odds), "odds_lo": lo, "odds_hi": hi, "edge": float(edge), "src": src,
-                     "tier": tier, "rank": float(p_adj + 0.5 * eadj - (0.03 if tier == "B" else 0.0)), "fam": _family(key)})
+                     "rank": float(p_adj + 0.5 * eadj), "fam": _family(key), "rx": relax})
     legs.sort(key=lambda x: -x["rank"])
-    chosen, fams, nb = [], set(), 0
+    chosen, fams = [], set()
     for lg in legs:
         if lg["fam"] in fams:
             continue
-        if lg["tier"] == "B":
-            if nb >= 2:
-                continue
-            nb += 1
         chosen.append(lg)
         fams.add(lg["fam"])
-        if len(chosen) >= MAX_MENU_LEGS:
+        if len(chosen) >= 6:
             break
     return chosen
 
 
 def gate_reasons(m, cfg):
-    """Evidence gate: a match may only feed tickets if it rests on real team data AND real prices."""
+    """Strict mode: a match may only feed tickets with real team data AND real prices.
+    Default (never-stop) mode: a match is only dropped if no selection clears even the relaxed thresholds."""
     why = []
-    if m["basis"] == "prior":
-        why.append("no team-specific data (league-average defaults only)")
-    if not m["odds"] and not cfg.get("allow_est"):
-        why.append("no real bookmaker odds")
-    if (m.get("form_age_days") or 0) > 200:
-        why.append(f"newest form result is {m['form_age_days']} days old")
-    if m["dq"] < cfg.get("min_dq", 0.5):
-        why.append(f"data quality {m['dq']} < {cfg.get('min_dq', 0.5)}")
-    if not why:
-        if not m["legs"]:
-            why.append("no leg clears the safety filters (model AND market >= 55-60%)")
-        elif not any(l["tier"] == "S" for l in m["legs"]) and not cfg.get("allow_b_only"):
-            why.append("only borderline legs (model/market agreement 55-60%)")
+    if cfg.get("strict_gate"):
+        if m["basis"] == "prior":
+            why.append("no team-specific data (competition averages only)")
+        if not m["odds"] and not cfg.get("allow_est"):
+            why.append("no real bookmaker odds")
+        if m["dq"] < cfg.get("min_dq", 0.5):
+            why.append(f"data quality {m['dq']} < {cfg.get('min_dq', 0.5)}")
+    if not why and not m["legs"]:
+        why.append("no selection clears the safety thresholds" + ("" if cfg.get("strict_gate") else " (even relaxed)"))
     return why
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Data collection pipeline
 # ═════════════════════════════════════════════════════════════════════════════
+def analyse_matches(sl, core, odds_by, inj_by, st_by, hist, upc, db, elo_tab, cfg, out, inj_known=False, odds_partial=False, log=lambda m: None):
+    """Source-independent: profiles -> expected goals -> Monte Carlo -> market blend -> trap score -> data quality."""
+    log("🧠 Building profiles and running Monte Carlo simulations...")
+    for m in sl:
+        c = core.get(m["id"]) or {"pred": None, "rh": [], "ra": [], "h2h": []}
+        hs_h = team_history_stats(m["home_id"], [r["id"] for r in c["rh"][:5]], hist)
+        hs_a = team_history_stats(m["away_id"], [r["id"] for r in c["ra"][:5]], hist)
+        lus = {((l.get("team") or {}).get("id")): l for l in (upc.get(m["id"]) or {}).get("lineups") or []}
+        ph = build_profile(m["home_id"], c["rh"], hs_h, inj_by.get((m["id"], m["home_id"])), lus.get(m["home_id"]))
+        pa = build_profile(m["away_id"], c["ra"], hs_a, inj_by.get((m["id"], m["away_id"])), lus.get(m["away_id"]))
+        enrich_profile_from_l5(ph, (c["pred"] or {}).get("home"))
+        enrich_profile_from_l5(pa, (c["pred"] or {}).get("away"))
+        e_h, e_a = elo_tab.lookup(m["home"], m.get("country")), elo_tab.lookup(m["away"], m.get("country"))
+        elo = (e_h, e_a) if (e_h is not None and e_a is not None) else None
+        prior = db.league_prior(m["league_id"])
+        lam_h, lam_a, _, basis = estimate_lambdas(c["pred"], ph, pa, elo, prior)
+        mu_ch, mu_ca, cn = estimate_corners(ph, pa, lam_h, lam_a)
+        mc = monte_carlo(lam_h, lam_a, mu_ch, mu_ca, n=cfg["sims"], seed=int(m["id"]) % (2 ** 31))
+        odds = odds_by.get(m["id"], {})
+        w_eff = cfg["w_model"] if basis in ("season+recent", "season", "recent") else min(cfg["w_model"], 0.15)
+        p_bl, mkt = blend_probs(mc["p"], odds, w_eff)
+        api_d = api_dist(c["pred"])
+        elo_d = poisson_1x2(*elo_lambdas(elo[0], elo[1], prior)) if (elo and basis != "elo") else None
+        ext_d, ext_name = (api_d, "api") if api_d else ((elo_d, "elo") if elo_d else (None, None))
+        api_d, ext_src = ext_d, ("mkt" if mkt else None)
+        if not mkt and api_d:                     # no bookmaker prices: use the API's (or Elo's) own model as the independent check
+            b = {k: 0.65 * p_bl[k] + 0.35 * api_d[k] for k in ("1", "X", "2")}
+            tb = sum(b.values())
+            b = {k: v / tb for k, v in b.items()}
+            p_bl.update(b)
+            p_bl["1X"], p_bl["X2"], p_bl["12"] = b["1"] + b["X"], b["X"] + b["2"], b["1"] + b["2"]
+            mkt, ext_src = api_d, ext_name
+        rec = dict(m, ph=ph, pa=pa, pred=c["pred"], h2h=h2h_summary(c["h2h"]), lam_h=lam_h, lam_a=lam_a, basis=basis,
+                   model_p=mc["p"], p=p_bl, mkt_1x2=mkt, api_1x2=api_d, ext_src=ext_src, ext_name=ext_name, elo=elo is not None, odds=odds, exp_goals=mc["exp_goals"],
+                   exp_corners=mc["exp_corners"], top_scores=mc["top_scores"], corner_n=cn,
+                   st_h=(st_by.get(m["league_id"]) or {}).get(m["home_id"]),
+                   st_a=(st_by.get(m["league_id"]) or {}).get(m["away_id"]), inj_known=inj_known, odds_partial=odds_partial)
+        rec["trap"] = trap_analysis(rec)
+        rec["dq"] = data_quality(rec)
+        out["matches"].append(rec)
+    thin = sum(1 for r in out["matches"] if r["basis"] == "prior")
+    if thin:
+        out["warnings"].append(f"{thin}/{len(out['matches'])} matches have NO team-specific data (plan restriction, early season or missing coverage); they rest on competition averages only and are labelled P.")
+
+
 def fetch_coverage(api, ttl_s=86400):
     """One call: which competitions the API covers (predictions/odds/injuries/stats) this season."""
     cov = {}
@@ -1834,10 +1293,16 @@ def detail_cost(ms, deep):
     return len(ms) * (3.9 if deep else 3.3) + (len({m["league_id"] for m in ms}) if deep else 0)
 
 
-def team_results(api, team_id, season, date_str, tz, ttl_s):
-    """Last-10 results. Free plans block `last` and current-season queries, so try fallbacks once, then stop."""
+def team_results(api, team_id, season, date_str, tz, ttl_s, db=None):
+    """Last-10 results. Free plans block `last` and current-season queries, so: try the API once, then fall back to the
+    permanent results database built from daily fixture dumps."""
+    def from_db():
+        if not db:
+            return []
+        before = int(datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp())
+        return db.results(team_id, before)
     if api.no_history:
-        return []
+        return from_db()
     if "last" not in api.blocked:
         r = api.resp("/fixtures", {"team": team_id, "last": 10, "timezone": tz}, ttl_s)
         if r:
@@ -1851,133 +1316,23 @@ def team_results(api, team_id, season, date_str, tz, ttl_s):
         res = parse_results(d2.get("response") or [], team_id)
         if not res and d2.get("errors"):
             api.no_history = True
-    return res[:10]
+    return res[:10] or from_db()
 
 
-def _syn_id(s):
-    return int(hashlib.md5(s.encode()).hexdigest()[:8], 16)
-
-
-def make_record(m, c, hs_h, hs_a, inj_h, inj_a, lu_h, lu_a, odds, odds_src, st_h, st_a, inj_known, cfg):
-    """Turns collected raw data for one match into the analysed record (profiles, Monte Carlo, blend, trap, dq)."""
-    ph = build_profile(m["home_id"], c["rh"], hs_h, inj_h, lu_h)
-    pa = build_profile(m["away_id"], c["ra"], hs_a, inj_a, lu_a)
-    enrich_profile_from_l5(ph, (c["pred"] or {}).get("home"))
-    enrich_profile_from_l5(pa, (c["pred"] or {}).get("away"))
-    elo = c.get("elo")
-    lam_h, lam_a, _, basis = estimate_lambdas(c["pred"], ph, pa, elo)
-    mu_ch, mu_ca, cn = estimate_corners(ph, pa, lam_h, lam_a)
-    mc = monte_carlo(lam_h, lam_a, mu_ch, mu_ca, n=cfg["sims"], seed=int(m["id"]) % (2 ** 31))
-    odds = derive_dc_odds(odds or {})
-    p_bl, mkt = blend_probs(mc["p"], odds, cfg["w_model"])
-    api_d = api_dist(c["pred"])
-    elo_d = elo["p"] if elo else None
-    ext_d = api_d or elo_d
-    ext_src = "mkt" if mkt else None
-    if not mkt and ext_d:                     # no bookmaker prices: an independent model is the cross-check
-        b = {k: 0.65 * p_bl[k] + 0.35 * ext_d[k] for k in ("1", "X", "2")}
-        tb = sum(b.values())
-        b = {k: v / tb for k, v in b.items()}
-        p_bl.update(b)
-        p_bl["1X"], p_bl["X2"], p_bl["12"] = b["1"] + b["X"], b["X"] + b["2"], b["1"] + b["2"]
-        mkt, ext_src = ext_d, ("api" if api_d else "elo")
-    ages = [x["stale_days"] for x in (c.get("fh"), c.get("fa")) if x and x.get("stale_days") is not None]
-    m = dict(m, form_age_days=max(ages) if ages else None)
-    rec = dict(m, ph=ph, pa=pa, pred=c["pred"], h2h=h2h_summary(c["h2h"]), lam_h=lam_h, lam_a=lam_a, basis=basis,
-               model_p=mc["p"], p=p_bl, mkt_1x2=mkt, api_1x2=api_d, elo=elo, ext_d=ext_d, ext_src=ext_src, odds=odds,
-               odds_src=odds_src, exp_goals=mc["exp_goals"], exp_corners=mc["exp_corners"], top_scores=mc["top_scores"],
-               corner_n=cn, st_h=st_h, st_a=st_a, inj_known=inj_known, free_tags=list(c.get("free_tags", [])))
-    rec["trap"] = trap_analysis(rec)
-    rec["dq"] = data_quality(rec)
-    return rec
-
-
-def collect_free_only(api, free, cfg, log, progress, out):
-    """API-Football unavailable (no key / quota out / plan block): build the whole slate from free sources."""
-    date_str, tz = cfg["date"], cfg["tz"]
-    free.target_date = date_str
-    log("🆓 Free-only mode: collecting fixtures from ESPN + football-data.co.uk (no API-Football calls)...")
-    fx = free.free_fixtures(date_str, tz)
-    out["raw_count"] = len(fx)
-    fixtures = []
-    for e in fx:
-        lid = e["league_id"]
-        name, country = LEAGUE_INFO.get(lid, (f"League {lid}", ""))
-        if cfg["exclude_minor"] and (TEAM_EXCLUDE_RE.search(e["home"]) or TEAM_EXCLUDE_RE.search(e["away"])):
-            continue
-        fixtures.append({"id": -_syn_id(f"F:{date_str}:{e['home']}:{e['away']}"), "ts": e["ts"], "status": "NS", "league_id": lid,
-                         "league": name, "country": country, "season": None, "round": None,
-                         "home_id": _syn_id("T:" + e["home"]), "home": e["home"], "away_id": _syn_id("T:" + e["away"]), "away": e["away"],
-                         "cat": league_category(lid, country), "free_odds": e["odds"], "free_src": e["src"]})
-    out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
-    log(f"   {len(fx)} fixtures found by free sources, {len(fixtures)} eligible {out['cat_counts']}")
-    if not fixtures:
-        out["reason"] = "No fixtures were found by API-Football or by the free sources for this date. " + ("; ".join(free.fails[:2]) if free.fails else "")
-        return out
-    cand = shortlist_matches(fixtures, min(len(fixtures), cfg["max_matches"]), cfg["force_leagues"], BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
-    out["warnings"].append("API-Football returned nothing usable, so this analysis was built ONLY from free sources (football-data.co.uk, ESPN, ClubElo). "
-                           "Injuries, lineups and API predictions are unavailable - those matches show 'inj n/a' and the AI is told to demand extra margin.")
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        list(ex.map(lambda lid: free.rows_for(lid, date_str), {c["league_id"] for c in cand}))
-    free.elo_table(date_str)
-    for i, m in enumerate(cand):
-        fh, fa = free.team_form(m["home"], m["league_id"], date_str), free.team_form(m["away"], m["league_id"], date_str)
-        if not fh or not fa or len(fh["results"]) < 4 or len(fa["results"]) < 4:
-            out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no free-source team history"})
-            continue
-        odds, osrc = dict(m.get("free_odds") or {}), m.get("free_src")
-        if not odds.get("O2.5"):
-            o2, s2 = free.odds_for(m["home"], m["away"], m["league_id"], date_str)
-            if o2 and (not odds or o2.get("O2.5")):
-                odds, osrc = o2, s2
-        if not odds:
-            out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no bookmaker odds from any source"})
-            continue
-        c = {"pred": None, "rh": fh["results"], "ra": fa["results"], "h2h": free.h2h(m["home"], m["away"], m["league_id"], date_str),
-             "elo": free.elo_for(m["home"], m["away"], m["league_id"], m["country"], date_str), "free_tags": ["form"], "fh": fh, "fa": fa}
-        if c["h2h"]:
-            c["free_tags"].append("h2h")
-        if c["elo"]:
-            c["free_tags"].append("elo")
-        c["free_tags"].append("odds:" + str(osrc))
-        rec = make_record(m, c, fh["hs"], fa["hs"], None, None, None, None, odds, "free:" + str(osrc),
-                          free.standing(m["home"], m["league_id"], date_str), free.standing(m["away"], m["league_id"], date_str), False, cfg)
-        out["matches"].append(rec)
-        for t in c["free_tags"]:
-            free.used[t.split(":")[0] if not t.startswith("odds") else "odds"] += 1
-        progress(0.2 + 0.7 * (i + 1) / len(cand))
-    out["caps"] = {"history": False, "league_odds": False, "fixture_odds": False}
-    out["deep"], out["budget"] = False, 0
-    out["plan"] = out.get("plan") or {"plan": "free sources only"}
-    if not out["matches"]:
-        out["reason"] = "Free sources found fixtures but none had both team history and bookmaker odds."
-    return out
-
-
-def collect_day(api, cfg, log, progress, free=None):
-    free = free or FreeData(enabled=False)
+def collect_day(api, cfg, log, progress):
     out = {"warnings": [], "matches": [], "excluded": [], "raw_count": 0, "cat_counts": {}, "plan": None, "reason": None}
     date_str, tz, force = cfg["date"], cfg["tz"], cfg["force"]
-    free.target_date = date_str
     ttl = lambda t: 0 if force else t
     stt = api.status()
     out["plan"] = stt
-    if api.offline:
-        log("ℹ️ No API-Football key configured - using free sources only.")
-        return collect_free_only(api, free, cfg, log, progress, out)
     if stt.get("errors") and not stt.get("plan"):
         out["warnings"].append(f"API status problem: {stt.get('errors')}")
     if api.remaining is not None and api.remaining <= 5:
-        out["warnings"].append("API daily quota almost exhausted - only cached data and free sources can be used.")
+        out["warnings"].append("API daily quota almost exhausted - only cached data can be used.")
     budget = min(cfg["max_calls"], api.remaining if api.remaining is not None else cfg["max_calls"])
     if api.remaining is not None and budget < 60:
         out["warnings"].append(f"Only {api.remaining} API calls are left today (plan limit {api.limit}), so this run was limited to fit. "
-                               "The quota resets at 00:00 UTC (03:00 in Kampala); cached data and free sources are reused for free.")
-
-    def can_spend(k=1):
-        """Call-time guard: never exceed the per-run budget or the remaining daily quota, whatever the plan said."""
-        return (not api.quota_out and (api.remaining is None or api.remaining > k) and (budget - api.calls) >= k)
-
+                               "The quota resets at 00:00 UTC (03:00 in Kampala); cached data from earlier runs is reused for free.")
     log(f"📥 Fetching all fixtures for {date_str} ({tz})...")
     fx_raw = api.resp("/fixtures", {"date": date_str, "timezone": tz}, ttl=ttl(900))
     out["raw_count"] = len(fx_raw)
@@ -1988,18 +1343,16 @@ def collect_day(api, cfg, log, progress, free=None):
                     and not TEAM_EXCLUDE_RE.search(f["home"] or "") and not TEAM_EXCLUDE_RE.search(f["away"] or "")]
     if cfg.get("exclude_lower", True):
         fixtures = [f for f in fixtures if not LOWER_DIV_RE.search(f["league"] or "")]
-    cov = fetch_coverage(api, 7 * 86400)
+    cov = fetch_coverage(api)
     if cov:
         for f in fixtures:
             c_ = cov.get(f["league_id"])
             f["cov_pred"], f["cov_odds"] = (c_["pred"], c_["odds"]) if c_ else (None, None)
         n0 = len(fixtures)
-        # with free sources a competition without API predictions can still be analysed, so only drop it when free data is off
-        if not free.enabled:
-            fixtures = [f for f in fixtures if f["cov_pred"] is not False]
-            log(f"🗂 Coverage filter: dropped {n0 - len(fixtures)} fixtures in competitions the API has no predictions for; "
-                f"{sum(1 for f in fixtures if f['cov_odds'])} of {len(fixtures)} remaining have odds coverage")
-    lmem = load_state().get("league_mem3", {})     # v3: old entries (written when national teams had no data source) are ignored
+        fixtures = [f for f in fixtures if f["cov_pred"] is not False]
+        log(f"🗂 Coverage filter: dropped {n0 - len(fixtures)} fixtures in competitions the API has no predictions for; "
+            f"{sum(1 for f in fixtures if f['cov_odds'])} of {len(fixtures)} remaining have odds coverage")
+    lmem = load_state().get("league_mem", {})
     today_ = datetime.now(timezone.utc).date()
 
     def mem_bad(lid):
@@ -2009,18 +1362,17 @@ def collect_day(api, cfg, log, progress, free=None):
         except Exception:
             return False
     if not force:
-        n0 = len(fixtures)
-        fixtures = [f for f in fixtures if not mem_bad(f["league_id"]) or f["league_id"] in cfg["force_leagues"] or (free.enabled and (f["league_id"] in FD_ALL or str(f.get("country") or "").lower() == "world"))]
-        if n0 != len(fixtures):
-            log(f"🧠 Skipped {n0 - len(fixtures)} fixtures in competitions that returned no usable team data in recent runs (retried after 5 days)")
+        bad = [f for f in fixtures if mem_bad(f["league_id"]) and f["league_id"] not in cfg["force_leagues"]]
+        for f in bad:
+            f["mem_bad"] = True
+        if bad and cfg.get("strict_gate"):
+            fixtures = [f for f in fixtures if not f.get("mem_bad")]
+            log(f"🧠 Skipped {len(bad)} fixtures in competitions that returned no usable team data in recent runs (retried after 5 days)")
+        elif bad:
+            log(f"🧠 {len(bad)} fixtures are in competitions with no API team data lately - skipping their predictions calls (free fallbacks are used instead)")
     out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
     log(f"   {out['raw_count']} fixtures on the day, {len(fixtures)} upcoming & eligible {out['cat_counts']}")
     if not fixtures:
-        if free.enabled:
-            log("🆓 API-Football gave no usable fixtures - switching to free sources only...")
-            out2 = collect_free_only(api, free, cfg, log, progress, out)
-            if out2["matches"]:
-                return out2
         out["reason"] = "No eligible upcoming fixtures were returned by the API. " + ("; ".join(api.error_summary()[:3]) if api.errors else "")
         return out
     progress(0.06)
@@ -2032,14 +1384,12 @@ def collect_day(api, cfg, log, progress, free=None):
     while len({c["league_id"] for c in cand}) > odds_cap and pool_n > 8:
         pool_n -= 1
         cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"], BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
-    odds_by, odds_src = {}, {}
+    odds_by = {}
 
     def fetch_league_odds(lid, s_):
         for params in ({"league": lid, "season": s_, "date": date_str, "timezone": tz}, {"league": lid, "season": s_, "date": date_str}):
             items, errs = [], False
             for page in (1, 2, 3):
-                if not can_spend(1):
-                    return items
                 d = api.get("/odds", dict(params, page=page), ttl(1200))
                 items += d.get("response") or []
                 if d.get("errors"):
@@ -2057,9 +1407,48 @@ def collect_day(api, cfg, log, progress, free=None):
             f_ = fid or (item.get("fixture") or {}).get("id")
             if f_:
                 odds_by[f_] = parse_odds_item(item, cfg["bookmaker"])
-                odds_src[f_] = "api"
 
-    # ── capability probe ──
+    # ── capability probe: a few calls to learn what this API plan allows, so we plan around it ──
+    # ── free data layers: results database (past fixture dumps) + ClubElo ──
+    db = ResultsDB()
+    elo_tab = EloTable.fetch(date_str, api.cache_dir) if cfg.get("use_elo", True) else EloTable([])
+    log(f"📈 ClubElo ratings loaded for {len(elo_tab)} clubs (free, no API quota)" if len(elo_tab) else "📈 ClubElo unavailable right now - continuing without it")
+    state0 = load_state()
+    real_today = datetime.now(timezone.utc).date()
+    today_d = datetime.strptime(date_str, "%Y-%m-%d").date()
+    is_free = str(stt.get("plan") or "Free").lower() == "free"
+    # Free plans only serve dates from yesterday to tomorrow (relative to the real date): the database then grows by one day per daily run
+    max_back = state0.get("dh_max_back", 1 if is_free else cfg.get("backfill_days", 14))
+    dh_blocked = False
+    try:
+        dh_blocked = bool(state0.get("dh_block")) and not force and (real_today - datetime.fromisoformat(state0["dh_block"]).date()).days < 3
+    except Exception:
+        pass
+    wanted = [(today_d - timedelta(days=i)).isoformat() for i in range(1, cfg.get("backfill_days", 14) + 1)]
+    missing = [d for d in wanted if not db.has(d) and (real_today - datetime.fromisoformat(d).date()).days <= max_back]
+    n_bf = 0 if dh_blocked else min(len(missing), max(0, int((budget - api.calls) * 0.30)))
+    if missing and n_bf:
+        log(f"🗄 Building the free results database: fetching {n_bf} past day(s) (1 call = every match worldwide on that date; stored permanently)")
+        for d in missing[:n_bf]:
+            dd = api.get("/fixtures", {"date": d}, 30 * 86400)
+            if dd.get("errors"):
+                msg = json.dumps(dd.get("errors"))
+                mw = re.search(r"try from (\d{4}-\d{2}-\d{2})", msg)
+                if mw:                                   # "Free plans do not have access to this date, try from X to Y"
+                    state0["dh_max_back"] = max(0, (real_today - datetime.fromisoformat(mw.group(1)).date()).days)
+                    save_state(state0)
+                    log(f"   ℹ️ Your plan only serves dates from {mw.group(1)} - the results database will grow by one day per daily run")
+                elif not api.quota_out:
+                    state0["dh_block"] = datetime.now(timezone.utc).isoformat()
+                    save_state(state0)
+                    log("   ℹ️ Past-date fixture dumps are not available on your plan - pausing the results database for 3 days")
+                break
+            db.add_day(d, dd.get("response") or [])
+        db.save()
+    elif not missing:
+        log("🗄 Results database is up to date for the dates your plan allows")
+    log(f"   results database: {len(db.days)} day(s), {sum(len(v) for v in db.days.values())} finished matches")
+
     state_ = load_state()
     plan_key = str(stt.get("plan") or "Free").lower()
     mem = state_.get("caps_mem") or {}
@@ -2070,18 +1459,13 @@ def collect_day(api, cfg, log, progress, free=None):
         pass
     sample = cand[0]
     probed_leagues = set()
-    free_hist_sample = bool(free.enabled and free.team_form(sample["home"], sample["league_id"], date_str))
     if fresh and not force:
         caps = dict(mem["caps"])
         api.no_history = not caps["history"]
         log("🧠 Using remembered plan capabilities from an earlier run (saves probe calls; tick 'Ignore cache' to re-probe).")
     else:
         log("🔬 Probing what your API plan allows (a few calls)...")
-        if plan_key == "free" and free_hist_sample:
-            api.no_history = True           # free plan + free-source history: the API history probe would only waste calls
-            log("   🆓 Free plan and free-source history available - skipping the API team-history probe.")
-        else:
-            team_results(api, sample["home_id"], sample["season"], date_str, tz, ttl(3 * 3600))
+        team_results(api, sample["home_id"], sample["season"], date_str, tz, ttl(3 * 3600))
         caps = {"history": not api.no_history, "league_odds": None, "fixture_odds": False}
         items = fetch_league_odds(sample["league_id"], sample["season"])
         probed_leagues = {(sample["league_id"], sample["season"])}
@@ -2090,18 +1474,18 @@ def collect_day(api, cfg, log, progress, free=None):
             caps["league_odds"] = True
         elif api.ep_fail.get("/odds", 0) > 0 and not api.ep_ok.get("/odds"):
             caps["league_odds"] = False
-        if caps["league_odds"] is False and can_spend(2):
-            for c in cand[:2]:
+        if caps["league_odds"] is False:
+            for c in cand[:2]:                                   # season-free per-fixture odds may still be allowed
                 its = api.get("/odds", {"fixture": c["id"]}, ttl(1200), True).get("response") or []
                 if its:
                     store_odds(its, c["id"])
                     caps["fixture_odds"] = True
                     break
-        if caps["league_odds"] is not None:
+        if caps["league_odds"] is not None:                       # only remember conclusive results
             state_["caps_mem"] = {"plan": plan_key, "date": datetime.now(timezone.utc).isoformat(), "caps": caps}
             save_state(state_)
     out["caps"] = caps
-    log(f"   team history: {'yes' if caps['history'] else 'NO (free sources / predictions last-5 form instead)'} | "
+    log(f"   team history: {'yes' if caps['history'] else 'NO (using predictions last-5 form instead)'} | "
         f"odds by league: {'yes' if caps['league_odds'] else 'NO' if caps['league_odds'] is False else 'unknown'} | "
         f"odds by fixture: {'yes' if caps['fixture_odds'] else 'no'}")
 
@@ -2114,18 +1498,7 @@ def collect_day(api, cfg, log, progress, free=None):
                     store_odds(fu.result())
                 except Exception as e:
                     api.errors.append(f"odds: {e}")
-    if free.enabled:                        # FREE price fallback for every candidate the API has no prices for
-        n_free = 0
-        for c in cand:
-            if c["id"] not in odds_by:
-                fo, src_ = free.odds_for(c["home"], c["away"], c["league_id"], date_str)
-                if fo:
-                    odds_by[c["id"]], odds_src[c["id"]] = fo, "free:" + str(src_)
-                    n_free += 1
-        if n_free:
-            log(f"   🆓 {n_free} matches got bookmaker prices from free sources (football-data.co.uk / ESPN) instead of API-Football")
-    if caps["league_odds"] is not False:
-        if not odds_by and caps["league_odds"] is None and can_spend(20):
+        if not odds_by and caps["league_odds"] is None and (api.remaining is None or api.remaining > 20):
             for c in cand[1:4]:
                 its = api.get("/odds", {"fixture": c["id"]}, ttl(1200), True).get("response") or []
                 if its:
@@ -2133,7 +1506,7 @@ def collect_day(api, cfg, log, progress, free=None):
                     caps["fixture_odds"] = True
     with_odds = [c for c in cand if c["id"] in odds_by]
     if caps["fixture_odds"] or (cfg["allow_est"] and not (caps["league_odds"] and len(with_odds) >= 10)):
-        keep = list(cand)
+        keep = list(cand)                                  # odds come per fixture later, or are estimated for matches without prices
     else:
         keep = with_odds
     keep_ids = {c["id"] for c in keep}
@@ -2144,15 +1517,13 @@ def collect_day(api, cfg, log, progress, free=None):
     progress(0.14)
     if not keep:
         errs = [e for e in api.error_summary() if "/odds" in e][:2] or api.error_summary()[-2:]
-        out["reason"] = ("No bookmaker odds were returned for any candidate match (API-Football or free sources). "
+        out["reason"] = ("No bookmaker odds were returned for any candidate match. "
                          + ("API said: " + " | ".join(e[:170] for e in errs) + ". " if errs else "No error was reported - odds may not be published yet for this day. ")
                          + "Enable 'model-estimated odds' in Settings to continue with approximate prices.")
         return out
 
     # ── budget-aware cap on how many get deep data ──
-    free_first = free.enabled
-    per = ((0.6 if (free_first and cfg.get("save_calls", True)) else 1.0) + (2.0 if caps["history"] else 0.0)
-           + (0.6 if caps["fixture_odds"] else 0.0))
+    per = 1.0 + (2.0 if caps["history"] else 0.0) + (0.6 if caps["fixture_odds"] else 0.0)   # odds are fetched only for matches that have usable data
     deep = caps["history"] and (cfg["depth"] == "Full" or (cfg["depth"] == "Auto" and budget >= 150))
 
     def cost(ms, dp):
@@ -2160,85 +1531,42 @@ def collect_day(api, cfg, log, progress, free=None):
 
     left = budget - api.calls
     n = min(cfg["max_matches"], len(keep))
-    if caps["history"] or not free_first:      # with free history the per-call guard protects the quota, so no up-front trimming
-        while n > 4 and cost(keep[:n], deep) > left * 0.95:
-            n -= 1
-        if deep and n < min(cfg["max_matches"], len(keep)) and n < 12:
-            n_l = min(cfg["max_matches"], len(keep))
-            while n_l > 4 and cost(keep[:n_l], False) > left * 0.95:
-                n_l -= 1
-            if n_l >= n + 4:
-                deep, n = False, n_l
-    free_cov = set()
-    if free.enabled:
-        free_cov = {c["id"] for c in keep if free.covers(c, date_str)}
-        if not caps["history"]:
-            keep.sort(key=lambda c: 0 if c["id"] in free_cov else 1)      # matches the free sources can fully cover go first (stable order inside each group)
+    while n > 4 and cost(keep[:n], deep) > left * 0.95:
+        n -= 1
+    if deep and n < min(cfg["max_matches"], len(keep)) and n < 12:
+        n_l = min(cfg["max_matches"], len(keep))
+        while n_l > 4 and cost(keep[:n_l], False) > left * 0.95:
+            n_l -= 1
+        if n_l >= n + 4:
+            deep, n = False, n_l
     sl = keep[:n]
-    why_cut = (f"beyond your 'max matches' setting ({cfg['max_matches']})" if n >= min(cfg["max_matches"], len(keep)) else "beyond API call budget")
     for c in keep[n:]:
-        out["excluded"].append({"league": c["league"], "match": f"{c['home']} v {c['away']}", "reason": why_cut})
+        out["excluded"].append({"league": c["league"], "match": f"{c['home']} v {c['away']}", "reason": "beyond API call budget"})
     out["deep"], out["budget"] = deep, budget
     leagues = {(m["league_id"], m["season"]) for m in sl}
     est_calls = cost(sl, deep)
-    log(f"🎯 Stage 2: data for {len(sl)} matches | depth={'FULL' if deep else 'LITE'} | est. ≤{est_calls:.0f} more API calls "
-        f"(budget left ~{left:.0f}; free sources are used first) | ~{est_calls * api.rate.interval / 60:.1f} min at your plan's rate limit")
-    if free.enabled:                         # warm the free caches once, in parallel, before the worker threads read them
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            list(ex.map(lambda lid: free.rows_for(lid, date_str), {m["league_id"] for m in sl}))
-        free.elo_table(date_str)
+    log(f"🎯 Stage 2: data for {len(sl)} matches | depth={'FULL' if deep else 'LITE'} | est. ~{est_calls:.0f} more calls "
+        f"(budget left ~{left:.0f}) | ~{est_calls * api.rate.interval / 60:.1f} min at your plan's rate limit")
 
     # ── injuries ──
     log("🩹 Fetching injuries & suspensions...")
     inj_by = defaultdict(list)
-    inj_raw = api.resp("/injuries", {"date": date_str, "timezone": tz}, ttl=ttl(3600)) if can_spend(1) else []
+    inj_raw = api.resp("/injuries", {"date": date_str, "timezone": tz}, ttl=ttl(3600))
     for i in inj_raw:
         inj_by[((i.get("fixture") or {}).get("id"), (i.get("team") or {}).get("id"))].append(i)
     inj_known = bool(inj_raw)
     progress(0.18)
 
-    # ── predictions + last-10 (both teams), FREE history first ──
-    log("📊 Collecting predictions, team form (last 10) and H2H (free sources first)...")
+    # ── predictions + last-10 (both teams) ──
+    log("📊 Fetching predictions, team form (last 10) and H2H...")
     core = {}
-    api_alive = {"v": True}
 
-    def fetch_core(m):
-        fh = free.team_form(m["home"], m["league_id"], date_str) if free.enabled else None
-        fa = free.team_form(m["away"], m["league_id"], date_str) if free.enabled else None
-        good_h, good_a = bool(fh and len(fh["results"]) >= 6), bool(fa and len(fa["results"]) >= 6)
-        skip_pred = bool(free.enabled and cfg.get("save_calls", True) and good_h and good_a)      # free form + H2H + Elo/market already give an independent view
-        pred = None
-        if skip_pred:
-            free.saved_calls += 1
-        elif api_alive["v"] and can_spend(1):
-            pred = parse_predictions(api.resp("/predictions", {"fixture": m["id"]}, ttl=ttl(6 * 3600)))
-        tags = []
-
-        def side(f_, good, team_id, name):
-            if good:
-                if caps["history"]:
-                    free.saved_calls += 1
-                tags.append("form")
-                return f_["results"], f_
-            r = team_results(api, team_id, m["season"], date_str, tz, ttl(3 * 3600)) if (api_alive["v"] and not api.no_history and can_spend(2)) else []
-            if len(r) < 4 and f_:
-                tags.append("form")
-                return f_["results"], f_
-            return r, None
-        rh, used_h = side(fh, good_h, m["home_id"], m["home"])
-        ra, used_a = side(fa, good_a, m["away_id"], m["away"])
+    def fetch_core(m, with_pred=True):
+        pred = parse_predictions(api.resp("/predictions", {"fixture": m["id"]}, ttl=ttl(6 * 3600))) if (with_pred and not m.get("mem_bad")) else None
+        rh = team_results(api, m["home_id"], m["season"], date_str, tz, ttl(3 * 3600), db)
+        ra = team_results(api, m["away_id"], m["season"], date_str, tz, ttl(3 * 3600), db)
         h2h = parse_h2h(pred["h2h"], m["home_id"]) if pred else []
-        if len(h2h) < 3 and free.enabled:
-            fh2 = free.h2h(m["home"], m["away"], m["league_id"], date_str)
-            if len(fh2) > len(h2h):
-                h2h = fh2
-                tags.append("h2h")
-        elo = free.elo_for(m["home"], m["away"], m["league_id"], m["country"], date_str) if free.enabled else None
-        if elo:
-            tags.append("elo")
-        if str(odds_src.get(m["id"], "")).startswith("free"):
-            tags.append("odds")
-        return m["id"], {"pred": pred, "rh": rh, "ra": ra, "h2h": h2h, "elo": elo, "free_tags": tags, "fh": used_h, "fa": used_a}
+        return m["id"], {"pred": pred, "rh": rh, "ra": ra, "h2h": h2h}
 
     def viable(c):
         pr = c["pred"]
@@ -2250,11 +1578,10 @@ def collect_day(api, cfg, log, progress, free=None):
                 return True
         return len(c["rh"]) >= 4 and len(c["ra"]) >= 4
 
-    # Probe the API on a few matches the free sources CANNOT cover, so a plan restriction is detected after a handful of calls
-    # instead of burning the quota - but a failed probe only switches API fetching off; free-covered matches carry on.
+    # probe up to 4 matches from DIFFERENT competitions; abort only if none has usable team data
     seen_lg, probe = set(), []
     for m in sl:
-        if m["id"] not in free_cov and m["league_id"] not in seen_lg:
+        if m["league_id"] not in seen_lg:
             seen_lg.add(m["league_id"])
             probe.append(m)
         if len(probe) == 4:
@@ -2264,25 +1591,15 @@ def collect_day(api, cfg, log, progress, free=None):
         core[fid] = c
         if sum(1 for x in core.values() if viable(x)) >= 2:
             break
-    probed_viable = sum(1 for m in probe if m["id"] in core and viable(core[m["id"]]))
-    if len(probe) >= 3 and probed_viable == 0:
-        api_alive["v"] = False
-        log(f"   ⚠️ API-Football returned no usable team data for {len(probe)} probed matches (plan restriction) - "
-            f"continuing ONLY with the {len(free_cov)} matches the free sources cover; no more API calls will be wasted on the others.")
-    if not any(viable(c) for c in core.values()) and not free_cov:
-        out["reason"] = ("Neither API-Football nor the free sources (football-data.co.uk, international results) had team history for these matches "
-                         "(see API errors below - usually a plan restriction). Stopped early to protect your daily API quota; "
-                         "without team data any ticket would be a guess.")
-        for m in sl:
-            out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no team-specific data retrievable"})
-        return out
+    skip_pred = (not any(viable(c) for c in core.values())) and ((budget - api.calls) < 2.2 * len([m for m in sl if m["id"] not in core]))
+    if not any(viable(c) for c in core.values()):
+        out["warnings"].append("The API returned no usable team data for the matches probed, so the analysis continued with free fallbacks "
+                               "(results database, ClubElo, competition averages). Matches resting on thin data are labelled.")
+        log("   ⚠️ No usable team data from the API for the probed matches - continuing with free fallbacks" + (" (and saving predictions calls for odds)" if skip_pred else ""))
     rest = [m for m in sl if m["id"] not in core]
     done = len(core)
     with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
-        futs = [ex.submit(fetch_core, m) for m in rest if api_alive["v"] or m["id"] in free_cov]
-        for m in rest:
-            if not (api_alive["v"] or m["id"] in free_cov):
-                out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no team data from the API (plan) or free sources"})
+        futs = [ex.submit(fetch_core, m, not skip_pred) for m in rest]
         for fu in as_completed(futs):
             try:
                 fid, c = fu.result()
@@ -2292,7 +1609,7 @@ def collect_day(api, cfg, log, progress, free=None):
             done += 1
             progress(0.18 + 0.37 * done / len(sl))
     st2 = load_state()
-    lm = st2.setdefault("league_mem3", {})
+    lm = st2.setdefault("league_mem", {})
     for m in sl:
         c_ = core.get(m["id"])
         if c_ is not None:
@@ -2302,11 +1619,16 @@ def collect_day(api, cfg, log, progress, free=None):
             e["d"] = datetime.now(timezone.utc).isoformat()
     save_state(st2)
     if caps["fixture_odds"]:
-        log("💰 Fetching per-fixture bookmaker odds (only for matches that have usable team data)...")
+        cand_o = [m for m in sl if m["id"] not in odds_by and m.get("cov_odds") is not False]
+        vi_ids = {m["id"] for m in cand_o if viable(core.get(m["id"]) or {"pred": None, "rh": [], "ra": []})}
+        todo_odds = [m for m in cand_o if m["id"] in vi_ids]
+        if not cfg.get("strict_gate"):               # never-stop: odds are the strongest evidence when team data is thin -> use spare budget on them
+            spare = max(0, (budget - api.calls) - 4 - len(todo_odds))
+            todo_odds += [m for m in cand_o if m["id"] not in vi_ids][:spare]
+        log(f"💰 Fetching per-fixture bookmaker odds for {len(todo_odds)} matches (real prices are the strongest evidence when team data is thin)...")
         with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
-            futs = {ex.submit(lambda mm: api.get("/odds", {"fixture": mm["id"]}, ttl(1200), True).get("response") or [] if can_spend(1) else [], m): m
-                    for m in sl if m["id"] not in odds_by and m.get("cov_odds") is not False
-                    and viable(core.get(m["id"]) or {"pred": None, "rh": [], "ra": []})}
+            futs = {ex.submit(lambda mm: api.get("/odds", {"fixture": mm["id"]}, ttl(1200), True).get("response") or [], m): m
+                    for m in todo_odds}
             for fu in as_completed(futs):
                 try:
                     store_odds(fu.result(), futs[fu]["id"])
@@ -2315,7 +1637,7 @@ def collect_day(api, cfg, log, progress, free=None):
     if deep:
         for m in sl:
             c = core.get(m["id"])
-            if c and len(c["h2h"]) < 3 and "last" not in api.blocked and can_spend(41) and not api.quota_out:
+            if c and len(c["h2h"]) < 3 and "last" not in api.blocked and (api.remaining is None or api.remaining > 40) and not api.quota_out:
                 c["h2h"] = parse_h2h(api.resp("/fixtures/headtohead", {"h2h": f"{m['home_id']}-{m['away_id']}", "last": 8}, ttl=ttl(24 * 3600)), m["home_id"])
 
     # ── batched history stats (corners, shots, xG, player ratings) + upcoming lineups + standings ──
@@ -2325,23 +1647,22 @@ def collect_day(api, cfg, log, progress, free=None):
         hist_ids = set()
         for c in core.values():
             for r in (c["rh"][:5] + c["ra"][:5]):
-                if isinstance(r["id"], int):           # free-source rows carry text ids and must never reach the API
-                    hist_ids.add(r["id"])
+                hist_ids.add(r["id"])
 
         def batch(ids, ttl_s):
-            ids = sorted(i for i in ids if isinstance(i, int) and i > 0)
+            ids = sorted(ids)
             chunks = [ids[i:i + 20] for i in range(0, len(ids), 20)]
             res = {}
             with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
-                for fu in as_completed([ex.submit(api.resp, "/fixtures", {"ids": "-".join(map(str, c_))}, ttl_s) for c_ in chunks if can_spend(1)]):
+                for fu in as_completed([ex.submit(api.resp, "/fixtures", {"ids": "-".join(map(str, c_))}, ttl_s) for c_ in chunks]):
                     for f in fu.result():
                         res[f["fixture"]["id"]] = f
             return res
-        hist = batch(hist_ids, ttl(5 * 86400))           # finished matches never change: cache for days
+        hist = batch(hist_ids, ttl(6 * 3600))
         progress(0.75)
         upc = batch([m["id"] for m in sl], ttl(600))
         with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
-            futs = {ex.submit(api.resp, "/standings", {"league": lid, "season": s_}, ttl(12 * 3600)): lid for lid, s_ in leagues if can_spend(1)}
+            futs = {ex.submit(api.resp, "/standings", {"league": lid, "season": s_}, ttl(12 * 3600)): lid for lid, s_ in leagues}
             for fu in as_completed(futs):
                 try:
                     st_by[futs[fu]] = parse_standings(fu.result())
@@ -2349,309 +1670,494 @@ def collect_day(api, cfg, log, progress, free=None):
                     st_by[futs[fu]] = {}
     progress(0.85)
 
-    # ── build match objects ──
-    log("🧠 Building profiles and running Monte Carlo simulations...")
-    for m in sl:
-        c = core.get(m["id"]) or {"pred": None, "rh": [], "ra": [], "h2h": [], "elo": None, "free_tags": [], "fh": None, "fa": None}
-        hs_h = team_history_stats(m["home_id"], [r["id"] for r in c["rh"][:5] if isinstance(r["id"], int)], hist)
-        hs_a = team_history_stats(m["away_id"], [r["id"] for r in c["ra"][:5] if isinstance(r["id"], int)], hist)
-        if not hs_h.get("cor_n") and c.get("fh"):
-            hs_h.update({k: c["fh"]["hs"][k] for k in ("cor_for", "cor_against", "cor_n", "sot")})
-        if not hs_a.get("cor_n") and c.get("fa"):
-            hs_a.update({k: c["fa"]["hs"][k] for k in ("cor_for", "cor_against", "cor_n", "sot")})
-        lus = {((l.get("team") or {}).get("id")): l for l in (upc.get(m["id"]) or {}).get("lineups") or []}
-        st_h = (st_by.get(m["league_id"]) or {}).get(m["home_id"]) or (free.standing(m["home"], m["league_id"], date_str) if free.enabled else None)
-        st_a = (st_by.get(m["league_id"]) or {}).get(m["away_id"]) or (free.standing(m["away"], m["league_id"], date_str) if free.enabled else None)
-        rec = make_record(m, c, hs_h, hs_a, inj_by.get((m["id"], m["home_id"])), inj_by.get((m["id"], m["away_id"])),
-                          lus.get(m["home_id"]), lus.get(m["away_id"]), odds_by.get(m["id"], {}), odds_src.get(m["id"]),
-                          st_h, st_a, inj_known, cfg)
-        for t in set(rec["free_tags"]):
-            free.used[t] += 1
-        out["matches"].append(rec)
-    thin = sum(1 for r in out["matches"] if r["basis"] == "prior")
-    if thin:
-        out["warnings"].append(f"{thin}/{len(out['matches'])} matches have NO team-specific data (plan restriction, early season or missing coverage) and are excluded from tickets.")
-    if free.intl_extra:
-        free.used["espn-recent-results"] = free.intl_extra
-    if free.enabled and free.used:
-        log(f"🆓 Free sources helped: {dict(free.used)} | ≈{free.saved_calls} API calls avoided")
+    analyse_matches(sl, core, odds_by, inj_by, st_by, hist, upc, db, elo_tab, cfg, out, inj_known, False, log)
     progress(0.90)
     return out
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Evidence packs for the AI (three passes: SCOUT -> DESK -> AUDIT) under a per-minute token governor
+# FREE SOURCE: ESPN public JSON (no key, no daily quota). Unofficial: ESPN has no official public API, so every call is defensive.
 # ═════════════════════════════════════════════════════════════════════════════
-DESK_PROMPT = """You are head of trading at a sharp sportsbook and a quant analyst at once. Python collected the data, ran a Monte Carlo per match (Poisson goals, shared tempo, Dixon-Coles, corners), blended it with de-vigged bookmaker prices (Elo/API % when there are no prices) and screened every leg. YOU decide: audit the evidence and build @WHAT@.
-
-DATA: dq=quality 0-1; S+R/R/S/E=data behind xG (season+recent/recent/season/Elo only); NATIONAL=national team (Elo from its international history); formNd-old=newest result is N days old (squads/coaches may have changed: demand margin, trust Elo/market more); xG=home-away; mdl=model 1X2 %; mkt=bookmaker 1/X/2 prices (fd=free source), then independent elo/API %; H/A lines: form oldest>newest, ppg, gf/ga weighted goals, rt rating, rk table rank, last=recent scores; H2H=W-D-L home view; inj=missing (*=key,?=doubtful), inj n/a=UNKNOWN (a risk, not clean); lu=lineup (?=not out, ROT=rotation); TRAP=Python trap score 0-100.
-LEGS: id@odds/p=blended %/m=market fair %/e=edge %. ~=borderline (only if no safer leg and strong evidence). ^=derived/estimated price: no real quote and no market check, avoid unless clearly best.
-
-RULES
-1. Choose legs ONLY by exact id from the LEGS lists shown; never invent. Python recomputes odds.
-2. @STRUCT@
-3. Ticket odds (product of leg odds) >= 3.50, aim 3.5-4.6, from well-priced SAFE legs.
-4. Maximise the ticket's win probability (product of p); prefer p>=75, 65-74 only with strong evidence.
-@ROLE@
-
-REASONING (do it before answering)
-- If mkt vs mdl, or p vs m, differ >8pts explain with hard evidence (injuries, lineups, form, motivation); no evidence = trust the market. A big +edge on a short price is usually model error.
-- TRAP>=45 suspect, 30-44 watch (favourite shorter than model, poor-form favourite, key starters out/rotated, dangerous underdog, away favourite, draw>=27%, friendlies, dead rubbers, stale form). In a suspect match never use the favourite-win leg.
-- For every leg name the scenario that loses it and judge how common it is; reject common ones.
-- Python lint-checks: Over1.5 needs total xG>=2.6; Over2.5 >=3.0; Under2.5 <=2.3; BTTS-No needs a side xG<=0.9; team Over1.5 needs own xG>=1.9; corners only with dq>=0.6.
-- Unknown injuries/lineups, dq<0.6, friendlies, Elo-only or stale data = demand extra margin. Diversify markets; never 4+ legs of one type.
-- Multiply the odds and confirm 5 distinct matches before answering.@RELAXED@
-
-OUTPUT: ONE JSON object only, no markdown:
-{"tickets":[{"name":"...","legs":[{"id":"m3.1X","why":"<=12 words evidence","fail":"<=8 words: scenario that loses it","vs":"<=10 words, ONLY if p and m differ >8pts"}, ...5 legs],"logic":"<=30 words","risk":"LOW|MED"}],"traps":[{"id":"m5","note":"<=14 words"}],"avoid":[{"id":"m9","why":"<=10 words"}],"summary":"<=30 words"}"""
-
-DESK_ROLES = ["This is Ticket 1: the SAFEST possible ticket.",
-              "This is Ticket 2: BALANCED - strong probability plus some positive edge.",
-              "This is Ticket 3: VALUE - the best price-versus-evidence legs that are still solid."]
-
-SCOUT_PROMPT = """You are head of trading at a sharp sportsbook and a quant analyst. Python analysed @N@ matches (Monte Carlo + de-vigged market prices). There is room to study only @K@ of them in depth, and @NT@ accumulator(s) x 5 legs from separate matches are needed (at least @NEED@ usable matches).
-
-Pick the @K@ matches you trust MOST as sources of safe accumulator legs, best first. Reject matches with thin, contradictory or trap-prone evidence: TRAP>=45 where the legs are favourite wins, dq<0.6, big favourite with unknown injuries/lineups, friendlies, model vs market gap >8pts without a reason, only ~ (borderline) legs. Keep a mix of leagues and leg types.
-
-DATA KEY: xG home-away; mdl=model 1X2 %; mk=bookmaker 1/X/2 prices (or elo/api %); T=trap score; inj=missing starters (n/a = unknown); ROT=rotation; legs: key@odds p=blended % m=market %, ~=borderline.
-
-OUTPUT: ONE JSON object only: {"keep":["a3","a7", ...up to @K@ ids, best first],"drop":[{"id":"a2","why":"<=8 words"}],"traps":[{"id":"a5","note":"<=14 words"}]}"""
-
-AUDIT_PROMPT = """You are the risk officer of a sportsbook trading desk. A trader drafted @NT@ accumulator(s). BREAK each leg: use the evidence to find the most likely way it loses, then rule. Be sceptical - a leg survives only if its losing scenario is rare and the evidence supports it.
-
-Rules the trader had: no favourite-win leg in TRAP>=45 matches; Over1.5 needs total xG>=2.6, Over2.5>=3.0, Under2.5<=2.3, BTTS-No needs a side with xG<=0.9, team Over1.5 needs own xG>=1.9; p vs m gaps >8pts need hard evidence; unknown injuries (n/a), thin data and borderline (~) legs need extra margin; distinct matches in a ticket; ticket odds >=3.50. FLAGS are Python's lint findings.
-
-ok=true keeps a leg. ok=false needs a swap: an id from that leg's ALT list (same match) or from POOL (an unused match), safer than the old leg, with the ticket's odds product staying >=3.50. Flag a leg only for a concrete reason. GAPS are slots with no valid leg: fill them from POOL with distinct matches.
-
-OUTPUT: ONE JSON object only: {"legs":[{"id":"m3.1X","ok":true,"risk":"LOW|MED|HIGH","issue":"<=14 words"}, ...one per leg],"swaps":[{"old":"m4.O2.5","new":"m4.O1.5"}],"fills":[{"t":2,"id":"m9.1X"}],"note":"<=30 words"}"""
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+ESPN_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                "Accept": "application/json"}
+ESPN_SLUGS = [
+    # top leagues + continental
+    "eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "uefa.champions", "uefa.europa", "uefa.europa.conf", "uefa.nations", "uefa.euro",
+    "uefa.euroq", "fifa.world", "fifa.worldq.uefa", "fifa.worldq.conmebol", "fifa.worldq.caf", "fifa.worldq.afc", "fifa.worldq.concacaf",
+    "fifa.friendly", "club.friendly", "conmebol.libertadores", "conmebol.sudamericana", "concacaf.champions", "concacaf.nations.league",
+    "concacaf.gold", "caf.nations", "caf.champions", "afc.champions", "afc.asian.cup", "uefa.wchampions",
+    # domestic: mid / lower
+    "eng.2", "eng.3", "eng.4", "eng.fa", "eng.league_cup", "esp.2", "esp.copa_del_rey", "ita.2", "ita.coppa_italia", "ger.2", "ger.3",
+    "ger.dfb_pokal", "fra.2", "fra.coupe_de_france", "ned.1", "ned.2", "por.1", "por.2", "bel.1", "sco.1", "sco.2", "tur.1", "gre.1",
+    "rus.1", "ukr.1", "aut.1", "sui.1", "den.1", "nor.1", "swe.1", "pol.1", "cze.1", "cro.1", "srb.1", "rou.1", "hun.1", "bul.1",
+    "isr.1", "cyp.1", "irl.1", "fin.1", "usa.1", "usa.2", "mex.1", "bra.1", "bra.2", "arg.1", "col.1", "chi.1", "uru.1", "per.1",
+    "ecu.1", "par.1", "ven.1", "bol.1", "crc.1", "jpn.1", "jpn.2", "kor.1", "chn.1", "aus.1", "ind.1", "sau.1", "uae.1", "qat.1",
+    "tha.1", "egy.1", "rsa.1", "mar.1", "alg.1", "tun.1", "nga.1", "gha.1", "ken.1", "uga.1",
+]
+ESPN_DOMESTIC_RESULTS = ["eng.1", "eng.2", "eng.3", "esp.1", "esp.2", "ita.1", "ita.2", "ger.1", "ger.2", "fra.1", "fra.2", "ned.1", "por.1",
+                         "bel.1", "sco.1", "tur.1", "gre.1", "rus.1", "ukr.1", "aut.1", "sui.1", "den.1", "nor.1", "swe.1", "pol.1", "usa.1",
+                         "mex.1", "bra.1", "arg.1", "jpn.1", "kor.1", "chn.1", "aus.1", "sau.1", "uae.1", "egy.1", "uefa.champions",
+                         "uefa.europa", "uefa.europa.conf", "uefa.nations", "fifa.friendly", "club.friendly"]
+ESPN_TOP = {"eng.1", "esp.1", "ita.1", "ger.1", "fra.1", "uefa.champions", "uefa.europa", "uefa.europa.conf", "fifa.world", "uefa.euro", "uefa.nations"}
+ESPN_MID = {"ned.1", "por.1", "eng.2", "bel.1", "sco.1", "tur.1", "usa.1", "mex.1", "bra.1", "arg.1", "jpn.1", "sau.1", "esp.2", "ita.2", "ger.2",
+            "fra.2", "eng.fa", "eng.league_cup", "esp.copa_del_rey", "ger.dfb_pokal", "ita.coppa_italia", "fra.coupe_de_france", "gre.1",
+            "rus.1", "aut.1", "sui.1", "den.1", "nor.1", "swe.1", "pol.1", "kor.1", "chn.1", "aus.1"}
+ESPN_COUNTRY = {"eng": "England", "esp": "Spain", "ita": "Italy", "ger": "Germany", "fra": "France", "ned": "Netherlands", "por": "Portugal",
+                "bel": "Belgium", "sco": "Scotland", "tur": "Turkey", "gre": "Greece", "rus": "Russia", "ukr": "Ukraine", "aut": "Austria",
+                "sui": "Switzerland", "den": "Denmark", "nor": "Norway", "swe": "Sweden", "pol": "Poland", "cze": "Czech-Republic",
+                "cro": "Croatia", "srb": "Serbia", "rou": "Romania", "hun": "Hungary", "bul": "Bulgaria", "isr": "Israel", "cyp": "Cyprus",
+                "irl": "Ireland", "fin": "Finland"}
+ESPN_BAD_STATUS = ("POSTPONED", "CANCELED", "CANCELLED", "ABANDONED", "SUSPENDED")
 
 
-def desk_prompt(ti, n_tickets, reuse, relaxed=False):
-    """Prompt for ONE ticket (ticket index ti, 0-based): one focused request per ticket keeps each call inside Groq's per-request limit."""
-    return (DESK_PROMPT.replace("@WHAT@", f"ticket {ti + 1} of {n_tickets}: one 5-leg accumulator")
-            .replace("@STRUCT@", "Exactly 1 ticket of 5 legs from 5 different matches." + (" Earlier tickets are listed below; avoid their legs and matches wherever possible." if reuse and ti > 0 else ""))
-            .replace("@ROLE@", DESK_ROLES[min(ti, 2)])
-            .replace("@RELAXED@", "\n- The slate is thin so some safety thresholds were relaxed: be stricter yourself, prefer the best available legs, mark risk MED where honest." if relaxed else ""))
+def espn_category(slug):
+    if slug in ESPN_TOP:
+        return "TOP"
+    if slug.startswith(("fifa.", "uefa.nations", "uefa.euro", "concacaf.", "caf.", "afc.", "conmebol.", "club.friendly")):
+        return "INTL"
+    return "MID" if slug in ESPN_MID else "LOW"
 
 
-def scout_prompt(n, k, n_tickets, need):
-    return SCOUT_PROMPT.replace("@N@", str(n)).replace("@K@", str(k)).replace("@NT@", str(n_tickets)).replace("@NEED@", str(need))
+def espn_country(slug):
+    return ESPN_COUNTRY.get(slug.split(".")[0], "World")
 
 
-def audit_prompt(n_tickets):
-    return AUDIT_PROMPT.replace("@NT@", str(n_tickets))
+def espn_lid(slug):
+    return zlib.crc32(slug.encode()) % 900000 + 100000
 
 
-def _leg_txt(mid, l):
-    s = f"{mid}.{l['key']}@{l['odds']:.2f}/p{_pct(l['p'])}/m{_pct(l['p_mkt'])}/e{l['edge'] * 100:+.0f}"
-    if l.get("tier") == "B":
-        s += "~"
-    if l.get("src") in ("est", "derived"):
-        s += "^"
-    return s
+def _iso_ts(s):
+    try:
+        s = str(s)
+        if re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\dZ$", s):
+            s = s[:-1] + ":00+00:00"
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
 
 
-def _inj_txt(pr, m):
-    if not m.get("inj_known"):
-        return "n/a"
-    items = [f"{_short((i['name'] or '?').split(' ')[-1], 10)}{'*' if i['key'] else ''}({i['pos'] or '?'}){'?' if i['type'] != 'Missing Fixture' else ''}"
-             for i in pr.get("inj", [])[:5]]
-    return ",".join(items) if items else "-"
+def american_to_decimal(x):
+    try:
+        if x is None:
+            return None
+        t = str(x).strip().upper()
+        if t in ("EVEN", "EV", "PK"):
+            return 2.0
+        v = float(t.replace("+", ""))
+        if 1.0 < v < 100:                 # already decimal
+            return v
+        if v == 0 or -100 < v < 100:
+            return None
+        return 1 + v / 100 if v > 0 else 1 + 100 / abs(v)
+    except Exception:
+        return None
 
 
-def _lu_txt(pr):
-    l = pr.get("lineup")
-    return "?" if not l else (l["formation"] or "ok") + ("ROT" if l["rotation"] else "")
+def espn_odds(comp):
+    """1X2 decimal odds from an ESPN competition object (handles both known odds layouts)."""
+    for o in comp.get("odds") or []:
+        def ml(side_key, nested):
+            v = (o.get(side_key) or {}).get("moneyLine")
+            if v is None:
+                n = ((o.get("moneyline") or {}).get(nested) or {})
+                for k in ("close", "open"):
+                    d = n.get(k) or {}
+                    v = d.get("odds") if d.get("odds") is not None else d.get("line")
+                    if v is not None:
+                        break
+            return american_to_decimal(v)
+        h, d, a = ml("homeTeamOdds", "home"), ml("drawOdds", "draw"), ml("awayTeamOdds", "away")
+        if h and d and a and min(h, d, a) > 1.0:
+            return {"1": h, "X": d, "2": a}
+    return None
 
 
-def _side_txt(pr, lab, last=False):
-    if not pr.get("n"):
-        return f"{lab} n/a"
-    rt = f" rt{pr['team_rating']:.1f}" if pr.get("team_rating") else ""
-    lst = f" last[{','.join(pr['last'][:4])}]" if last and pr.get("last") else ""
-    return f"{lab} {pr['form5']} ppg{pr['ppg5']:.1f} gf{pr['gf_w']:.1f} ga{pr['ga_w']:.1f}{rt}{lst}"
+def espn_odds_map(o):
+    """Canonical odds map. Double-chance prices are derived from the 1X2 (with a 5% margin haircut); other markets stay empty."""
+    if not o:
+        return {}
+    mk = lambda v, **kw: dict({"odds": float(v), "median": float(v), "best": float(v), "low": float(v), "n": 1}, **kw)
+    m = {k: mk(o[k]) for k in ("1", "X", "2")}
+    inv = {k: 1 / o[k] for k in ("1", "X", "2")}
+    for key, (a, b) in {"1X": ("1", "X"), "X2": ("X", "2"), "12": ("1", "2")}.items():
+        m[key] = mk(max(1.01, 0.95 / (inv[a] + inv[b])), derived=True)
+    return m
 
 
-def _mkt_txt(m):
-    o = m["odds"]
-    if all(k in o for k in ("1", "X", "2")):
-        t = "/".join(f"{o[k]['odds']:.2f}" for k in ("1", "X", "2"))
-        return t + ("(fd)" if str(m.get("odds_src") or "").startswith("free") else "")
-    return "n/a"
+def espn_events(data):
+    out = []
+    lg = ((data or {}).get("leagues") or [{}])[0] or {}
+    for ev in (data or {}).get("events") or []:
+        comp = (ev.get("competitions") or [{}])[0]
+        cs = comp.get("competitors") or []
+        h = next((c for c in cs if c.get("homeAway") == "home"), None)
+        a = next((c for c in cs if c.get("homeAway") == "away"), None)
+        if not h or not a:
+            continue
+        try:
+            hid = int((h.get("team") or {}).get("id") or h.get("id"))
+            aid = int((a.get("team") or {}).get("id") or a.get("id"))
+            eid = int(ev.get("id"))
+        except Exception:
+            continue
+        st = ((comp.get("status") or ev.get("status") or {}).get("type") or {})
+
+        def sc(c):
+            try:
+                return int(float(c.get("score")))
+            except Exception:
+                return None
+        nm = lambda c: (c.get("team") or {}).get("displayName") or (c.get("team") or {}).get("name") or (c.get("team") or {}).get("shortDisplayName") or "?"
+        out.append({"eid": eid, "ts": _iso_ts(ev.get("date") or comp.get("date")), "state": st.get("state"), "completed": bool(st.get("completed")),
+                    "status_name": str(st.get("name", "")).upper(), "hid": hid, "aid": aid, "home": nm(h), "away": nm(a), "gh": sc(h), "ga": sc(a),
+                    "odds": espn_odds(comp), "league_name": lg.get("name") or lg.get("abbreviation"),
+                    "season": (ev.get("season") or {}).get("year") or (lg.get("season") or {}).get("year")})
+    return out
 
 
-def _ext_txt(m):
-    d = m.get("ext_d")
-    if not d:
-        return "n/a"
-    return f"{'elo' if m.get('ext_src') == 'elo' or (not m.get('api_1x2') and m.get('elo')) else 'API'} " + "/".join(str(_pct(d[k])) for k in ("1", "X", "2"))
+class EspnClient:
+    def __init__(self, cache_dir=CACHE_DIR, workers=6):
+        self.session = requests.Session()
+        self.session.headers.update(ESPN_HEADERS)
+        self.cache_dir, self.workers = cache_dir, workers
+        self.calls, self.cache_hits, self.err, self.lock = 0, 0, {}, threading.Lock()
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            pass
+
+    def note(self, msg):
+        with self.lock:
+            self.err[msg] = self.err.get(msg, 0) + 1
+            if msg.startswith("network"):
+                self.net_errors = getattr(self, "net_errors", 0) + 1
+
+    def error_summary(self):
+        with self.lock:
+            return [f"{k}  (x{v})" if v > 1 else k for k, v in self.err.items()]
+
+    def scoreboard(self, slug, d1, d2=None, ttl=900):
+        """Returns (data|None, http_status). d1/d2 are date objects; a range uses ESPN's YYYYMMDD-YYYYMMDD form."""
+        dates = d1.strftime("%Y%m%d") + (("-" + d2.strftime("%Y%m%d")) if d2 else "")
+        url = f"{ESPN_BASE}/{slug}/scoreboard"
+        path = os.path.join(self.cache_dir, "espn_" + hashlib.md5(f"{slug}{dates}".encode()).hexdigest() + ".json")
+        if ttl > 0:
+            try:
+                if os.path.exists(path) and time.time() - os.path.getmtime(path) < ttl:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        with self.lock:
+                            self.cache_hits += 1
+                        return json.load(fh), 200
+            except Exception:
+                pass
+        code = None
+        for attempt in range(2):
+            try:
+                r = self.session.get(url, params={"dates": dates, "limit": 1000}, timeout=(6, 25))
+            except Exception as e:
+                self.note(f"network: {str(e)[:80]}")
+                time.sleep(1)
+                continue
+            code = r.status_code
+            with self.lock:
+                self.calls += 1
+            if code == 200:
+                try:
+                    data = r.json()
+                except Exception:
+                    self.note("bad json")
+                    return None, code
+                if ttl > 0:
+                    try:
+                        with open(path, "w", encoding="utf-8") as fh:
+                            json.dump(data, fh)
+                    except Exception:
+                        pass
+                return data, code
+            if code == 404:
+                return None, 404
+            if code in (429, 503):
+                time.sleep(2 * (attempt + 1))
+                continue
+            self.note(f"HTTP {code} on {slug}")
+            return None, code
+        return None, code
 
 
-def format_match_block(mid, m, n_legs, tz, detail=3):
+def espn_collect_fixtures(client, slugs, d, tz, log=lambda m: None, bad_out=None):
+    d1, d2 = d - timedelta(days=1), d + timedelta(days=1)
+    fixtures, odds_by, seen, valid = [], {}, set(), 0
+    with ThreadPoolExecutor(max_workers=client.workers) as ex:
+        futs = {ex.submit(client.scoreboard, s_, d1, d2, 900): s_ for s_ in slugs}
+        for fu in as_completed(futs):
+            slug = futs[fu]
+            if getattr(client, "net_errors", 0) >= 10 and valid == 0:      # ESPN unreachable from this machine: stop early instead of waiting for 100+ timeouts
+                for f_ in futs:
+                    f_.cancel()
+                client.note("ESPN is not reachable from this machine (aborted early)")
+                break
+            try:
+                data, code = fu.result()
+            except Exception as e:
+                client.note(f"{slug}: {str(e)[:60]}")
+                continue
+            if not data:
+                if code == 404 and bad_out is not None:
+                    bad_out[slug] = d.isoformat()
+                continue
+            valid += 1
+            for e in espn_events(data):
+                if e["state"] != "pre" or e["ts"] is None or e["eid"] in seen or any(b in e["status_name"] for b in ESPN_BAD_STATUS):
+                    continue
+                if datetime.fromtimestamp(e["ts"], ZoneInfo(tz)).date() != d:
+                    continue
+                seen.add(e["eid"])
+                fixtures.append({"id": e["eid"], "ts": e["ts"], "status": "NS", "league_id": espn_lid(slug), "league": e["league_name"] or slug,
+                                 "country": espn_country(slug), "season": e["season"], "round": None, "home_id": e["hid"], "home": e["home"],
+                                 "away_id": e["aid"], "away": e["away"], "cat": espn_category(slug), "slug": slug,
+                                 "cov_odds": bool(e["odds"]), "cov_pred": None})
+                if e["odds"]:
+                    odds_by[e["eid"]] = espn_odds_map(e["odds"])
+    log(f"   ESPN answered for {valid}/{len(slugs)} competitions; {len(fixtures)} upcoming matches on {d}, {len(odds_by)} with bookmaker odds")
+    return fixtures, odds_by
+
+
+def espn_update_results(client, db, slugs, today_d, days_back=60, log=lambda m: None):
+    """Incremental results database: one date-range call per competition, then only the new days on later runs."""
+    meta = db.meta.setdefault("espn", {})
+    bad = db.meta.setdefault("espn_invalid", {})
+    end = today_d - timedelta(days=1)
+    todo = []
+    for slug in dict.fromkeys(slugs):
+        if slug in bad and (today_d - date.fromisoformat(bad[slug])).days < 7:
+            continue
+        last = meta.get(slug)
+        start = (date.fromisoformat(last) + timedelta(days=1)) if last else (today_d - timedelta(days=days_back))
+        if start <= end:
+            todo.append((slug, start))
+    added = 0
+    with ThreadPoolExecutor(max_workers=client.workers) as ex:
+        futs = {ex.submit(client.scoreboard, s_, st_, end, 0): (s_, st_) for s_, st_ in todo}
+        for fu in as_completed(futs):
+            slug, _ = futs[fu]
+            try:
+                data, code = fu.result()
+            except Exception:
+                continue
+            if code == 404:
+                bad[slug] = today_d.isoformat()
+                continue
+            if not data:
+                continue
+            rows = defaultdict(list)
+            for e in espn_events(data):
+                if e["completed"] and e["gh"] is not None and e["ga"] is not None and e["ts"] and not any(b in e["status_name"] for b in ESPN_BAD_STATUS):
+                    rows[datetime.fromtimestamp(e["ts"], timezone.utc).date().isoformat()].append([e["eid"], e["ts"], espn_lid(slug), e["hid"], e["aid"], e["gh"], e["ga"]])
+            added += db.add_rows(rows)
+            meta[slug] = end.isoformat()
+    log(f"   results database: +{added} finished matches from {len(todo)} competition call(s); now {db.total_matches()} matches over {len(db.days)} day-buckets")
+    return added
+
+
+def collect_day_espn(cfg, log, progress):
+    out = {"warnings": [], "matches": [], "excluded": [], "raw_count": 0, "cat_counts": {}, "plan": None, "reason": None,
+           "source": "ESPN", "calls": 0, "cache_hits": 0, "errors": [], "budget": None, "deep": False}
+    tz, d = cfg["tz"], date.fromisoformat(cfg["date"])
+    client = EspnClient(workers=6)
+    extra = [x.strip() for x in str(cfg.get("extra_slugs", "")).split(",") if x.strip()]
+    slugs = list(dict.fromkeys(ESPN_SLUGS + extra))
+    db = ResultsDB()
+    bad_old = db.meta.setdefault("espn_invalid", {})        # competition codes ESPN does not know: skipped for 7 days (saves ~100 calls per run)
+    skipped = [x for x in slugs if x in bad_old and (d - date.fromisoformat(bad_old[x])).days < 7 and x not in extra]
+    slugs = [x for x in slugs if x not in skipped]
+    log(f"🌐 ESPN (free, no key): scanning {len(slugs)} competitions for {d} ({tz})" + (f" - {len(skipped)} known-invalid codes skipped" if skipped else "") + "...")
+    bad_new = {}
+    fixtures, odds_by = espn_collect_fixtures(client, slugs, d, tz, log, bad_new)
+    bad_old.update(bad_new)
+    out["raw_count"] = len(fixtures)
+    if cfg.get("exclude_minor", True):
+        fixtures = [f for f in fixtures if not LEAGUE_EXCLUDE_RE.search(f["league"] or "") and not TEAM_EXCLUDE_RE.search(f["home"] or "")
+                    and not TEAM_EXCLUDE_RE.search(f["away"] or "")]
+    out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
+    progress(0.15)
+    if not fixtures:
+        out["reason"] = ("ESPN returned no upcoming matches for this date. " + ("Messages: " + "; ".join(client.error_summary()[:3]) if client.err else
+                         "It may be a very quiet day, or ESPN could not be reached from this machine (use Settings -> Test data sources)."))
+        out["calls"], out["errors"] = client.calls, client.error_summary()
+        return out
+    res_slugs = list(dict.fromkeys([f["slug"] for f in fixtures] + ESPN_DOMESTIC_RESULTS))
+    log(f"🗄 Updating the free results database from ESPN ({len(res_slugs)} competitions, incremental)...")
+    espn_update_results(client, db, res_slugs, d, 60, log)
+    db.save()
+    progress(0.5)
+    elo_tab = EloTable.fetch(cfg["date"], client.cache_dir) if cfg.get("use_elo", True) else EloTable([])
+    log(f"📈 ClubElo ratings loaded for {len(elo_tab)} clubs" if len(elo_tab) else "📈 ClubElo unavailable - continuing without it")
+    n = min(len(fixtures), max(cfg["max_matches"], 40))
+    sl = shortlist_matches(fixtures, n, cfg["force_leagues"], BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
+    keep = {f["id"] for f in sl}
+    for f in fixtures:
+        if f["id"] not in keep:
+            out["excluded"].append({"league": f["league"], "match": f"{f['home']} v {f['away']}", "reason": "beyond the match limit"})
+    core = {m["id"]: {"pred": None, "rh": db.results(m["home_id"], m["ts"]), "ra": db.results(m["away_id"], m["ts"]),
+                      "h2h": db.h2h(m["home_id"], m["away_id"], m["ts"])} for m in sl}
+    have = sum(1 for c in core.values() if len(c["rh"]) >= 4 and len(c["ra"]) >= 4)
+    log(f"🎯 {len(sl)} matches selected; {have} have 4+ recent results for both teams; {sum(1 for m in sl if m['id'] in odds_by)} have bookmaker odds")
+    out["caps"] = {"history": True, "league_odds": False, "fixture_odds": False}
+    analyse_matches(sl, core, odds_by, {}, {}, {}, {}, db, elo_tab, cfg, out, inj_known=False, odds_partial=True, log=log)
+    out["calls"], out["cache_hits"], out["errors"] = client.calls, client.cache_hits, client.error_summary()
+    progress(0.9)
+    return out
+
+
+def test_data_sources(tz="Africa/Kampala", api_key=""):
+    """Reachability check from THIS machine: shows exactly which free sources work here."""
+    rows, today = [], datetime.now(ZoneInfo(tz)).date()
+    ymd = today.strftime("%Y%m%d")
+    try:
+        r = requests.get(f"{ESPN_BASE}/eng.1/scoreboard", params={"dates": ymd + "-" + (today + timedelta(days=7)).strftime("%Y%m%d")},
+                         headers=ESPN_HEADERS, timeout=20)
+        if r.status_code == 200:
+            evs = espn_events(r.json())
+            rows.append(("ESPN scoreboard", f"✅ HTTP 200 - {len(evs)} Premier League events in the next 7 days, {sum(1 for e in evs if e['odds'])} with 1X2 odds"))
+        else:
+            rows.append(("ESPN scoreboard", f"❌ HTTP {r.status_code}"))
+    except Exception as e:
+        rows.append(("ESPN scoreboard", f"❌ {str(e)[:120]}"))
+    hdr = {"User-Agent": ESPN_HEADERS["User-Agent"], "X-Requested-With": "XMLHttpRequest", "Referer": "https://www.sofascore.com/", "Accept": "application/json"}
+    for label, url in (("SofaScore (api. host)", f"https://api.sofascore.com/api/v1/sport/football/scheduled-events/{today}"),
+                       ("SofaScore (www host)", f"https://www.sofascore.com/api/v1/sport/football/scheduled-events/{today}")):
+        try:
+            r = requests.get(url, headers=hdr, timeout=20)
+            rows.append((label + " - plain requests", ("✅ " if r.status_code == 200 else "❌ ") + f"HTTP {r.status_code}" + ("" if r.status_code == 200 else " (blocked or endpoint removed)")))
+        except Exception as e:
+            rows.append((label + " - plain requests", f"❌ {str(e)[:100]}"))
+        try:
+            from curl_cffi import requests as cr
+            r = cr.get(url, headers=hdr, impersonate="chrome", timeout=20)
+            rows.append((label + " - browser-impersonation", ("✅ " if r.status_code == 200 else "❌ ") + f"HTTP {r.status_code}"))
+        except ImportError:
+            rows.append((label + " - browser-impersonation", "⚪ curl_cffi not installed (pip install curl_cffi to test)"))
+        except Exception as e:
+            rows.append((label + " - browser-impersonation", f"❌ {str(e)[:100]}"))
+    try:
+        r = requests.get(f"http://api.clubelo.com/{today}", timeout=20)
+        rows.append(("ClubElo", f"✅ HTTP 200 - {max(0, len(r.text.splitlines()) - 1)} clubs" if r.status_code == 200 else f"❌ HTTP {r.status_code}"))
+    except Exception as e:
+        rows.append(("ClubElo", f"❌ {str(e)[:100]}"))
+    if api_key:
+        s_ = ApiFootball(api_key, 10).status()
+        rows.append(("API-Football", f"✅ plan {s_.get('plan')} - used {s_.get('used')}/{s_.get('limit')} today" if s_.get("plan") else f"❌ {s_.get('errors')}"))
+    else:
+        rows.append(("API-Football", "⚪ no API key set (optional)"))
+    return rows
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Evidence pack for the AI (hard token budget)
+# ═════════════════════════════════════════════════════════════════════════════
+SYSTEM_PROMPT = """You are two people at once: head of trading at a sharp sportsbook (you know exactly how prices are shaded to punish public money) and a professional quantitative analyst. Python already collected the day's football data and ran a 40,000-run Monte Carlo per match (Poisson goals, shared-tempo variance, Dixon-Coles correction, negative-binomial corners), then blended it with de-vigged bookmaker prices. Audit that evidence and build @NT@ separate accumulator(s) of 5 legs each.
+
+DATA KEY: S+R/R/S/E/P after dq = data behind xG: season+recent form / recent form / season stats / Elo rating only / P = NO team data (competition averages only). Treat P matches as coin-flips: use them only to complete a ticket, preferring base-rate goal legs. A * after p marks a relaxed-threshold leg (lower confidence): use only when needed. xG=model expected goals home-away; mdl=model 1X2 %; mkt=bookmaker 1/X/2 prices; API/ELO=third-party or Elo-rating win %; BTTS/O/U/corners = blended probabilities %; H/A lines = form (oldest>newest), ppg=points per game (last5), gf/ga=weighted goals for/against, rt=avg player rating, rk=table rank; H2H=W-D-L from home team's view + goals/game; inj=missing/doubtful (*=key starter, F/M/D/G=position); lu=formation, ? = not released, ROT=key starters benched; star=in-form players; dq=data quality 0-1; TRAP=Python trap score 0-100 + reasons. LEGS: id@decimal_odds/p=blended probability %/m=bookmaker margin-free probability %/e=edge %. Distrust a leg when p and m differ by >8 pts unless you can explain it.
+
+HARD RULES
+1. Pick legs ONLY by exact id from LEGS lists. Never invent legs/odds/matches. Python recomputes odds and rejects invalid picks.
+2. Exactly @NT@ ticket(s) x 5 legs; 5 different matches per ticket@REUSE@.
+3. Each ticket's combined odds (product of leg odds) must be >= 3.50; aim 3.5-4.6. Reach it with well-priced SAFE legs; if safe legs cannot reach it, add the least fragile * legs and set risk HIGH. NEVER return an empty or short tickets list: thin data is expected, so build the best possible tickets and say honestly how risky they are.
+4. Maximise each ticket's win probability (product of p) subject to rule 3. Prefer p>=75; accept 65-74 only with strong evidence.
+5. Ticket 1 = safest possible, Ticket 2 (if any) = balanced, Ticket 3 (if any) = best value (positive edge) but still solid. Quality over quantity: if a leg is merely mediocre, swap it for a safer one from the list.
+
+HOW TO REASON
+- Price vs model: if mkt and mdl differ by >8 pts, explain it with hard evidence (injuries, lineups, form, motivation, rotation). No evidence = trust the market. A big + edge on a short price is usually model error, not a gift.
+- TRAP DETECTION: books profit most when the obvious favourite in a big game fails. TRAP>=45 = suspect, 30-44 = watch. Signals: favourite shorter than model says, favourite in poor form, key starters out or rotated, dangerous underdog (form/H2H), away favourite, draw prob >=27%, cups/friendlies/dead rubbers, relegation-threatened home side. For a suspect NEVER use the favourite-win leg: skip the match, or use a leg that survives the trap (draw-covering double chance on the underdog side, goals-market leg, Under/BTTS-No) only if p is high and evidence supports it. Apply your own judgement to matches Python scored low too.
+- Failure test per leg: name the scenario that loses it (early red, 1-0 low block, rotation, tempo) and judge how common it is. Reject legs whose losing scenario is common.
+- Goals logic: Over1.5 solid at total xG>=2.6; Over2.5 needs >=3.0; Under needs total xG<=2.3 with weak attacks; BTTS-No needs a side with xG<=0.9; team over1.5 needs own xG>=1.9. Corners follow attacking volume; use only with dq>=0.6.
+- Diversify market types and leagues; avoid five Overs or five favourites; do not stack legs with the same failure mode. Categories: TOP=major leagues, MID, INTL=international/continental, LOW=thin data (needs extra margin). Low dq (<0.6), unreleased lineups near kickoff, friendlies need extra margin or exclusion.
+
+OUTPUT: ONE JSON object only, no markdown, all reasoning inside these fields, terse:
+{"tickets":[{"name":"Ticket 1 - Safest","legs":[{"id":"m3.1X","why":"<=14 words of evidence"}, ...5 legs],"logic":"<=40 words: why these five together, what could break it","risk":"LOW|MED|HIGH"}, ...@NT@ tickets],"traps":[{"id":"m5","note":"<=20 words: trap read + action"}],"avoid":[{"id":"m9","why":"<=12 words"}],"summary":"<=50 words overall slate read"}"""
+
+
+def system_prompt(n_tickets, reuse):
+    return (SYSTEM_PROMPT.replace("@NT@", str(n_tickets))
+            .replace("@REUSE@", "; a match may appear in more than one ticket only if unavoidable" if reuse else f"; {n_tickets * LEGS_PER_TICKET} different matches overall (no match reused)"))
+
+
+def format_match_block(mid, m, n_legs, tz):
     p = m["p"]
+    thin_model = m.get("basis") == "prior"
+    xg_txt = "xG n/a" if thin_model else f"xG {m['lam_h']:.2f}-{m['lam_a']:.2f}"
+    mdl_txt = "n/a" if thin_model else f"{_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])}"
     ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
     ph, pa = m["ph"], m["pa"]
-    star = lambda pr: ",".join(f"{_short(s['name'].split(' ')[-1], 9)}{s['rating']:.1f}" for s in pr.get("stars", [])[:1]) or "-"
+    mk = m.get("mkt_1x2")
+    mk_txt = "/".join(f"{m['odds'][k]['odds']:.2f}" for k in ("1", "X", "2")) if all(k in m["odds"] for k in ("1", "X", "2")) else "n/a"
+    ad = m.get("api_1x2")
+    api_txt = "/".join(str(_pct(ad[k])) for k in ("1", "X", "2")) if ad else "n/a"
+
+    def side(pr, lab):
+        if not pr.get("n"):
+            return f"{lab} n/a"
+        rt = f" rt{pr['team_rating']:.1f}" if pr.get("team_rating") else ""
+        return f"{lab} {pr['form5']} ppg{pr['ppg5']:.1f} gf{pr['gf_w']:.1f} ga{pr['ga_w']:.1f}{rt}"
+
+    def inj(pr):
+        items = [f"{_short((i['name'] or '?').split(' ')[-1], 10)}{'*' if i['key'] else ''}({i['pos'] or '?'}){'?' if i['type'] != 'Missing Fixture' else ''}" for i in pr.get("inj", [])[:4]]
+        return ",".join(items) if items else "-"
+
+    def lu(pr):
+        l = pr.get("lineup")
+        return "?" if not l else (l["formation"] or "ok") + ("ROT" if l["rotation"] else "")
+
+    def star(pr):
+        return ",".join(f"{_short(s['name'].split(' ')[-1], 9)}{s['rating']:.1f}" for s in pr.get("stars", [])[:1]) or "-"
+
     rk = f" rk{m['st_h']['rank']}/{m['st_a']['rank']}" if m.get("st_h") and m.get("st_a") else ""
     h2 = f"H2H{m['h2h']['n']} {m['h2h']['w']}-{m['h2h']['d']}-{m['h2h']['l']} g{m['h2h']['g']:.1f}" if m.get("h2h") else "H2H n/a"
-    corn = f" | crn{m['exp_corners']:.1f} O9.5:{_pct(p['C_O9.5'])}" if m.get("corner_n", 0) >= 3 and "C_O9.5" in p else ""
+    corn = f" | crn{m['exp_corners']:.1f} O9.5:{_pct(p['C_O9.5'])}" if m.get("corner_n", 0) >= 3 else ""
     t = m["trap"]
     trap = f"TRAP{t['risk']}: {', '.join(t['reasons'])}" if t["risk"] >= 25 else f"TRAP{t['risk']}"
-    legs = " ; ".join(_leg_txt(mid, l) for l in m["legs"][:n_legs])
-    extra = f" U2.5:{_pct(p['U2.5'])} BTTSn:{_pct(p['BTTS_N'])}" if detail >= 3 else ""
-    head = (f"#{mid} {m['cat']}|{_short(m['league'], 18)} {_short(m['home'], 15)} v {_short(m['away'], 15)} {ko} dq{m['dq']} {BASIS_TAG.get(m['basis'], '?')}{(' form' + str(m['form_age_days']) + 'd-old') if (m.get('form_age_days') or 0) > 30 else ''}{' NATIONAL' if (m.get('elo') or {}).get('intl') else ''}\n"
-            f"xG {m['lam_h']:.2f}-{m['lam_a']:.2f} mdl {_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])} mkt {_mkt_txt(m)} {_ext_txt(m)}"
-            f" | BTTS{_pct(p['BTTS_Y'])} O1.5:{_pct(p['O1.5'])} O2.5:{_pct(p['O2.5'])} O3.5:{_pct(p['O3.5'])}{extra}{corn}\n")
-    if detail <= 1:
-        return head + f"{_side_txt(ph, 'H')} | {_side_txt(pa, 'A')}\ninj H:{_inj_txt(ph, m)} A:{_inj_txt(pa, m)}\n{trap}\nLEGS {legs}"
-    return (head + f"{_side_txt(ph, 'H', detail >= 3)} | {_side_txt(pa, 'A', detail >= 3)}{rk} | {h2}\n"
-            f"inj H:{_inj_txt(ph, m)} A:{_inj_txt(pa, m)} | lu H:{_lu_txt(ph)} A:{_lu_txt(pa)} | star H:{star(ph)} A:{star(pa)}\n{trap}\nLEGS {legs}")
-
-
-def format_scout_block(aid, m, tz, n_legs=3):
-    ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
-    t = m["trap"]
-    if m.get("inj_known"):
-        ko_h = sum(1 for i in m["ph"].get("inj", []) if i["key"] and i["type"] == "Missing Fixture")
-        ko_a = sum(1 for i in m["pa"].get("inj", []) if i["key"] and i["type"] == "Missing Fixture")
-        inj = f"{ko_h}/{ko_a}"
-    else:
-        inj = "n/a"
-    rot = "ROT" if any((pr.get("lineup") or {}).get("rotation") for pr in (m["ph"], m["pa"])) else ""
-    legs = " ".join(f"{l['key']}@{l['odds']:.2f}p{_pct(l['p'])}m{_pct(l['p_mkt'])}{'~' if l.get('tier') == 'B' else ''}" for l in m["legs"][:n_legs])
-    trap = f"T{t['risk']}" + (f":{t['reasons'][0]}" if t["risk"] >= 30 and t["reasons"] else "")
-    return (f"{aid} {m['cat']}|{_short(m['league'], 14)} {_short(m['home'], 13)} v {_short(m['away'], 13)} {ko} dq{m['dq']} {BASIS_TAG.get(m['basis'], '?')} "
-            f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f} mdl{_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])} mk{_mkt_txt(m)} "
-            f"{trap} inj{inj}{rot} | {legs}")
+    legs = " ; ".join(f"{mid}.{l['key']}@{l['odds']:.2f}/p{_pct(l['p'])}{'*' if l.get('rx') else ''}/m{_pct(l['p_mkt'])}/e{l['edge'] * 100:+.0f}" for l in m["legs"][:n_legs])
+    return (f"#{mid} {m['cat']}|{_short(m['league'], 18)} {_short(m['home'], 15)} v {_short(m['away'], 15)} {ko} dq{m['dq']} {BASIS_TAG.get(m['basis'], '?')}\n"
+            f"{xg_txt} mdl {mdl_txt} mkt {mk_txt} {'ELO' if m.get('ext_name') == 'elo' else 'API'} {api_txt}"
+            f" | BTTS{_pct(p['BTTS_Y'])} O1.5:{_pct(p['O1.5'])} O2.5:{_pct(p['O2.5'])} O3.5:{_pct(p['O3.5'])}{corn}\n"
+            f"{side(ph, 'H')} | {side(pa, 'A')}{rk} | {h2}\n"
+            f"inj H:{inj(ph)} A:{inj(pa)} | lu H:{lu(ph)} A:{lu(pa)} | star H:{star(ph)} A:{star(pa)}\n"
+            f"{trap}\nLEGS {legs}")
 
 
 def est_tokens(text, cpt):
     return int(len(text) / cpt) + 1
 
 
-def rank_matches(ms):
-    usable = [m for m in ms if m["legs"]]
-    usable.sort(key=lambda m: -(sum(l["rank"] for l in m["legs"][:2]) / min(2, len(m["legs"]))))
-    return usable
-
-
-def build_ai_pack(matches, tz, cpt, sys_prompt, floor, reserve, ceiling, labels, extra=""):
-    """DESK pack for ONE ticket: as many matches as one request allows (at least `floor`), richest detail that fits.
-    `labels` maps id(match) -> global label (m1, m7, ...) so ids stay unique across the per-ticket calls."""
-    top = [m for m in matches if m["legs"]]            # keep the caller's order (the scout's best-first ranking)
-    prompt_cap = ceiling - reserve - TOKEN_SAFETY
-    sys_tok = est_tokens(sys_prompt + extra, cpt)
-    floor = max(1, min(floor, len(top)))
-    for detail in (3, 2, 1):
-        for n_legs in (6, 5, 4, 3):
-            for n in range(len(top), floor - 1, -1):
-                sel = top[:n]
-                user = (f"CANDIDATES: {len(sel)} matches. Build the ticket from these LEGS only.\n{extra}\n"
-                        + "\n\n".join(format_match_block(labels[id(m)], m, n_legs, tz, detail) for m in sel))
-                if sys_tok + est_tokens(user, cpt) <= prompt_cap:
-                    return sel, {labels[id(m)]: m for m in sel}, user, n_legs, detail
-    sel = top[:floor]
-    user = "CANDIDATES:\n" + "\n\n".join(format_match_block(labels[id(m)], m, 2, tz, 1) for m in sel)
-    return sel, {labels[id(m)]: m for m in sel}, user, 2, 1
-
-
-def build_scout_pack(pool, tz, cpt, sys_prompt, reserve, ceiling):
-    prompt_cap = ceiling - reserve - TOKEN_SAFETY
+def build_ai_pack(matches, tz, cpt, n_ai, sys_prompt, need, reserve=OUTPUT_RESERVE):
+    """Choose matches + legs-per-match so that prompt + reserved completion <= 8,000 tokens."""
+    usable = [m for m in matches if m["legs"]]
+    usable.sort(key=lambda m: -(sum(l["rank"] for l in m["legs"][:2]) / min(2, len(m["legs"])) - {"prior": 0.12, "elo": 0.04}.get(m["basis"], 0.0)))
+    top = usable[:n_ai]
+    flagged = sorted([m for m in usable if m["trap"]["risk"] >= 45 and m not in top], key=lambda m: -m["trap"]["risk"])[:2]
+    prompt_cap = TOTAL_TOKEN_BUDGET - reserve - TOKEN_SAFETY
     sys_tok = est_tokens(sys_prompt, cpt)
-    for n_legs in (3, 2):
-        for n in range(len(pool), 5, -1):
-            sel = pool[:n]
-            ids = {f"a{i + 1}": m for i, m in enumerate(sel)}
-            user = f"SLATE ({len(sel)} matches):\n" + "\n".join(format_scout_block(a, m, tz, n_legs) for a, m in ids.items())
+    floor = min(need, len(top))
+    for n_legs in (5, 4, 3, 2):
+        for n in range(len(top), max(0, floor - 1), -1):
+            sel = top[:n]
+            if flagged and n > floor + len(flagged):
+                sel = top[:n - len(flagged)] + flagged
+            ids = {id(m): f"m{i + 1}" for i, m in enumerate(sel)}
+            user = (f"SLATE: {len(sel)} pre-screened matches (of {len(matches)} analysed). Build exactly {need // LEGS_PER_TICKET} ticket(s) from these LEGS only. You MUST return them: thin data is expected, so choose the least-bad legs and flag the risk - never return an empty list.\n\n"
+                    + "\n\n".join(format_match_block(ids[id(m)], m, n_legs, tz) for m in sel))
             if sys_tok + est_tokens(user, cpt) <= prompt_cap:
-                return sel, ids, user
-    return None, {}, ""
-
-
-def _audit_leg_line(ti, li, l, m, match_legs, detail, flags):
-    mid = l["mid"]
-    alts = [x for x in match_legs.get(mid, []) if x["key"] != l["key"]][:3]
-    ev = (f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f} mdl{_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])} dq{m['dq']} "
-          f"| {_side_txt(m['ph'], 'H', detail >= 2)} | {_side_txt(m['pa'], 'A', detail >= 2)} | inj H:{_inj_txt(m['ph'], m)} A:{_inj_txt(m['pa'], m)}")
-    if detail >= 2:
-        h2 = f" | H2H{m['h2h']['n']} {m['h2h']['w']}-{m['h2h']['d']}-{m['h2h']['l']}" if m.get("h2h") else ""
-        ev += f" | lu H:{_lu_txt(m['ph'])} A:{_lu_txt(m['pa'])}{h2}"
-    t = m["trap"]
-    return (f" {li + 1}) {_leg_txt(mid, l)} | {_short(m['home'], 14)} v {_short(m['away'], 14)} [{_short(m['league'], 14)}] {ev} | TRAP{t['risk']}"
-            f"{(':' + ','.join(t['reasons'][:2])) if t['risk'] >= 30 else ''} | ALT {' ; '.join(_leg_txt(mid, a) for a in alts) or '-'}"
-            f"{' | FLAGS ' + ','.join(flags) if flags else ''}")
-
-
-def build_audit_pack(tickets, match_legs, tz, cpt, sys_prompt, reserve, ceiling, per, distinct):
-    prompt_cap = ceiling - reserve - TOKEN_SAFETY
-    sys_tok = est_tokens(sys_prompt, cpt)
-    used = {l["mid"] for t in tickets for l in t["legs"]}
-    pool_mids = [mid for mid, lst in match_legs.items() if lst and (mid not in used or not distinct)]
-    pool_mids.sort(key=lambda mid: -match_legs[mid][0]["rank"])
-    for detail in (2, 1):
-        for n_pool in (6, 4, 2):
-            lines = []
-            for ti, t in enumerate(tickets):
-                lines.append(f"T{ti + 1} '{t['name']}' odds {_tprod(t['legs']):.2f} joint p~{_pct(_tprod(t['legs'], 'p'))}% ({len(t['legs'])}/{per} legs)")
-                for li, l in enumerate(t["legs"]):
-                    lines.append(_audit_leg_line(ti, li, l, l["match"], match_legs, detail, lint_leg(l)))
-                if len(t["legs"]) < per:
-                    lines.append(f" GAP: ticket {ti + 1} needs {per - len(t['legs'])} more leg(s)")
-            pool_lines = [f" {mid} {_short(match_legs[mid][0]['match']['home'], 13)} v {_short(match_legs[mid][0]['match']['away'], 13)}: "
-                          + " ; ".join(_leg_txt(mid, x) for x in match_legs[mid][:2]) for mid in pool_mids[:n_pool]]
-            user = "\n".join(lines) + "\nPOOL (unused matches):\n" + ("\n".join(pool_lines) if pool_lines else " none")
-            if sys_tok + est_tokens(user, cpt) <= prompt_cap:
-                return user
-    return None
+                return sel, {ids[id(m)]: m for m in sel}, user, n_legs
+    sel = top[:max(floor, 1)]
+    ids = {id(m): f"m{i + 1}" for i, m in enumerate(sel)}
+    user = "SLATE:\n\n" + "\n\n".join(format_match_block(ids[id(m)], m, 2, tz) for m in sel)
+    return sel, {ids[id(m)]: m for m in sel}, user, 2
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Groq: per-minute token governor, budgeted calls, model fallback
+# Groq (budgeted, model fallback)
 # ═════════════════════════════════════════════════════════════════════════════
-class TpmGovernor:
-    """Keeps the tokens sent to Groq inside its rolling 60-second window by sleeping until enough old usage has expired."""
-    def __init__(self, window_limit, clock=time.monotonic, sleep=time.sleep):
-        self.limit = int(window_limit)
-        self.clock, self.sleep = clock, sleep
-        self.events: List[list] = []
-
-    def _prune(self, now):
-        self.events = [e for e in self.events if now - e[0] < 60.0]
-
-    def used(self):
-        self._prune(self.clock())
-        return sum(e[1] for e in self.events)
-
-    def wait_for(self, tokens, log_fn=None):
-        waited = 0.0
-        tokens = min(int(tokens), self.limit)
-        while True:
-            now = self.clock()
-            self._prune(now)
-            used = sum(e[1] for e in self.events)
-            if used + tokens <= self.limit:
-                return waited
-            need_free, acc, release = used + tokens - self.limit, 0, None
-            for t, k in self.events:
-                acc += k
-                if acc >= need_free:
-                    release = t + 60.0
-                    break
-            wait = min(65.0, max(1.0, (release if release is not None else now + 60.0) - now + 0.5))
-            if log_fn:
-                log_fn(f"   ⏳ Groq allows ~{self.limit + WINDOW_MARGIN} tokens/minute: waiting {wait:.0f}s so the next AI pass fits the window...")
-            self.sleep(wait)
-            waited += wait
-
-    def charge(self, tokens):
-        e = [self.clock(), int(tokens)]
-        self.events.append(e)
-        return e
-
-    def settle(self, handle, actual):
-        handle[1] = max(0, int(actual))
-
-
 class TokenBudget:
     def __init__(self, total):
         self.total, self.used = total, 0
@@ -2710,6 +2216,25 @@ def _parse_json(content):
     return _parse_json_ex(content)[0]
 
 
+_GROQ_MODELS_CACHE = {"t": 0.0, "ids": None}
+
+
+def groq_available_models(api_key):
+    """Models active on this Groq account (free call). None if it cannot be determined."""
+    if _GROQ_MODELS_CACHE["ids"] is not None and time.time() - _GROQ_MODELS_CACHE["t"] < 3600:
+        return _GROQ_MODELS_CACHE["ids"]
+    try:
+        r = requests.get("https://api.groq.com/openai/v1/models", headers={"Authorization": f"Bearer {api_key}"}, timeout=15)
+        if r.status_code == 200:
+            ids = {m.get("id") for m in (r.json().get("data") or [])}
+            if ids:
+                _GROQ_MODELS_CACHE.update(t=time.time(), ids=ids)
+                return ids
+    except Exception:
+        pass
+    return None
+
+
 def _retry_after(text):
     m = re.search(r"try again in ([0-9hms.]+)", text or "")
     if not m:
@@ -2721,77 +2246,40 @@ def _retry_after(text):
     return sec
 
 
-def _dead_models():
-    try:
-        d = load_state().get("dead_models") or {}
-        return {m for m, t in d.items() if time.time() - float(t) < 7 * 86400}
-    except Exception:
-        return set()
-
-
-def _mark_dead(model):
-    try:
-        st_ = load_state()
-        st_.setdefault("dead_models", {})[model] = time.time()
-        save_state(st_)
-    except Exception:
-        pass
-
-
-def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov=None, ceiling=None, expect="tickets", log_fn=None, label="desk"):
-    """One Groq request inside the per-request ceiling and the run-level token cap.
-    - the TpmGovernor spaces requests over the minute;
-    - 413 'too large' replies are used to MEASURE the real prompt size and shrink the reply room (or report PROMPT_TOO_LARGE so the
-      caller can rebuild a smaller prompt);
-    - 400 'Failed to validate JSON' replies carry the model's partial output: it is salvaged, or the request is retried without JSON mode;
-    - a model that answers 404 is remembered as unavailable and skipped on later runs."""
+def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None):
+    """Calls Groq inside the hard token budget. The prompt estimate is padded, the completion cap is bounded by the chosen
+    reasoning effort, and 413/429 errors are parsed so the request is corrected instead of blindly retried."""
     api_key = get_secret("GROQ_API_KEY", "").strip()
     log = []
-    info = {"attempts": log, "model": None, "prompt_tokens": 0, "completion_tokens": 0, "label": label, "waited": 0.0, "fallback": False}
     if not api_key:
-        log.append({"model": "-", "status": "GROQ_API_KEY not set"})
-        info["status"] = "MISSING_KEY"
-        return None, info
-    ceiling = ceiling or (GROQ_TPM_DEFAULT - TPM_MARGIN)
+        return None, {"status": "MISSING_KEY", "attempts": [{"model": "-", "status": "GROQ_API_KEY not set"}], "prompt_tokens": 0, "completion_tokens": 0}
     chars = len(system_prompt + user_prompt)
     est_prompt = est_tokens(system_prompt + user_prompt, cpt)
+    info = {"attempts": log, "model": None, "prompt_tokens": 0, "completion_tokens": 0}
     too_large = False
-    p_real_max = 0
-    valid = (lambda p: isinstance(p, dict) and isinstance(p.get("legs"), list)) if expect == "legs" else (lambda p: isinstance(p, dict) and bool(p.get(expect)))
-    dead = _dead_models()
-    models = [m for m in GROQ_MODELS if m not in dead] or GROQ_MODELS[:2]
-    for model in models:
+    avail = groq_available_models(api_key)
+    chain = [m for m in GROQ_MODELS if not avail or m in avail] or list(GROQ_MODELS)
+    for m in GROQ_MODELS:
+        if m not in chain:
+            log.append({"model": m, "status": "not available on your Groq account - skipped"})
+    for model in chain:
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
         eff = effort or cfg.get("reasoning_effort")
         upper = cfg["max_completion_tokens"]
         if model.startswith("openai/") and eff in EFFORT_RESERVE:
             upper = min(upper, EFFORT_RESERVE[eff] + 100)
-        limit = ceiling                              # per-request token limit; refined from error messages
-        p_est = int(est_prompt * 1.15) + 60          # pessimistic prompt size until the API tells us the real one
-        cap_max, json_mode = None, True
-        for attempt in range(4):
+        limit = TOTAL_TOKEN_BUDGET               # per-request token limit; refined from error messages
+        p_est = int(est_prompt * 1.15) + 60      # pessimistic prompt size until the API tells us the real one
+        for attempt in range(3):
             cap = min(upper, budget.remaining - p_est - 60, limit - p_est - 60)
-            if cap_max is not None:
-                cap = min(cap, cap_max)
             if cap < MIN_COMPLETION:
-                budget_short = budget.remaining - p_est - 60 < MIN_COMPLETION
-                log.append({"model": model, "status": ("SKIPPED_BUDGET(run token cap used up)" if budget_short else f"PROMPT_TOO_LARGE(prompt~{p_est}, reply room={cap})")})
-                if budget_short:
-                    info["status"] = "TOKEN_CAP"
-                    return None, info
-                if p_real_max:                              # the prompt itself is the problem, so another model would fail the same way
-                    info["actual_cpt"] = chars / p_real_max
-                    info["status"] = "PROMPT_TOO_LARGE"
-                    return None, info
-                too_large = True
+                log.append({"model": model, "status": f"SKIPPED_BUDGET(prompt~{p_est}, cap={cap}, tokens already used {budget.used})"})
+                if budget.used == 0:
+                    too_large = True
                 break
-            handle = None
-            if gov:
-                info["waited"] += gov.wait_for(p_est + cap, log_fn)
-                handle = gov.charge(p_est + cap)
             payload = {"model": model, "temperature": 0.2, "max_completion_tokens": int(cap),
                        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]}
-            if json_mode:
+            if not model.startswith("openai/"):          # strict JSON mode makes Groq reject slightly-invalid JSON; we parse/repair ourselves
                 payload["response_format"] = {"type": "json_object"}
             if cfg.get("supports_reasoning_effort") and eff:
                 payload["reasoning_effort"] = eff if model.startswith("openai/") or eff == "none" else "none"
@@ -2800,8 +2288,6 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
             try:
                 r = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=GROQ_TIMEOUT)
             except Exception as e:
-                if handle:
-                    gov.settle(handle, 0)
                 log.append({"model": model, "status": f"NETWORK {str(e)[:80]}"})
                 time.sleep(2)
                 continue
@@ -2809,87 +2295,68 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
                 d = r.json()
                 u = d.get("usage") or {}
                 pt, ct = u.get("prompt_tokens", est_prompt), u.get("completion_tokens", 0)
-                total = u.get("total_tokens", pt + ct)
-                budget.used += total
-                if handle:
-                    gov.settle(handle, total)
+                budget.used += u.get("total_tokens", pt + ct)
                 info["prompt_tokens"] += pt
                 info["completion_tokens"] += ct
                 info["actual_cpt"] = chars / max(1, pt)
                 ch = (d.get("choices") or [{}])[0]
                 content = (ch.get("message") or {}).get("content") or ""
                 parsed, salvaged = _parse_json_ex(content) if content else (None, False)
-                if valid(parsed):
-                    log.append({"model": model, "status": "SUCCESS" + (" (reply hit the token cap - recovered the complete part)" if salvaged else "")})
-                    info.update({"salvaged": salvaged, "model": model, "status": "SUCCESS", "fallback": model != GROQ_MODELS[0]})
+                if parsed and parsed.get("tickets"):
+                    log.append({"model": model, "status": "SUCCESS" + (" (reply hit the token cap - recovered the complete tickets)" if salvaged else "")})
+                    info["salvaged"] = salvaged
+                    info["model"], info["status"] = model, "SUCCESS"
                     return parsed, info
-                log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')} (completion {ct} of room {cap})"})
+                log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')} (completion {ct} of cap {cap}) reply={content[:200]!r}"})
+                if parsed is not None:
+                    info["declined"] = parsed
                 break
-            body = (r.text or "")[:300]
+            body = (r.text or "")[:240]
             low = body.lower()
+            if r.status_code == 400 and "failed_generation" in (r.text or ""):      # Groq rejected the JSON but returns what the model wrote
+                try:
+                    fg = ((r.json().get("error") or {}).get("failed_generation")) or ""
+                except Exception:
+                    fg = ""
+                parsed, salvaged = _parse_json_ex(fg) if fg else (None, False)
+                if parsed and parsed.get("tickets"):
+                    budget.used += p_est + int(len(fg) / 3)
+                    log.append({"model": model, "status": "SUCCESS (recovered from Groq's rejected JSON)"})
+                    info["model"], info["status"], info["salvaged"] = model, "SUCCESS", True
+                    return parsed, info
+                log.append({"model": model, "status": f"HTTP_400 JSON rejected and not recoverable; model wrote: {fg[:160]!r}"})
+                break
             if r.status_code == 413 or "too large" in low:
-                if handle:
-                    gov.settle(handle, 0)
                 lim, req = re.search(r"Limit (\d+)", body), re.search(r"Requested (\d+)", body)
                 if lim and req:
-                    limit = min(limit, int(lim.group(1)) - 150)
-                    info["learned_limit"] = int(lim.group(1))
-                    excess = int(req.group(1)) - int(lim.group(1))
-                    p_real = max(1, int(req.group(1)) - int(cap))
-                    p_real_max = max(p_real_max, p_real)
-                    info["actual_cpt"] = chars / p_real_max
-                    cap_max = int(cap) - max(0, excess) - 150          # shrink the reply room by exactly what was too much
-                    p_est = max(p_est, p_real + 20)
-                    log.append({"model": model, "status": f"HTTP_413 limit {lim.group(1)}, requested {req.group(1)} -> real prompt ~{p_real} tokens, reply room now {max(cap_max, 0)}"})
+                    limit = int(lim.group(1))
+                    real_prompt = max(1, int(req.group(1)) - int(cap))
+                    p_est = real_prompt + 20
+                    info["actual_cpt"] = chars / real_prompt
+                    log.append({"model": model, "status": f"HTTP_413 limit {limit}, real prompt ~{real_prompt} tokens -> recomputing cap"})
                 else:
                     p_est = int(p_est * 1.2)
                     log.append({"model": model, "status": f"HTTP_413 {body[:120]}"})
                 continue
             if r.status_code == 429:
                 wait = _retry_after(body)
-                lim = re.search(r"Limit (\d+)", body)
-                if lim and "per minute" in low:
-                    info["learned_limit"] = int(lim.group(1))
-                if handle:
-                    gov.settle(handle, p_est if "per minute" in low else 0)   # a daily-limit refusal consumed no window tokens
-                if "per minute" in low and wait is not None and wait <= 40 and attempt < 3:
+                if "per minute" in low and wait is not None and wait <= 30 and attempt < 2:
                     log.append({"model": model, "status": f"RATE_LIMIT_429 per-minute, waiting {wait:.0f}s"})
                     time.sleep(wait + 0.5)
                     continue
                 log.append({"model": model, "status": f"RATE_LIMIT_429 {body[:140]}"})
-                break
-            if handle:
-                gov.settle(handle, 0)
-            if r.status_code == 400 and "failed_generation" in (r.text or ""):
-                fg = ""
-                try:
-                    fg = (r.json().get("error") or {}).get("failed_generation") or ""
-                except Exception:
-                    pass
-                parsed, salvaged = _parse_json_ex(fg) if fg else (None, True)
-                if valid(parsed):                                  # the model's own partial JSON still contains complete tickets/verdicts
-                    budget.used += p_est + int(len(fg) / 3)
-                    log.append({"model": model, "status": "SUCCESS (recovered from the model's partially generated JSON)"})
-                    info.update({"salvaged": True, "model": model, "status": "SUCCESS", "fallback": model != GROQ_MODELS[0]})
-                    return parsed, info
-                if json_mode:                                      # retry once without JSON mode: some models do better, the prompt still demands JSON
-                    json_mode = False
-                    log.append({"model": model, "status": "HTTP_400 JSON validation failed -> retrying without strict JSON mode"})
-                    continue
-                log.append({"model": model, "status": "HTTP_400 JSON validation failed again"})
-                break
-            if r.status_code == 404:
-                _mark_dead(model)
-                log.append({"model": model, "status": "HTTP_404 model not available on this account - skipped from now on"})
                 break
             if r.status_code in NON_RETRYABLE:
                 log.append({"model": model, "status": f"HTTP_{r.status_code} {body[:140]}"})
                 break
             log.append({"model": model, "status": f"HTTP_{r.status_code} {body[:100]} (retrying)"})
             time.sleep(2.5 * (attempt + 1))
-    if p_real_max:
-        info["actual_cpt"] = chars / p_real_max
-    info["status"] = "PROMPT_TOO_LARGE" if too_large and not info["model"] else "FAILED"
+    if too_large and budget.used == 0:
+        info["status"] = "PROMPT_TOO_LARGE"
+    elif any(a["status"].startswith("BAD_OUTPUT") for a in log):
+        info["status"] = "BAD_OUTPUT"
+    else:
+        info["status"] = "FAILED"
     return None, info
 
 
@@ -2924,7 +2391,7 @@ def optimize_tickets(match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, min_o
         fam = defaultdict(int)
         for l in legs:
             fam[l["fam"]] += 1
-        div = -0.06 * sum(max(0, c - 2) for c in fam.values()) - 0.05 * sum(1 for l in legs if l.get("tier") == "B")
+        div = -0.06 * sum(max(0, c - 2) for c in fam.values())
         return lp - 40 * max(0.0, math.log(min_odds) - lo) + div
     def total():
         return sum(tscore(t) for t in tickets)
@@ -2960,31 +2427,78 @@ def optimize_tickets(match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, min_o
 
 
 def enforce_min_odds(legs, match_legs, used, min_odds=MIN_TICKET_ODDS):
+    """Lift a ticket to the minimum odds. Prefer changing the MARKET inside a match the AI already chose; only swap in a
+    different match when no same-match option can do it."""
     fixed = False
     for _ in range(12):
         if _tprod(legs) >= min_odds:
             break
         cur = {l["mid"] for l in legs}
-        best, best_s = None, 0
+        best_same = best_any = None
+        s_same = s_any = 0.0
         for i, l in enumerate(legs):
-            opts = [dict(x, mid=l["mid"]) for x in match_legs.get(l["mid"], []) if x["odds"] > l["odds"]]
+            same = [dict(x, mid=l["mid"]) for x in match_legs.get(l["mid"], []) if x["odds"] > l["odds"]]
+            other = []
             for mid, lst in match_legs.items():
                 if mid not in used and mid not in cur:
-                    opts += [dict(x, mid=mid) for x in lst if x["odds"] > l["odds"]]
-            for o in opts:
-                gain = math.log(o["odds"] / l["odds"])
-                loss = max(1e-4, math.log(l["p_adj"]) - math.log(o["p_adj"])) + 0.02
-                s = gain / loss
-                if s > best_s:
-                    best, best_s = (i, o), s
+                    other += [dict(x, mid=mid) for x in lst if x["odds"] > l["odds"]]
+            for o, is_same in [(o, True) for o in same] + [(o, False) for o in other]:
+                sc = math.log(o["odds"] / l["odds"]) / (max(1e-4, math.log(l["p_adj"]) - math.log(o["p_adj"])) + 0.02)
+                if is_same and sc > s_same:
+                    best_same, s_same = (i, o), sc
+                if sc > s_any:
+                    best_any, s_any = (i, o), sc
+        best = best_same or best_any
         if not best:
             break
-        legs[best[0]] = dict(best[1], why="Python swap: AI ticket was below the 3.5 minimum odds", swapped=True, by="PY")
+        i, o = best
+        same = o["mid"] == legs[i]["mid"]
+        legs[i] = dict(o, swapped=True, by="AI*" if same else "PY",
+                       why=("Python price tweak: the AI's match was kept, the leg was changed to reach the 3.5 minimum odds" if same
+                            else "Python swap: the AI ticket was below the 3.5 minimum odds"))
         fixed = True
     return legs, fixed
 
 
-
+def finalize_tickets(ai, leg_index, match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, distinct=True):
+    raw = (ai or {}).get("tickets") or []
+    fallback = None
+    used, tickets = set(), []
+    for ti in range(n_tickets):
+        t = raw[ti] if ti < len(raw) and isinstance(raw[ti], dict) else {}
+        legs, repaired = [], False
+        for it in t.get("legs") or []:
+            lid = (it.get("id") if isinstance(it, dict) else str(it)) or ""
+            lg = leg_index.get(lid.strip().lower())
+            if not lg or lg["mid"] in used or lg["mid"] in {l["mid"] for l in legs}:
+                repaired = True
+                continue
+            legs.append(dict(lg, why=(it.get("why", "") if isinstance(it, dict) else ""), by="AI"))
+        legs = legs[:per]
+        if len(legs) < per:
+            repaired = True
+            if fallback is None:
+                fallback = optimize_tickets(match_legs, n_tickets=n_tickets)
+            pool_ = [l for tk in fallback for l in tk]
+            pool_ += [dict(x, mid=k) for k, v in match_legs.items() for x in v[:3]]
+            while len(legs) < per:
+                cur_m = {x["mid"] for x in legs}
+                avail = [c for c in pool_ if c["mid"] not in used and c["mid"] not in cur_m]
+                if not avail:
+                    break
+                cur, need = max(_tprod(legs), 1.0), per - len(legs)
+                target = (MIN_TICKET_ODDS * 1.03 / cur) ** (1 / need) if cur < MIN_TICKET_ODDS * 1.03 else 1.15
+                c = max(avail, key=lambda x: x["rank"] - 0.4 * max(0.0, math.log(x["odds"] / (target * 1.15))))
+                legs.append(dict(c, why="Python fill-in (AI leg missing/invalid/duplicate)", by="PY"))
+        legs, up = enforce_min_odds(legs, match_legs, used)
+        repaired = repaired or up
+        if distinct:
+            used |= {l["mid"] for l in legs}
+        tickets.append({"name": t.get("name") or TICKET_LABELS[ti], "legs": legs, "logic": t.get("logic", ""),
+                        "risk": t.get("risk", ""), "repaired": repaired, "odds": _tprod(legs),
+                        "p_joint": _tprod(legs, "p"), "valid": len(legs) == per and _tprod(legs) >= MIN_TICKET_ODDS,
+                        "ai_kept": sum(1 for l in legs if str(l.get("by", "")).startswith("AI"))})
+    return tickets
 
 
 def python_only_tickets(match_legs, n_tickets=N_TICKETS):
@@ -2998,182 +2512,6 @@ def python_only_tickets(match_legs, n_tickets=N_TICKETS):
                     "p_joint": _tprod(legs, "p"), "valid": _tprod(legs) >= MIN_TICKET_ODDS, "ai_kept": 0,
                     "logic": "Deterministic Python optimiser (AI unavailable): maximises joint probability with trap/data-quality penalties and odds >= 3.5."})
     return out
-
-
-HARD_FLAGS = {"trap-fav", "xg-rule"}
-
-
-def lint_leg(l):
-    """Checks a chosen leg against the SAME rules the AI was given. Python never invents a view; it only reports breaches."""
-    m, key = l["match"], l["key"]
-    flags = []
-    tot, lh, la = m["lam_h"] + m["lam_a"], m["lam_h"], m["lam_a"]
-    fav, risk = m["trap"]["fav"], m["trap"]["risk"]
-    if fav and key == fav and risk >= 45:
-        flags.append("trap-fav")
-    if ((key == "O1.5" and tot < 2.6) or (key == "O2.5" and tot < 3.0) or (key == "U2.5" and tot > 2.3)
-            or (key == "BTTS_N" and min(lh, la) > 0.9) or (key == "H_O1.5" and lh < 1.9) or (key == "A_O1.5" and la < 1.9)):
-        flags.append("xg-rule")
-    if key.startswith("C_") and m["dq"] < 0.6:
-        flags.append("corners-lowdq")
-    if str(l.get("by", "")).startswith("AI") and abs(l["p"] - l["p_mkt"]) > 0.08 and not l.get("vs"):
-        flags.append("gap-unexplained")
-    if l.get("tier") == "B":
-        flags.append("borderline")
-    if m["dq"] < 0.55:
-        flags.append("thin-data")
-    if not m.get("inj_known") and fav and key == fav:
-        flags.append("inj-unknown")
-    return flags
-
-
-def finish_ticket(t, per=LEGS_PER_TICKET):
-    legs = t["legs"]
-    t["odds"], t["p_joint"] = _tprod(legs), _tprod(legs, "p")
-    t["valid"] = len(legs) == per and t["odds"] >= MIN_TICKET_ODDS
-    t["ai_kept"] = sum(1 for l in legs if str(l.get("by", "")).startswith("AI"))
-    t["py_legs"] = sum(1 for l in legs if l.get("by") == "PY")
-    fam = defaultdict(int)
-    for l in legs:
-        l["flags"] = lint_leg(l)
-        fam[l["fam"]] += 1
-    t["stacked"] = any(c >= 4 for c in fam.values())
-    return t
-
-
-def parse_ai_tickets(ai, leg_index, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, distinct=True):
-    """Keeps ONLY what the AI chose and what is valid (real id, distinct matches). No Python fill here."""
-    raw = (ai or {}).get("tickets") or []
-    used, tickets = set(), []
-    for ti in range(n_tickets):
-        t = raw[ti] if ti < len(raw) and isinstance(raw[ti], dict) else {}
-        legs, repaired = [], False
-        for it in t.get("legs") or []:
-            d = it if isinstance(it, dict) else {"id": str(it)}
-            lg = leg_index.get(str(d.get("id") or "").strip().lower())
-            if not lg or lg["mid"] in used or lg["mid"] in {l["mid"] for l in legs}:
-                repaired = True
-                continue
-            legs.append(dict(lg, why=d.get("why", ""), fail=d.get("fail", ""), vs=d.get("vs", ""), by="AI"))
-        if len(legs) > per:
-            legs, repaired = legs[:per], True
-        if distinct:
-            used |= {l["mid"] for l in legs}
-        tickets.append({"name": t.get("name") or TICKET_LABELS[min(ti, 2)], "legs": legs, "logic": t.get("logic", ""),
-                        "risk": t.get("risk", ""), "repaired": repaired, "audit_swaps": 0})
-    return tickets
-
-
-def apply_audit(tickets, aud, leg_index, match_legs, per=LEGS_PER_TICKET, distinct=True):
-    """Applies the risk officer's verdicts: annotate legs, execute valid swaps, fill gaps. Returns a list of human-readable changes."""
-    changes = []
-    verdict = {}
-    for v in (aud or {}).get("legs") or []:
-        if isinstance(v, dict) and v.get("id"):
-            verdict[str(v["id"]).strip().lower()] = v
-    for t in tickets:
-        for l in t["legs"]:
-            v = verdict.get(l["id"].lower())
-            if v:
-                l["audit"] = {"ok": bool(v.get("ok", True)), "risk": str(v.get("risk", "") or "")[:6], "issue": str(v.get("issue", "") or "")[:140]}
-
-    def others(t, leg=None):
-        return {x["mid"] for x in t["legs"] if x is not leg}
-
-    def taken_elsewhere(t):
-        return {x["mid"] for tt in tickets if tt is not t for x in tt["legs"]} if distinct else set()
-
-    for sw in (aud or {}).get("swaps") or []:
-        if not isinstance(sw, dict):
-            continue
-        old, new = str(sw.get("old") or "").strip().lower(), leg_index.get(str(sw.get("new") or "").strip().lower())
-        if not new:
-            continue
-        for t in tickets:
-            for i, l in enumerate(t["legs"]):
-                if l["id"].lower() != old or l["id"].lower() == new["id"].lower():
-                    continue
-                if new["mid"] != l["mid"] and (new["mid"] in others(t, l) or new["mid"] in taken_elsewhere(t)):
-                    continue
-                cand = dict(new, why=(l.get("why") or "") + " | audit swap", fail=l.get("fail", ""), vs="", by="AI2",
-                            audit={"ok": True, "risk": "", "issue": (l.get("audit") or {}).get("issue", "")})
-                trial = t["legs"][:i] + [cand] + t["legs"][i + 1:]
-                if _tprod(trial) < MIN_TICKET_ODDS <= _tprod(t["legs"]):
-                    continue
-                t["legs"] = trial
-                t["audit_swaps"] = t.get("audit_swaps", 0) + 1
-                changes.append(f"{l['id']} -> {new['id']}")
-                break
-    for fl in (aud or {}).get("fills") or []:
-        if not isinstance(fl, dict):
-            continue
-        try:
-            ti = int(fl.get("t")) - 1
-        except Exception:
-            continue
-        new = leg_index.get(str(fl.get("id") or "").strip().lower())
-        if not new or not (0 <= ti < len(tickets)):
-            continue
-        t = tickets[ti]
-        if len(t["legs"]) >= per or new["mid"] in others(t) or new["mid"] in taken_elsewhere(t):
-            continue
-        t["legs"].append(dict(new, why="audit gap-fill", fail="", vs="", by="AI2", audit={"ok": True, "risk": "", "issue": ""}))
-        changes.append(f"gap-fill T{ti + 1}: {new['id']}")
-    return changes
-
-
-def py_fix_breaches(tickets, match_legs):
-    """Safety net: a leg that breaks one of the AI's OWN hard rules is replaced by the best clean alternative from the same match."""
-    fixed = []
-    for t in tickets:
-        for i, l in enumerate(t["legs"]):
-            hard = [f for f in lint_leg(l) if f in HARD_FLAGS]
-            if not hard:
-                continue
-            alts = [x for x in match_legs.get(l["mid"], []) if x["key"] != l["key"] and not [f for f in lint_leg(x) if f in HARD_FLAGS]
-                    and x["tier"] == "S"]
-            if not alts:
-                continue
-            best = max(alts, key=lambda x: x["p_adj"])
-            trial = t["legs"][:i] + [dict(best, why=f"Python rule-fix: '{l['label']}' broke rule {hard[0]}", fail="", vs="", by="PY")] + t["legs"][i + 1:]
-            if _tprod(trial) < MIN_TICKET_ODDS <= _tprod(t["legs"]):
-                continue
-            t["legs"] = trial
-            t["repaired"] = True
-            fixed.append(f"{l['id']} -> {best['id']} ({hard[0]})")
-    return fixed
-
-
-def complete_tickets(tickets, match_legs, per=LEGS_PER_TICKET, distinct=True):
-    """Python completes only what is still missing, and labels every leg it supplies (by='PY')."""
-    fallback = None
-    n = len(tickets)
-    for ti, t in enumerate(tickets):
-        legs = t["legs"]
-        taken_other = {l["mid"] for tj, tk in enumerate(tickets) if tj != ti for l in tk["legs"]} if distinct else set()
-        if len(legs) < per:
-            t["repaired"] = True
-            if fallback is None:
-                fallback = optimize_tickets(match_legs, n_tickets=max(1, n))
-            pool_ = [l for tk in fallback for l in tk] + [dict(x, mid=k) for k, v in match_legs.items() for x in v[:3]]
-            while len(legs) < per:
-                cur_m = {x["mid"] for x in legs}
-                avail = [c for c in pool_ if c["mid"] not in taken_other and c["mid"] not in cur_m]
-                if not avail:
-                    break
-                cur, need = max(_tprod(legs), 1.0), per - len(legs)
-                target = (MIN_TICKET_ODDS * 1.03 / cur) ** (1 / need) if cur < MIN_TICKET_ODDS * 1.03 else 1.15
-                c = max(avail, key=lambda x: x["rank"] - 0.4 * max(0.0, math.log(x["odds"] / (target * 1.15))))
-                legs.append(dict(c, why="Python fill-in (AI leg missing/invalid/duplicate)", fail="", vs="", by="PY"))
-        legs, up = enforce_min_odds(legs, match_legs, taken_other)
-        t["legs"] = legs
-        t["repaired"] = bool(t.get("repaired") or up)
-        finish_ticket(t, per)
-    return tickets
-
-
-def finalize_tickets(ai, leg_index, match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, distinct=True):
-    return complete_tickets(parse_ai_tickets(ai, leg_index, n_tickets, per, distinct), match_legs, per, distinct)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3202,7 +2540,45 @@ def send_telegram(text):
     return True, "sent"
 
 
-
+def build_telegram_message(res, tz):
+    nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    L = [f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])} | {res['n_analysed']} matches analysed | {res['n_ai']} sent to AI"]
+    thin_total = sum(t.get("thin", 0) for t in res["tickets"])
+    if thin_total:
+        L.append(f"⚠️ <b>Thin-data warning:</b> {thin_total} of {sum(len(t['legs']) for t in res['tickets'])} legs rest on competition averages or relaxed thresholds (marked ⚠️). Treat them as higher risk.")
+    if res.get("est_mode"):
+        L.append("⚠️ <b>Approximate odds:</b> bookmaker prices were unavailable for some legs, so odds are model-estimated. Bookmakers differ slightly - confirm the price on yours.")
+    for t in res["tickets"]:
+        ok = "✅" if t["valid"] else "⚠️"
+        s = f"🎟 <b>{_esc(t['name'])}</b> {ok}\nOdds <b>{t['odds']:.2f}</b> | joint prob ~{_pct(t['p_joint'])}% | risk {_esc(t.get('risk') or '-')} | evidence {t.get('grade', '?')} | 🤖 AI-chosen legs {t.get('ai_kept', 0)}/{len(t['legs'])}"
+        for i, l in enumerate(t["legs"]):
+            m = l["match"]
+            ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
+            s += (f"\n{nums[i]} <i>{_esc(_short(m['league'], 22))}</i> {ko}\n   {_esc(m['home'])} v {_esc(m['away'])}\n"
+                  f"   ➜ {'⚠️ ' if (m['basis'] == 'prior' or l.get('rx')) else ''}<b>{_esc(l['label'])}</b> @{l['odds']:.2f}{' (books ' + format(l['odds_lo'], '.2f') + '-' + format(l['odds_hi'], '.2f') + ')' if l.get('odds_lo') else ''} (p {_pct(l['p'])}%{' est.odds' if l.get('src') == 'est' else ''})")
+            if l.get("why"):
+                s += f"\n   💡 {_esc(l['why'])}"
+        if t.get("logic"):
+            s += f"\n\n🧠 {_esc(t['logic'])}"
+        if t.get("repaired"):
+            s += "\n🔧 Python adjusted this ticket (invalid/duplicate leg or odds<3.5)."
+        L.append(s)
+    ai = res.get("ai") or {}
+    if ai.get("traps"):
+        L.append("🪤 <b>Trap watch</b>\n" + "\n".join(f"• {_esc(res['id_map'][x['id']]['home'])} v {_esc(res['id_map'][x['id']]['away'])}: {_esc(x.get('note'))}"
+                                                    for x in ai["traps"][:4] if x.get("id") in res["id_map"]))
+    if ai.get("avoid"):
+        L.append("🚫 <b>Avoid</b>\n" + "\n".join(f"• {_esc(res['id_map'][x['id']]['home'])} v {_esc(res['id_map'][x['id']]['away'])}: {_esc(x.get('why'))}"
+                                                 for x in ai["avoid"][:4] if x.get("id") in res["id_map"]))
+    if ai.get("summary"):
+        L.append(f"📝 <b>Slate read</b>\n{_esc(ai['summary'])}")
+    if not res.get("model"):
+        L.append("ℹ️ <b>AI reasoning was not applied</b> - these tickets come from the Python Monte Carlo optimiser only."
+                 + (f" ({_esc(res.get('ai_note'))[:180]})" if res.get("ai_note") else ""))
+    foot = (f"🤖 {_esc(res.get('model') or 'Python optimiser')} | tokens {res.get('tokens', 0)}/{TOTAL_TOKEN_BUDGET} | "
+            f"API calls {res.get('api_calls', 0)} | ⚠️ Odds shown are bookmaker snapshots; betting carries risk.")
+    L.append(foot)
+    return "\n\n".join(L)
 
 
 def build_aifail_message(res, tz):
@@ -3219,81 +2595,6 @@ def build_nobet_message(res, tz):
     return (f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])}\n\n🛑 <b>NO BET TODAY</b>\n{_esc(res.get('reason'))}"
             + (f"\n\n<b>Why matches were excluded</b>\n{lines}" if lines else "")
             + f"\n\nAPI calls used: {res.get('api_calls', 0)}. No tickets are better than tickets built on guesses.")
-
-
-def _flag_txt(l):
-    show = [f for f in (l.get("flags") or []) if f in HARD_FLAGS or f in ("gap-unexplained", "thin-data", "inj-unknown", "corners-lowdq")]
-    return ("⚠ " + ",".join(show)) if show else ""
-
-
-def _by_txt(l):
-    b = str(l.get("by") or "")
-    return "🤖✓ AI+audit" if b == "AI2" else "🤖 AI" if b == "AI" else "🐍 Python" if b == "PY" else ""
-
-
-def build_telegram_message(res, tz):
-    nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-    L = [f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])} | {res['n_analysed']} matches analysed | {res['n_ai']} studied by the AI desk"]
-    if res.get("fallback_model"):
-        L.append("⚠️ <b>A smaller fallback AI model took part</b> (the top model was rate-limited). Treat this slate with extra caution or re-run later.")
-    if res.get("relaxed"):
-        L.append("⚠️ <b>Thin slate - safety thresholds relaxed:</b> " + _esc("; ".join(res["relaxed"])) + ". Stakes should be smaller than usual.")
-    if res.get("est_mode"):
-        L.append("⚠️ <b>Approximate odds:</b> bookmaker prices were unavailable for some legs, so odds are model-estimated. Confirm the price on your bookmaker.")
-    for t in res["tickets"]:
-        ok = "✅" if t["valid"] else "⚠️"
-        s = (f"🎟 <b>{_esc(t['name'])}</b> {ok}\nOdds <b>{t['odds']:.2f}</b> | joint prob ~{_pct(t['p_joint'])}% | risk {_esc(t.get('risk') or '-')} | evidence {t.get('grade', '?')}"
-             f" | 🤖 AI legs {t.get('ai_kept', 0)}/{len(t['legs'])}" + (f" | 🐍 Python legs {t.get('py_legs', 0)}" if t.get("py_legs") else ""))
-        for i, l in enumerate(t["legs"]):
-            m = l["match"]
-            ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
-            px = ""
-            if l.get("src") == "est":
-                px = " est.odds"
-            elif l.get("src") == "derived":
-                px = " derived odds"
-            s += (f"\n{nums[i]} <i>{_esc(_short(m['league'], 22))}</i> {ko}\n   {_esc(m['home'])} v {_esc(m['away'])}\n"
-                  f"   ➜ <b>{_esc(l['label'])}</b> @{l['odds']:.2f}{' (books ' + format(l['odds_lo'], '.2f') + '-' + format(l['odds_hi'], '.2f') + ')' if l.get('odds_lo') else ''}"
-                  f" (p {_pct(l['p'])}%{px}) {_by_txt(l)}")
-            if l.get("why"):
-                s += f"\n   💡 {_esc(l['why'])}"
-            if l.get("fail"):
-                s += f"\n   🧯 loses if: {_esc(l['fail'])}"
-            au = l.get("audit") or {}
-            if au.get("issue") and (not au.get("ok", True) or au.get("risk") in ("MED", "HIGH")):
-                s += f"\n   🔎 audit: {_esc(au['issue'])}"
-            ft = _flag_txt(l)
-            if ft:
-                s += f"\n   {_esc(ft)}"
-        if t.get("logic"):
-            s += f"\n\n🧠 {_esc(t['logic'])}"
-        if t.get("repaired"):
-            s += "\n🔧 Python completed/adjusted part of this ticket (🐍 legs): AI leg missing/invalid, rule breach or odds below 3.5."
-        L.append(s)
-    ai = res.get("ai") or {}
-    traps = [f"• {_esc(res['id_map'][x['id']]['home'])} v {_esc(res['id_map'][x['id']]['away'])}: {_esc(x.get('note'))}"
-             for x in (ai.get("traps") or [])[:4] if x.get("id") in res["id_map"]]
-    traps += [f"• {_esc(x['match'])}: {_esc(x.get('note'))}" for x in ((res.get("scout") or {}).get("traps") or [])[:3]]
-    if traps:
-        L.append("🪤 <b>Trap watch</b>\n" + "\n".join(traps[:6]))
-    if ai.get("avoid"):
-        L.append("🚫 <b>Avoid</b>\n" + "\n".join(f"• {_esc(res['id_map'][x['id']]['home'])} v {_esc(res['id_map'][x['id']]['away'])}: {_esc(x.get('why'))}"
-                                                 for x in ai["avoid"][:4] if x.get("id") in res["id_map"]))
-    if ai.get("audit_note"):
-        L.append(f"🕵️ <b>Risk officer</b>\n{_esc(ai['audit_note'])}")
-    if ai.get("summary"):
-        L.append(f"📝 <b>Slate read</b>\n{_esc(ai['summary'])}")
-    if not res.get("model"):
-        L.append("ℹ️ <b>AI reasoning was not applied</b> - these tickets come from the Python Monte Carlo optimiser only (🐍)."
-                 + (f" ({_esc(res.get('ai_note'))[:180]})" if res.get("ai_note") else ""))
-    ps = "/".join(p["pass"].split(" ")[0] for p in res.get("passes", []) if p.get("status") == "SUCCESS") or "-"
-    foot = (f"🤖 {_esc(res.get('model') or 'Python optimiser')} | passes {ps} | AI tokens {res.get('tokens', 0)} | "
-            f"API calls {res.get('api_calls', 0)}" + (f" | 🆓 free sources used" if (res.get("free") or {}).get("used") else "")
-            + " | ⚠️ Odds are bookmaker snapshots; betting carries risk.")
-    L.append(foot)
-    return "\n\n".join(L)
-
-
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -3353,27 +2654,13 @@ def evaluate_leg(key, f):
     return val > line if ou == "O" else val < line
 
 
-def settle_history(api, state, free=None):
-    """Settles the ledger. Goal/HT/corner results come from football-data.co.uk first (free); API-Football only for what is left."""
-    free = free or FreeData(enabled=True)
-    free.target_date = datetime.now(timezone.utc).date().isoformat()
-    pend = [(e, l) for e in state["history"] if e.get("status") != "SETTLED" for t in e["tickets"] for l in t["legs"] if l.get("result") is None]
-    for e, l in pend:
-        home, away = l.get("home"), l.get("away")
-        if not home and " v " in (l.get("match") or ""):
-            home, away = l["match"].split(" v ", 1)
-        if home and away and l.get("league_id") in FD_ALL:
-            f = free.result_for(home, away, l["league_id"], e["date"])
-            if f:
-                l["result"] = evaluate_leg(l["key"], f)
-    ids = sorted({l["fid"] for e in state["history"] if e.get("status") != "SETTLED" for t in e["tickets"] for l in t["legs"]
-                  if l.get("result") is None and isinstance(l.get("fid"), int) and l["fid"] > 0})
+def settle_history(api, state):
+    ids = sorted({l["fid"] for e in state["history"] if e.get("status") != "SETTLED" for t in e["tickets"] for l in t["legs"] if l.get("result") is None})
     fx = {}
-    if not api.offline:
-        for i in range(0, len(ids), 20):
-            for f in api.resp("/fixtures", {"ids": "-".join(map(str, ids[i:i + 20]))}, ttl=0):
-                if ((f.get("fixture") or {}).get("status") or {}).get("short") in PLAYED_OK:
-                    fx[f["fixture"]["id"]] = f
+    for i in range(0, len(ids), 20):
+        for f in api.resp("/fixtures", {"ids": "-".join(map(str, ids[i:i + 20]))}, ttl=0):
+            if ((f.get("fixture") or {}).get("status") or {}).get("short") in PLAYED_OK:
+                fx[f["fixture"]["id"]] = f
     for e in state["history"]:
         alive = False
         for t in e["tickets"]:
@@ -3390,94 +2677,111 @@ def settle_history(api, state, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # Orchestrator (runs on the Analyse click)
 # ═════════════════════════════════════════════════════════════════════════════
+class _NoApi:
+    calls = 0
+    cache_hits = 0
+    remaining = None
+    limit = None
+
+    def error_summary(self):
+        return []
+
+
 def run_full_analysis(cfg, log, progress):
     t0 = time.time()
+    source = cfg.get("source", "Auto")
     api_key = get_secret("API_FOOTBALL_KEY") or get_secret("APISPORTS_KEY")
-    free = FreeData(enabled=bool(cfg.get("use_free", True)))
-    if not api_key and not free.enabled:
-        return {"error": "API_FOOTBALL_KEY is not set (get one at https://dashboard.api-football.com) and free sources are switched off."}
-    api = ApiFootball(api_key or "", per_minute=10)
-    stt = api.status()
-    plan = (stt.get("plan") or "Free")
-    per_min = 10 if str(plan).lower() == "free" else 280
-    api.rate = RateLimiter(cfg["rate_override"] or per_min)
-    cfg = dict(cfg, workers=3 if per_min <= 10 else 8)
-    log(f"🔑 API-Football plan: {plan if api_key else 'no key (free sources only)'} | used {stt.get('used')}/{stt.get('limit')} today")
-
-    data = collect_day(api, cfg, log, progress, free)
+    if not cfg.get("strict_gate"):                  # never-stop mode: estimated odds fill in where no prices exist
+        cfg = dict(cfg, allow_est=True)
+    data, used, api = None, None, _NoApi()
+    if source in ("Auto", "ESPN"):
+        log("🌐 Data source: ESPN public data (free, no API key, no daily quota)")
+        try:
+            data, used = collect_day_espn(cfg, log, progress), "ESPN"
+        except Exception:
+            log("   ⚠️ ESPN collection failed: " + traceback.format_exc().strip().splitlines()[-1])
+            data = None
+        if data is not None and len(data["matches"]) < LEGS_PER_TICKET:
+            log(f"   ESPN gave only {len(data['matches'])} usable matches" + (" - also trying API-Football" if (source == "Auto" and api_key) else ""))
+    if source in ("Auto", "API-Football") and (data is None or len(data["matches"]) < LEGS_PER_TICKET) and api_key:
+        api = ApiFootball(api_key, per_minute=10)
+        stt = api.status()
+        plan = (stt.get("plan") or "Free")
+        per_min = 10 if str(plan).lower() == "free" else 280
+        api.rate = RateLimiter(cfg["rate_override"] or per_min)
+        log(f"🔑 API-Football plan: {plan} | used {stt.get('used')}/{stt.get('limit')} today")
+        data2 = collect_day(api, dict(cfg, workers=3 if per_min <= 10 else 8), log, progress)
+        if data is None or len(data2["matches"]) > len(data["matches"]):
+            data, used = data2, "API-Football"
+    if data is None:
+        return {"error": "No data source produced results: ESPN was unavailable or not selected, and API_FOOTBALL_KEY is not set. "
+                         "Open Settings -> 'Test data sources' to see what your machine can reach."}
     matches = data["matches"]
 
     def result(**kw):
         base = {"date": cfg["date"], "tickets": [], "ai": None, "model": None, "info": {"attempts": []}, "tokens": 0,
                 "n_analysed": len(matches), "n_ai": 0, "matches": matches, "id_map": {}, "user_prompt": "",
-                "api_calls": api.calls, "cache_hits": api.cache_hits, "warnings": data["warnings"], "est_mode": False,
+                "api_calls": data.get("calls", api.calls), "cache_hits": data.get("cache_hits", api.cache_hits), "warnings": data["warnings"], "est_mode": False, "source": used,
                 "cat_counts": data["cat_counts"], "plan": data["plan"], "deep": data.get("deep"),
-                "api_errors": api.error_summary(), "seconds": round(time.time() - t0, 1),
-                "excluded": data["excluded"], "no_bet": False, "reason": "", "caps": data.get("caps"), "ai_failed": False,
-                "python_draft": None, "ai_note": "", "cfg": cfg, "quota": (api.remaining, api.limit),
-                "free": free.summary(), "relaxed": [], "passes": [], "fallback_model": False, "scout": None, "audit_changes": [], "rule_fixes": []}
+                "api_errors": data.get("errors", api.error_summary()), "seconds": round(time.time() - t0, 1),
+                "excluded": data["excluded"], "no_bet": False, "reason": "", "caps": data.get("caps"), "ai_failed": False, "python_draft": None, "ai_note": "", "cfg": cfg, "quota": (api.remaining, api.limit)}
         base.update(kw)
         return base
 
     if not matches:
         return result(no_bet=True, reason=data.get("reason") or "No matches could be analysed.")
 
-    # ── legs + evidence gate, with an automatic relaxation ladder so the slate always yields tickets if at all possible ──
-    def run_gate(c):
-        el = []
+    # ── legs, relaxed step by step so the analysis NEVER stops for lack of data ──
+    strict = bool(cfg.get("strict_gate"))
+    for m in matches:
+        m["legs"], m["relax"] = build_legs(m, allow_est=cfg["allow_est"]), 0
+
+    def eligible_list():
+        out_ = []
         for m in matches:
-            m["legs"] = build_legs(m, allow_est=c["allow_est"], wide=c.get("wide_menu", True))
-            why = gate_reasons(m, c)
+            why = gate_reasons(m, cfg)
             m["eligible"], m["excl"] = (not why), "; ".join(why)
             if not why:
-                el.append(m)
-        return el
-
-    cur = dict(cfg)
-    elig = run_gate(cur)
-    need_all, relaxed = N_TICKETS * LEGS_PER_TICKET, []
-    if cfg.get("auto_relax", True) and len(elig) < need_all:
-        for label, upd in (("minimum data quality lowered to 0.40", {"min_dq": min(cfg["min_dq"], 0.40)}),
-                           ("matches with only borderline legs allowed", {"allow_b_only": True}),
-                           ("model-estimated odds allowed for matches without prices", {"allow_est": True})):
-            if len(elig) >= need_all:
+                out_.append(m)
+        return out_
+    elig = eligible_list()
+    need_matches = N_TICKETS * LEGS_PER_TICKET
+    if not strict:
+        for lvl in (1, 2):
+            if len(elig) >= need_matches:
                 break
-            trial = dict(cur, **upd)
-            new = run_gate(trial)
-            if len(new) > len(elig):
-                cur, elig = trial, new
-                relaxed.append(label)
-            else:
-                elig = run_gate(cur)
-        if len(elig) < need_all and len(elig) >= 8 and not cur.get("allow_reuse"):      # with <8 matches reused tickets would be near-copies
-            cur["allow_reuse"] = True
-            relaxed.append("the same match may appear in more than one ticket")
-    cur["relaxed_notes"] = bool(relaxed)
-    cfg = dict(cur, relaxed=relaxed)
+            for m in matches:
+                if not m["legs"]:
+                    lg_ = build_legs(m, allow_est=True, relax=lvl)
+                    if lg_:
+                        m["legs"], m["relax"] = lg_, lvl
+            elig = eligible_list()
+            log(f"   ↘ relaxed the safety thresholds (level {lvl}) so the analysis can continue: {len(elig)} matches now have selections")
     for m in matches:
         if not m["eligible"]:
             data["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": m["excl"]})
-    if relaxed:
-        data["warnings"].append("The slate was thin, so safety thresholds were relaxed step by step: " + "; ".join(relaxed) + ". Tickets are graded lower and the AI was told to be stricter.")
-    log(f"🛡 Evidence gate: {len(elig)}/{len(matches)} matches qualify" + (f" (after relaxing: {'; '.join(relaxed)})" if relaxed else ""))
+    thin_n = sum(1 for m in elig if m["basis"] == "prior" or m["relax"])
+    log(f"🛡 {len(elig)}/{len(matches)} matches have selections ({thin_n} rest on thin data and are labelled)")
+    reuse = bool(cfg["allow_reuse"] or (not strict and LEGS_PER_TICKET <= len(elig) < need_matches))
+    cfg = dict(cfg, allow_reuse=reuse)
     n_t = plan_ticket_count(len(elig), cfg)
     if n_t == 0:
-        tip = (f" Only ~{data.get('budget')} API calls were available this run - retry after the daily quota resets (00:00 UTC) or raise the limit."
+        tip = (f" Only ~{data.get('budget')} API calls were available this run - retry after the daily quota resets (00:00 UTC)."
                if (data.get("budget") or 999) < 60 else "")
-        return result(no_bet=True, cfg=cfg, relaxed=relaxed,
-                      reason=f"Only {len(elig)} match(es) passed the evidence gate even after relaxing; a 5-leg ticket needs at least 5. "
-                             "Betting on thin data would just be guessing, so nothing is recommended." + tip)
-    if n_t < N_TICKETS:
-        data["warnings"].append(f"Only {len(elig)} matches qualified, so {n_t} ticket(s) were built instead of {N_TICKETS} (no match is reused).")
+        return result(no_bet=True, reason=f"Only {len(elig)} match(es) have any selection at all; a 5-leg ticket needs at least 5 different matches." + tip)
+    if reuse and len(elig) < need_matches:
+        data["warnings"].append(f"Only {len(elig)} matches have selections, so some matches appear in more than one ticket (with different legs where possible).")
+    if thin_n:
+        data["warnings"].append(f"{thin_n} of the {len(elig)} matches rest on thin data (competition averages or relaxed thresholds). Their legs are marked ⚠️ - treat them as higher risk.")
 
     stage = run_ai_stage(elig, n_t, cfg, log, progress)
     data["warnings"] += stage["warnings"]
-    res = result(tickets=stage["tickets"], ai=stage["ai"], model=stage["model"], info=stage["info"], tokens=stage["tokens"], n_ai=len(stage["sel"]),
+    tickets = stage["tickets"]
+    res = result(tickets=tickets, ai=stage["ai"], model=stage["model"], info=stage["info"], tokens=stage["tokens"], n_ai=len(stage["sel"]),
                  id_map=stage["id_map"], user_prompt=stage["user_prompt"], est_mode=stage["est_mode"], ai_note=stage["ai_note"],
-                 ai_failed=stage["ai_failed"], python_draft=stage["python_draft"], cfg=cfg, relaxed=relaxed, passes=stage["passes"],
-                 fallback_model=stage["fallback_model"], scout=stage["scout"], audit_changes=stage["audit_changes"], rule_fixes=stage["rule_fixes"])
-    if stage["tickets"]:
-        save_tickets_to_ledger(cfg["date"], stage["tickets"])
+                 ai_failed=stage["ai_failed"], python_draft=stage["python_draft"], cfg=cfg)
+    if tickets:
+        save_tickets_to_ledger(cfg["date"], tickets)
     return res
 
 
@@ -3494,227 +2798,93 @@ def save_tickets_to_ledger(date_str, tickets):
         "created": datetime.now(timezone.utc).isoformat(), "date": date_str, "status": "PENDING",
         "tickets": [{"name": t["name"], "odds": round(t["odds"], 2), "outcome": "PENDING", "grade": t.get("grade"),
                      "legs": [{"fid": l["fid"], "key": l["key"], "label": l["label"], "odds": round(l["odds"], 2),
-                               "p": round(l["p"], 3), "by": l.get("by"), "match": f"{l['match']['home']} v {l['match']['away']}",
-                               "home": l["match"]["home"], "away": l["match"]["away"], "league_id": l["match"].get("league_id"), "result": None}
+                               "p": round(l["p"], 3), "by": l.get("by"), "match": f"{l['match']['home']} v {l['match']['away']}", "result": None}
                               for l in t["legs"]]} for t in tickets]})
     state["history"] = state["history"][-60:]
     save_state(state)
 
 
-def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
-    """AI-first pipeline: SCOUT (orders the matches) -> one DESK call PER TICKET -> AUDIT, all paced by the per-minute token governor.
-    One call per ticket keeps every request inside Groq's per-request limit while the AI still sees full evidence for ~8 matches at a time.
-    Python verifies, lints and labels; it supplies a leg only when the AI could not (always marked 🐍)."""
+def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None, hint=""):
+    """The AI gets the FIRST attempt at choosing every leg. Python only verifies/repairs. If the AI fails, no ticket is produced
+    unless the user explicitly allows a Python-only fallback."""
     warnings = []
     state = load_state()
-    tpm = int(min(int(cfg.get("tpm", GROQ_TPM_DEFAULT)), int(state.get("tpm_limit", 10 ** 9))))
-    ceiling = max(3500, tpm - TPM_MARGIN)
-    gov = TpmGovernor(max(ceiling + 50, tpm - WINDOW_MARGIN))
-    budget = TokenBudget(int(cfg.get("run_tokens", RUN_TOKEN_CAP_DEFAULT)))
-    cpt = min(max(float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN)) * 0.95, 1.9), 3.2)
-    need, reuse = n_t * LEGS_PER_TICKET, bool(cfg["allow_reuse"])
-    distinct = not reuse
-    eff = cfg.get("effort") if cfg.get("effort") in EFFORT_RESERVE else "medium"
-    use_ai = cfg["use_ai"]
-    n_ai = max(int(cfg.get("n_ai", 28)), need)
-    passes, attempts, learned, cpt_obs = [], [], [], []
+    cpt = min(max(float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN)) * 0.95, 2.4), 3.6)
+    sys_p = system_prompt(n_t, cfg["allow_reuse"])
+    top_mo = sorted((max(l["odds"] for l in m["legs"]) for m in elig if m["legs"]), reverse=True)[: n_t * LEGS_PER_TICKET]
+    if top_mo and math.exp(sum(math.log(x) for x in top_mo) / len(top_mo)) ** LEGS_PER_TICKET < MIN_TICKET_ODDS * 1.08:
+        for m in elig:
+            have = {l["key"] for l in m["legs"]}
+            m["legs"] = m["legs"] + [l for l in build_legs(m, allow_est=True, relax=3) if l["key"] not in have][:4]
+        log("   ℹ️ The safe legs alone cannot reach 3.5 odds, so higher-priced '*' legs were added to the options the AI can choose from (lower confidence).")
+    eff = cfg.get("effort") if cfg.get("effort") in EFFORT_RESERVE else "low"
 
-    def record(label, info):
-        passes.append({"pass": label, "model": info.get("model"), "prompt": info.get("prompt_tokens", 0),
-                       "completion": info.get("completion_tokens", 0), "status": info.get("status"), "waited": round(info.get("waited", 0.0)),
-                       "fallback": bool(info.get("fallback"))})
-        for a in info.get("attempts", []):
-            attempts.append(dict(a, **{"pass": label}))
-        if info.get("learned_limit"):
-            learned.append(info["learned_limit"])
-        if info.get("actual_cpt"):
-            cpt_obs.append(info["actual_cpt"])
-
-    # ── PASS 1: SCOUT - the AI orders the qualified matches best-first (it also re-measures the real token density) ──
-    ordered = rank_matches(elig)
-    scout_info = None
-    k_keep = min(len(ordered), need + 6)
-    if use_ai and cfg.get("two_pass", True) and len(ordered) > need + 2:
-        pool = ordered[:max(n_ai, k_keep + 1)]
-        sys_sc = scout_prompt(len(pool), k_keep, n_t, need)
-        s_sel, s_ids, s_user = build_scout_pack(pool, cfg["tz"], cpt, sys_sc, SCOUT_RESERVE, ceiling)
-        if s_sel:
-            log(f"🔭 AI scout: reading a compact view of {len(s_sel)} qualified matches and choosing the {k_keep} best, ranked...")
-            sc, sinfo = call_groq_budgeted(sys_sc, s_user, budget, cpt, "low", gov, ceiling, "keep", log, "scout")
-            record("scout", sinfo)
-            if sinfo.get("actual_cpt"):
-                cpt = min(cpt, max(1.8, sinfo["actual_cpt"] * 0.97))
-            if sc:
-                chosen = []
-                for x in sc.get("keep") or []:
-                    mm = s_ids.get(str(x).strip().lower())
-                    if mm is not None and mm not in chosen:
-                        chosen.append(mm)
-                chosen = chosen[:k_keep]
-                topped = 0
-                for mm in rank_matches(s_sel):
-                    if len(chosen) >= need:
-                        break
-                    if mm not in chosen:
-                        chosen.append(mm)
-                        topped += 1
-                ordered = chosen
-                nm = lambda aid: (lambda mm: f"{mm['home']} v {mm['away']}" if mm else None)(s_ids.get(str(aid).strip().lower()))
-                scout_info = {"model": sinfo.get("model"), "kept": len(chosen), "of": len(s_sel), "topped_up": topped,
-                              "drops": [{"match": nm(x.get("id")), "why": x.get("why")} for x in (sc.get("drop") or []) if isinstance(x, dict) and nm(x.get("id"))][:8],
-                              "traps": [{"match": nm(x.get("id")), "note": x.get("note")} for x in (sc.get("traps") or []) if isinstance(x, dict) and nm(x.get("id"))][:6]}
-                log(f"   🔭 scout kept {len(chosen)} of {len(s_sel)} matches" + (f" (+{topped} added by Python rank to reach the {need} needed)" if topped else ""))
-            else:
-                ordered = ordered[:n_ai]
-                warnings.append("The AI scout pass failed, so the desk used Python's ranking to order the matches.")
-        else:
-            ordered = ordered[:n_ai]
-    else:
-        ordered = ordered[:n_ai]
-    progress(0.92)
-
-    # global labels/legs: ids stay unique across the per-ticket calls
-    labels = {id(m): f"m{i + 1}" for i, m in enumerate(ordered)}
-    match_legs, leg_index, id_map = {}, {}, {}
-    for m in ordered:
-        mid = labels[id(m)]
-        id_map[mid] = m
-        lst = [dict(l, mid=mid, fid=m["id"], match=m, id=f"{mid}.{l['key']}") for l in m["legs"]]
-        match_legs[mid] = lst
-        for l2 in lst:
-            leg_index[l2["id"].lower()] = l2
-
-    def pack_for_call(avail, sys_i, cpt_, extra):
-        floor = min(8, len(avail))
+    def make_pack(cpt_):
         for eff_try in [e for e in ("high", "medium", "low") if EFFORT_RESERVE[e] <= EFFORT_RESERVE[eff]]:
             reserve = EFFORT_RESERVE[eff_try]
-            sel_, idm_, user_, n_legs_, detail_ = build_ai_pack(avail, cfg["tz"], cpt_, sys_i, floor, reserve, ceiling, labels, extra)
-            if est_tokens(sys_i + user_, cpt_) <= ceiling - reserve - TOKEN_SAFETY:
+            sel_, id_map_, user_, n_legs_ = build_ai_pack(elig, cfg["tz"], cpt_, cfg["n_ai"], sys_p, n_t * LEGS_PER_TICKET, reserve)
+            if est_tokens(sys_p + user_, cpt_) <= TOTAL_TOKEN_BUDGET - reserve - TOKEN_SAFETY:
                 break
-        return sel_, idm_, user_, n_legs_, detail_, eff_try
+        ml_, li_ = {}, {}
+        for mid, m in id_map_.items():
+            lst = []
+            for l in m["legs"]:
+                l2 = dict(l, mid=mid, fid=m["id"], match=m, id=f"{mid}.{l['key']}")
+                lst.append(l2)
+                li_[l2["id"].lower()] = l2
+            have = {l["key"] for l in m["legs"]}                      # stretch legs: lower-probability options that Python may use
+            for l in build_legs(m, allow_est=True, relax=3):          # ONLY to reach the 3.5 minimum odds (flagged as thin-data legs)
+                if l["key"] not in have:
+                    l2 = dict(l, mid=mid, fid=m["id"], match=m, id=f"{mid}.{l['key']}", stretch=True)
+                    lst.append(l2)
+                    li_[l2["id"].lower()] = l2
+            ml_[mid] = lst
+        return sel_, id_map_, user_, n_legs_, eff_try, ml_, li_
 
-    # ── PASS 2: DESK - one focused call per ticket ──
-    ai_tickets, ai_traps, ai_avoid, ai_summ, shown, prompts = [], [], [], [], [], []
-    used_labels, model_used, last_info = set(), None, {"attempts": []}
-    if use_ai:
-        for ti in range(n_t):
-            avail = ([m for m in ordered if labels[id(m)] not in used_labels] if distinct
-                     else sorted(ordered, key=lambda m: labels[id(m)] in used_labels))
-            if len(avail) < LEGS_PER_TICKET:
-                warnings.append(f"Ticket {ti + 1}: fewer than {LEGS_PER_TICKET} unused matches were left, so the AI could not build it; it was completed/verified by Python.")
-                ai_tickets.append({})
-                continue
-            extra = ""
-            if reuse and ti > 0:
-                extra = "EARLIER TICKETS (do not copy): " + "; ".join(f"T{k + 1}: " + ",".join(x["id"] for x in tk.get("_legs", [])) for k, tk in enumerate(ai_tickets) if tk) + "\n"
-            sys_i = desk_prompt(ti, n_t, reuse, bool(cfg.get("relaxed_notes")))
-            log(f"🤖 AI desk - ticket {ti + 1} of {n_t}: studying the best candidate matches in full detail (Python only verifies afterwards)...")
-            ai_i, info_i, sel_i, idm_i, user_i = None, {"attempts": []}, [], {}, ""
-            for rebuild in range(2):
-                sel_i, idm_i, user_i, n_legs, detail, eff_try = pack_for_call(avail, sys_i, cpt, extra)
-                if rebuild == 0:
-                    log(f"   📦 pack: {len(sel_i)} matches x {n_legs} legs (detail {detail}/3), est. prompt {est_tokens(sys_i + user_i, cpt)} tokens, effort '{eff_try}'")
-                ai_i, info_i = call_groq_budgeted(sys_i, user_i, budget, cpt, eff_try, gov, ceiling, "tickets", log, f"desk{ti + 1}")
-                record(f"desk{ti + 1}" + (" (retry)" if rebuild else ""), info_i)
-                if info_i.get("actual_cpt"):
-                    cpt = min(cpt, max(1.8, info_i["actual_cpt"] * 0.97))
-                if ai_i or info_i.get("status") != "PROMPT_TOO_LARGE":
-                    break
-                log("   ℹ️ The real prompt was bigger than estimated - rebuilding a smaller pack and retrying once.")
-            last_info = info_i
-            if not ai_i and info_i.get("attempts") and all(("per day" in a["status"].lower() or "(tpd)" in a["status"].lower() or a["status"].startswith("HTTP_404"))
-                                                         for a in info_i["attempts"]):
-                warnings.append("Groq's DAILY token allowance is used up for every available model (it resets daily; the error message says when). "
-                                "The remaining AI calls were skipped instead of retrying - press 'Re-run AI analysis' later, it needs no API-Football calls.")
-                ai_tickets += [{}] * (n_t - len(ai_tickets))
-                break
-            shown += [m for m in sel_i if m not in shown]
-            prompts.append(f"===== desk call {ti + 1} (ticket {ti + 1}) =====\n{user_i}")
-            if ai_i:
-                model_used = model_used or info_i.get("model")
-                t0 = next((t for t in (ai_i.get("tickets") or []) if isinstance(t, dict)), {})
-                legs_ok = []
-                for it in t0.get("legs") or []:
-                    d = it if isinstance(it, dict) else {"id": str(it)}
-                    lid = str(d.get("id") or "").strip().lower()
-                    if lid in leg_index and lid.split(".")[0] in idm_i and leg_index[lid]["mid"] not in {leg_index[x["id"].lower()]["mid"] for x in legs_ok}:
-                        legs_ok.append(d)
-                t0 = dict(t0, legs=legs_ok, name=TICKET_LABELS[min(ti, 2)])
-                t0["_legs"] = legs_ok
-                ai_tickets.append(t0)
-                if distinct:
-                    used_labels |= {str(x["id"]).strip().lower().split(".")[0] for x in legs_ok}
-                else:
-                    used_labels |= {str(x["id"]).strip().lower().split(".")[0] for x in legs_ok}
-                ai_traps += [x for x in (ai_i.get("traps") or []) if isinstance(x, dict) and x.get("id") in id_map]
-                ai_avoid += [x for x in (ai_i.get("avoid") or []) if isinstance(x, dict) and x.get("id") in id_map]
-                if ai_i.get("summary"):
-                    ai_summ.append(str(ai_i["summary"]))
-                if info_i.get("salvaged"):
-                    warnings.append(f"Ticket {ti + 1}: the AI reply was cut short; the complete part was recovered and the rest verified/completed.")
-            else:
-                ai_tickets.append({})
-                warnings.append(f"Ticket {ti + 1}: the AI desk call failed ({info_i.get('status')}); it will be completed by the audit / Python.")
-        if cpt_obs:
-            state["cpt"] = round(0.6 * min(cpt_obs) + 0.4 * (sum(cpt_obs) / len(cpt_obs)), 3)
-        if learned:
-            state["tpm_limit"] = int(min(learned))
-        save_state(state)
-    ai = None
-    if any(t.get("legs") for t in ai_tickets):
-        seen, traps_u = set(), []
-        for x in ai_traps:
-            if x["id"] not in seen:
-                seen.add(x["id"])
-                traps_u.append(x)
-        ai = {"tickets": ai_tickets, "traps": traps_u[:6], "avoid": ai_avoid[:6], "summary": " ".join(ai_summ)[:320]}
-    sel = shown or ordered
-    user_prompt = "\n\n".join(prompts)
-    info = dict(last_info, attempts=attempts)
+    sel, id_map, user_prompt, n_legs, eff_try, match_legs, leg_index = make_pack(cpt)
+    user_prompt += ("\n\n" + hint) if hint else ""
+    if eff_try != eff:
+        log(f"   ℹ️ '{eff}' effort needs more thinking room than the 8,000-token cap allows for this many matches - using '{eff_try}'.")
+    log(f"📦 AI pack: {len(sel)} matches x {n_legs} legs | est. prompt {est_tokens(sys_p + user_prompt, cpt)} tokens (hard cap {TOTAL_TOKEN_BUDGET} incl. completion)")
+    progress(0.93)
 
-    python_draft, ai_note, audit_changes, rule_fixes = None, "", [], []
+    ai, info = None, {"attempts": []}
+    budget = TokenBudget(TOTAL_TOKEN_BUDGET)
+    if cfg["use_ai"]:
+        log("🤖 The AI bookmaker/quant is choosing the legs (Python only verifies afterwards)...")
+        ai, info = call_groq_budgeted(sys_p, user_prompt, budget, cpt, eff_try)
+        if not ai and info.get("status") == "PROMPT_TOO_LARGE" and info.get("actual_cpt"):
+            new_cpt = min(max(info["actual_cpt"] * 0.97, 1.8), cpt)
+            log(f"   ℹ️ The real prompt was bigger than estimated ({info['actual_cpt']:.2f} chars/token) - rebuilding a smaller pack and retrying.")
+            sel, id_map, user_prompt, n_legs, eff_try, match_legs, leg_index = make_pack(new_cpt)
+            user_prompt += ("\n\n" + hint) if hint else ""
+            prev = info["attempts"]
+            ai, info = call_groq_budgeted(sys_p, user_prompt, budget, new_cpt, eff_try)
+            info["attempts"] = prev + info["attempts"]
+            cpt = new_cpt
+        if info.get("actual_cpt"):
+            state["cpt"] = round(0.7 * cpt + 0.3 * info["actual_cpt"], 3)
+            save_state(state)
+    model_used = info.get("model")
+
+    python_draft, ai_note = None, ""
     if ai:
-        tickets = parse_ai_tickets(ai, leg_index, n_t, LEGS_PER_TICKET, distinct)
-        # ── PASS 3: AUDIT - a risk officer tries to break every leg, swaps weak legs, fills gaps ──
-        if cfg.get("audit", True):
-            if budget.remaining >= AUDIT_RESERVE + 1800:
-                sys_au = audit_prompt(n_t)
-                a_user = build_audit_pack(tickets, match_legs, cfg["tz"], cpt, sys_au, AUDIT_RESERVE, ceiling, LEGS_PER_TICKET, distinct)
-                if a_user:
-                    log("🕵️ AI risk-officer audit: trying to break every leg and filling any gap...")
-                    aud, ainfo = call_groq_budgeted(sys_au, a_user, budget, cpt, "low", gov, ceiling, "legs", log, "audit")
-                    record("audit", ainfo)
-                    if aud:
-                        audit_changes = apply_audit(tickets, aud, leg_index, match_legs, LEGS_PER_TICKET, distinct)
-                        if aud.get("note"):
-                            ai["audit_note"] = str(aud["note"])[:240]
-                    else:
-                        warnings.append("The AI audit pass failed; the desk's tickets were verified by Python rules only.")
-                else:
-                    warnings.append("The audit pass was skipped because its evidence did not fit one request.")
-            else:
-                warnings.append("The audit pass was skipped: the per-analysis AI token cap was nearly used up (raise it in Settings).")
-        tickets = complete_tickets(tickets, match_legs, LEGS_PER_TICKET, distinct)
-        if cfg.get("rule_fix", True):
-            rule_fixes = py_fix_breaches(tickets, match_legs)
-            for t in tickets:
-                finish_ticket(t, LEGS_PER_TICKET)
-        if not cfg.get("allow_py_fallback"):
-            keep = [t for t in tickets if t["ai_kept"] >= int(cfg.get("min_ai_legs", 3))]
-            if len(keep) < len(tickets):
-                warnings.append(f"{len(tickets) - len(keep)} ticket(s) were mostly Python-built because the AI did not supply enough valid legs, so they were withheld "
-                                "(Settings -> 'allow Python-built tickets' lets them through, clearly labelled).")
-                python_draft = [t for t in tickets if t not in keep]
-            tickets = keep
+        tickets = finalize_tickets(ai, leg_index, match_legs, n_tickets=n_t, distinct=not cfg["allow_reuse"])
+        if info.get("salvaged"):
+            warnings.append("The AI reply reached the token cap; the complete tickets were recovered and the rest were completed/verified by Python.")
+        weak = [t["name"] for t in tickets if t["ai_kept"] < 3]
+        if weak:
+            warnings.append(f"{', '.join(weak)}: the AI supplied too few valid legs, so Python completed them (legs marked 🐍). "
+                            "Press 'Re-run AI analysis' for a fully AI-built version.")
     else:
         draft = python_only_tickets(match_legs, n_t)
-        for t in draft:
-            finish_ticket(t, LEGS_PER_TICKET)
-        if use_ai:
-            ai_note = " | ".join(f"{a['model'].split('/')[-1]}: {a['status'][:110]}" for a in attempts[-3:])
+        if cfg["use_ai"]:
+            ai_note = " | ".join(f"{a['model'].split('/')[-1]}: {a['status'][:260]}" for a in info.get("attempts", [])[-3:])
+            if (info.get("declined") or {}).get("summary"):
+                ai_note += f" | AI said: {str(info['declined']['summary'])[:200]}"
             if cfg.get("allow_py_fallback"):
                 tickets = draft
-                warnings.append(f"AI analysis failed ({info.get('status')}): {ai_note}. Python-built tickets (🐍, NOT AI-approved) were used because you allowed that fallback.")
+                warnings.append(f"AI analysis failed ({info.get('status')}): {ai_note}. Python-only tickets were used because you allowed that fallback.")
             else:
                 tickets, python_draft = [], draft
                 warnings.append(f"AI analysis failed ({info.get('status')}): {ai_note}. No tickets were produced because AI analysis is required. "
@@ -3723,18 +2893,16 @@ def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
             tickets = draft
     for t in tickets + (python_draft or []):
         dqm = min([l["match"]["dq"] for l in t["legs"]] or [0])
-        t["grade"] = "A" if dqm >= 0.75 and not t["repaired"] and not cfg.get("relaxed_notes") else "B" if dqm >= 0.6 else "C"
+        t["grade"] = "A" if dqm >= 0.75 and not t["repaired"] else "B" if dqm >= 0.6 else "C"
+        t["thin"] = sum(1 for l in t["legs"] if l["match"]["basis"] == "prior" or l.get("rx"))
+        if t["thin"]:
+            t["grade"] = "C"
     est_mode = any(l.get("src") == "est" for t in tickets for l in t["legs"])
     if est_mode:
-        warnings.append("Some legs use MODEL-ESTIMATED odds (fair odds x 0.93, no market check). Bookmakers differ slightly - confirm the price on yours.")
-    fallback_model = any(p["fallback"] for p in passes)
-    if fallback_model:
-        warnings.append("⚠️ At least one AI pass ran on a smaller FALLBACK model (the top model was rate-limited or unavailable). Analysis quality may be lower - "
-                        "consider pressing 'Re-run AI analysis' after a minute.")
+        warnings.append("Some legs use MODEL-ESTIMATED odds (fair odds x 0.93). Bookmakers differ slightly - confirm the price on yours.")
     return {"tickets": tickets, "ai": ai, "model": model_used, "info": info, "tokens": budget.used, "sel": sel, "id_map": id_map,
-            "user_prompt": user_prompt, "est_mode": est_mode, "ai_failed": bool(use_ai and not ai), "python_draft": python_draft,
-            "ai_note": ai_note, "warnings": warnings, "passes": passes, "fallback_model": fallback_model, "scout": scout_info,
-            "audit_changes": audit_changes, "rule_fixes": rule_fixes}
+            "user_prompt": user_prompt, "est_mode": est_mode, "ai_failed": bool(cfg["use_ai"] and not ai), "python_draft": python_draft,
+            "ai_note": ai_note, "warnings": warnings}
 
 
 def rerun_ai(res, cfg, log):
@@ -3743,13 +2911,14 @@ def rerun_ai(res, cfg, log):
     n_t = plan_ticket_count(len(elig), cfg)
     if n_t == 0:
         return res
-    stage = run_ai_stage(elig, n_t, cfg, log)
-    old = [w for w in res.get("warnings", []) if not any(k in w for k in ("AI analysis failed", "AI unavailable", "MODEL-ESTIMATED", "token cap", "mostly Python-built",
-                                                                         "FALLBACK model", "scout pass", "audit pass"))]
+    prev_status = (res.get("info") or {}).get("status")
+    hint = ("IMPORTANT: your previous reply was rejected because it contained no usable tickets. Return the complete JSON with every ticket now, "
+            "choosing the least-bad legs and flagging the risk.") if prev_status == "BAD_OUTPUT" else ""
+    stage = run_ai_stage(elig, n_t, cfg, log, hint=hint)
+    old = [w for w in res.get("warnings", []) if not any(k in w for k in ("AI analysis failed", "AI unavailable", "MODEL-ESTIMATED", "token cap", "mostly Python-built", "supplied too few valid legs"))]
     new = dict(res, tickets=stage["tickets"], ai=stage["ai"], model=stage["model"], info=stage["info"], tokens=stage["tokens"], n_ai=len(stage["sel"]),
                id_map=stage["id_map"], user_prompt=stage["user_prompt"], est_mode=stage["est_mode"], ai_note=stage["ai_note"],
-               ai_failed=stage["ai_failed"], python_draft=stage["python_draft"], warnings=old + stage["warnings"], cfg=cfg,
-               passes=stage["passes"], fallback_model=stage["fallback_model"], scout=stage["scout"], audit_changes=stage["audit_changes"], rule_fixes=stage["rule_fixes"])
+               ai_failed=stage["ai_failed"], python_draft=stage["python_draft"], warnings=old + stage["warnings"], cfg=cfg)
     if new["tickets"]:
         save_tickets_to_ledger(cfg["date"], new["tickets"])
     return new
@@ -3761,7 +2930,11 @@ def test_groq_connection():
     if not key:
         return [("-", "GROQ_API_KEY is not set")]
     rows = []
+    avail = groq_available_models(key)
     for model in GROQ_MODELS:
+        if avail and model not in avail:
+            rows.append((model, "⚪ not available on your Groq account (skipped automatically)"))
+            continue
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
         payload = {"model": model, "max_completion_tokens": 120, "temperature": 0, "response_format": {"type": "json_object"},
                    "messages": [{"role": "user", "content": 'Return exactly this JSON and nothing else: {"ok": true}'}]}
@@ -3788,29 +2961,26 @@ def render_results(res, tz):
         st.warning(w)
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Matches analysed", res["n_analysed"])
-    c2.metric("Studied by AI desk", res["n_ai"])
-    c3.metric("AI tokens (all passes)", res["tokens"])
+    c2.metric("Qualified -> AI", res["n_ai"])
+    c3.metric("AI tokens (cap 8000)", res["tokens"])
     c4.metric("API calls", res["api_calls"], f"cache {res['cache_hits']}")
     c5.metric("Model", (res.get("model") or "Python optimiser").split("/")[-1] if res["tickets"] else "-")
+    if res.get("source") == "ESPN":
+        st.caption("📡 Data source: **ESPN public data** (free, no key, no daily quota) + permanent results database + ClubElo. "
+                   "Odds: ESPN 1X2 where listed; other markets are estimated and labelled.")
     if res.get("quota") and res["quota"][0] is not None:
         st.caption(f"📶 API quota left today: **{res['quota'][0]}** of {res['quota'][1]} (resets 00:00 UTC / 03:00 Kampala)")
-    if res.get("caps"):
+    if res.get("caps") and res.get("source") != "ESPN":
         cp = res["caps"]
-        st.caption(f"API plan capabilities detected - team history: {'✅' if cp['history'] else '❌ (free sources / predictions last-5 form used)'} · "
+        st.caption(f"API plan capabilities detected - team history: {'✅' if cp['history'] else '❌ (using predictions last-5 form)'} · "
                    f"odds by league: {'✅' if cp['league_odds'] else '❌' if cp['league_odds'] is False else '?'} · odds by fixture: {'✅' if cp['fixture_odds'] else '❌'}")
-    fr = res.get("free") or {}
-    if fr.get("used") or fr.get("saved_calls"):
-        st.caption("🆓 Free sources (no API quota): " + " · ".join(f"{k} ×{v}" for k, v in fr.get("used", {}).items())
-                   + (f" · ≈{fr['saved_calls']} API calls avoided" if fr.get("saved_calls") else ""))
-    if res.get("relaxed"):
-        st.info("🪜 Thin slate - thresholds relaxed: " + "; ".join(res["relaxed"]))
     if res.get("no_bet"):
         st.error(f"🛑 **NO BET** - {res.get('reason')}")
         if res.get("api_errors"):
             st.markdown("**API messages (send these if you need help):**")
             st.code("\n".join(res["api_errors"]), language="text")
     if res.get("ai_failed"):
-        st.error("🤖 **AI analysis did not complete.** " + (res.get("ai_note") or ""))
+        st.error("🤖 **AI analysis did not complete, so no tickets were produced.** " + (res.get("ai_note") or ""))
         st.info("Nothing needs to be re-collected: press **Re-run AI analysis** below (no API-Football calls are used).")
     if res.get("python_draft"):
         with st.expander("🐍 Python reference draft - NOT AI-approved (withheld)"):
@@ -3821,49 +2991,28 @@ def render_results(res, tz):
         rows = []
         for l in t["legs"]:
             m = l["match"]
-            au = l.get("audit") or {}
             rows.append({"Kick-off": datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M"), "League": m["league"],
                          "Match": f"{m['home']} v {m['away']}", "Pick": l["label"], "Odds": round(l["odds"], 2),
-                         "Price": (f"{l['odds_lo']:.2f}-{l['odds_hi']:.2f}" if l.get("odds_lo") else "derived" if l.get("src") == "derived" else "est."),
-                         "By": _by_txt(l), "Model+Mkt %": _pct(l["p"]), "Market fair %": _pct(l["p_mkt"]), "Trap": m["trap"]["risk"],
-                         "Data": BASIS_TAG.get(m["basis"]), "Why": l.get("why", ""), "Loses if": l.get("fail", ""),
-                         "Audit": (("✅ " if au.get("ok", True) else "⚠️ ") + (au.get("issue") or au.get("risk") or "")) if au else "",
-                         "Flags": ",".join(l.get("flags") or [])})
+                         "Books range": (f"{l['odds_lo']:.2f}-{l['odds_hi']:.2f}" if l.get("odds_lo") else "est."),
+                         "By": {"AI": "🤖 AI", "AI*": "🤖 AI match + 🐍 price tweak", "PY": "🐍 Python"}.get(l.get("by"), ""), "Model+Mkt %": _pct(l["p"]), "Market fair %": _pct(l["p_mkt"]), "Trap": m["trap"]["risk"],
+                         "Data": (BASIS_TAG.get(m["basis"]) or "") + ("*" if l.get("rx") else ""), "Why": l.get("why", "")})
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         if res.get("model"):
-            st.caption(f"🤖 AI chose {t.get('ai_kept', 0)} of {len(t['legs'])} legs"
-                       + (f" ({t.get('audit_swaps', 0)} improved by the audit)" if t.get("audit_swaps") else "")
-                       + (f"; 🐍 Python supplied {t.get('py_legs', 0)}" if t.get("py_legs") else "; Python only verified prices, uniqueness, rules and the 3.5 minimum") + ".")
+            st.caption(f"🤖 The AI ({res['model']}) selected {t.get('ai_kept', 0)} of {len(t['legs'])} legs/matches; Python only verified prices and uniqueness, and tweaked a leg's market within the AI's match when needed to reach 3.5.")
         if t.get("logic"):
             st.info(t["logic"])
         if t.get("repaired"):
-            st.caption("🔧 Python completed/adjusted part of this ticket (🐍 legs): AI leg missing/invalid, rule breach or odds below 3.5.")
-        if t.get("stacked"):
-            st.caption("⚠️ 4+ legs of the same market type - correlated failure risk.")
-    if res.get("audit_changes") or res.get("rule_fixes"):
-        with st.expander("🕵️ Audit & rule-check changes"):
-            for c in res.get("audit_changes", []):
-                st.write(f"🤖 audit: {c}")
-            for c in res.get("rule_fixes", []):
-                st.write(f"🐍 rule-fix: {c}")
+            st.caption("🔧 Python corrected this ticket (invalid/duplicate leg or odds below 3.5).")
     ai = res.get("ai") or {}
     for title, key, fld in (("🪤 Trap watch", "traps", "note"), ("🚫 Avoid", "avoid", "why")):
-        items = [(res["id_map"][x["id"]], x.get(fld)) for x in (ai.get(key) or []) if x.get("id") in res["id_map"]]
-        if key == "traps":
-            items += [({"home": x["match"], "away": ""}, x.get("note")) for x in ((res.get("scout") or {}).get("traps") or [])]
-        if items:
+        if ai.get(key):
             st.markdown(f"#### {title}")
-            for m, note in items:
-                st.write(f"**{m['home']}{' v ' + m['away'] if m.get('away') else ''}** — {note}")
-    if ai.get("audit_note"):
-        st.markdown(f"#### 🕵️ Risk officer\n{ai['audit_note']}")
+            for x in ai[key]:
+                m = res["id_map"].get(x.get("id"))
+                if m:
+                    st.write(f"**{m['home']} v {m['away']}** — {x.get(fld)}")
     if ai.get("summary"):
         st.markdown(f"#### 📝 Slate read\n{ai['summary']}")
-    sc = res.get("scout")
-    if sc:
-        with st.expander(f"🔭 AI scout - kept {sc['kept']} of {sc['of']} qualified matches for the full analysis"):
-            for x in sc.get("drops", []):
-                st.write(f"❌ {x['match']} — {x.get('why')}")
     if res.get("excluded"):
         with st.expander(f"🛡 Excluded by the evidence gate ({len(res['excluded'])})"):
             st.dataframe(pd.DataFrame(res["excluded"]), hide_index=True, width="stretch")
@@ -3873,8 +3022,7 @@ def render_results(res, tz):
             p = m["p"]
             rows.append({"Cat": m["cat"], "League": m["league"], "Match": f"{m['home']} v {m['away']}",
                          "KO": datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M"),
-                         "Data": BASIS_TAG.get(m["basis"]), "Sources": ",".join(sorted(set(m.get("free_tags") or []))) or "api",
-                         "xG": f"{m['lam_h']:.2f}-{m['lam_a']:.2f}",
+                         "Data": BASIS_TAG.get(m["basis"]), "xG": f"{m['lam_h']:.2f}-{m['lam_a']:.2f}",
                          "1": _pct(p["1"]), "X": _pct(p["X"]), "2": _pct(p["2"]), "1X": _pct(p["1X"]), "X2": _pct(p["X2"]),
                          "BTTS": _pct(p["BTTS_Y"]), "O1.5": _pct(p["O1.5"]), "O2.5": _pct(p["O2.5"]),
                          "Corners": round(m["exp_corners"], 1) if m["corner_n"] >= 3 else None,
@@ -3882,17 +3030,13 @@ def render_results(res, tz):
                          "Likely": ",".join(m["top_scores"])})
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     if res.get("user_prompt"):
-        with st.expander("🔎 Exact evidence pack sent to the AI desk"):
+        with st.expander("🔎 Exact evidence pack sent to the AI"):
             st.code(res["user_prompt"], language="text")
-    with st.expander("🛠 AI passes / model attempts / API errors"):
-        if res.get("passes"):
-            st.dataframe(pd.DataFrame(res["passes"]), hide_index=True, width="stretch")
+    with st.expander("🛠 Model attempts / API errors"):
         for a in (res.get("info") or {}).get("attempts", []):
-            st.caption(f"[{a.get('pass', '-')}] {a['model']} → {a['status']}")
+            st.caption(f"{a['model']} → {a['status']}")
         for e in res.get("api_errors", []):
             st.caption(f"API: {e}")
-        for e in (res.get("free") or {}).get("fails", []):
-            st.caption(f"free source: {e}")
 
 
 def main():
@@ -3912,49 +3056,42 @@ def main():
         s1, s2 = st.columns(2)
         tz = s1.text_input("Time zone", DEFAULT_TZ)
         max_matches = s1.slider("Max matches to collect deep data for", 10, 60, 30)
-        n_ai = s1.slider("Max matches the AI scout reads (the desk auto-fits as many as one Groq request allows)", 15, 40, 28)
+        n_ai = s1.slider("Max matches sent to AI (auto-trimmed to fit 8,000 tokens)", 15, 24, 18)
         max_calls = s1.number_input("Max API-Football calls per run", 30, 5000, 95, step=5,
                                     help="Free plan = 100/day. Pro = 7,500/day. The app auto-shrinks the shortlist to fit.")
         breadth = s1.selectbox("Search breadth", ["Focused", "Balanced", "Wide"], index=1,
                                help="Focused leans on major leagues; Wide gives lower and mid competitions and international games more room to compete for the tickets.")
+        source_label = s1.selectbox("Data source", ["Auto (ESPN free first, API-Football as backup)", "ESPN only (free, no key)", "API-Football only"],
+                                    help="ESPN needs no key and has no daily quota. API-Football is only used if you choose it, or as a backup when ESPN gives too few matches.")
+        extra_slugs = s1.text_input("Extra ESPN competition codes (comma separated, e.g. ned.2, uga.1)", "")
         depth = s1.selectbox("Data depth", ["Auto", "Full", "Lite"], help="Full adds corners/shots/xG history, player ratings, lineups and standings via batched calls.")
         sims = s2.select_slider("Monte Carlo simulations per match", [10000, 20000, 40000, 80000], 40000)
         w_model = s2.slider("Weight of Monte Carlo model vs bookmaker price", 0.2, 0.8, 0.5, 0.05)
         bookmaker = s2.number_input("Preferred bookmaker id (8 = Bet365, 11 = 1xBet, 4 = Pinnacle)", 1, 500, 8)
-        effort = s2.selectbox("AI reasoning effort (gpt-oss)", ["low", "medium", "high"], index=1, help="Higher effort thinks longer, so the desk evidence pack is automatically shrunk to keep prompt + completion inside ONE Groq request (tokens-per-minute limit). If even that cannot fit, the app steps effort down.")
+        effort = s2.selectbox("AI reasoning effort (gpt-oss)", ["low", "medium", "high"], help="Higher effort thinks longer, so the evidence pack is automatically shrunk (fewer matches/legs) to keep prompt + completion within 8,000 tokens. If even that cannot fit, the app steps effort down.")
         exclude_minor = s2.checkbox("Exclude youth / women / reserve teams", True)
         exclude_lower = s2.checkbox("Exclude amateur / regional lower divisions & club friendlies", True)
         force_leagues = {int(x) for x in re.findall(r"\d+", s2.text_input("Always include league ids (comma separated)", ""))}
         rate_override = int(s2.number_input("Requests/minute override (0 = auto by plan)", 0, 900, 0))
         send_tg = st.checkbox("Send tickets to Telegram automatically", True)
         use_ai = st.checkbox("Use AI (Groq)", True)
-        allow_py = st.checkbox("Always deliver tickets: if the AI cannot supply a leg or fails, allow Python-built legs/tickets (clearly marked 🐍, never presented as AI-approved)", True)
+        allow_py = st.checkbox("If the AI fails, allow Python-only tickets (off = the app withholds tickets rather than guess)", False)
         if st.button("🧪 Test AI connection (~100 tokens per model)"):
             for mdl, status in test_groq_connection():
                 st.write(f"`{mdl}` → {status}")
         min_dq = st.slider("Minimum data-quality score for a match to qualify", 0.3, 0.9, 0.5, 0.05,
                            help="Matches below this (or with no team-specific data / no real odds) are excluded from tickets.")
+        strict_gate = st.checkbox("Strict evidence gate (withhold tickets when data is thin). OFF = never stop: continue with whatever data exists and label thin-data legs", False)
+        backfill_days = st.slider("Free results database: past days to fetch (each missing day costs 1 API call, once, then is stored)", 0, 40, 14)
+        use_elo = st.checkbox("Use ClubElo ratings (free, no API quota) as extra team-strength data", True)
         allow_reuse = st.checkbox("Allow the same match in more than one ticket (only if too few matches qualify)", False)
         allow_est = st.checkbox("If the API has no odds for a match, use model-estimated approximate odds (clearly labelled)", True,
                                 help="Real bookmaker prices are always preferred (median of all bookmakers). Estimates only fill in when a match has none; trap and market-agreement checks are weaker for those matches.")
-        st.markdown("##### 🤖 AI pacing & quality")
-        a1, a2 = st.columns(2)
-        tpm = a1.number_input("Groq tokens-per-minute limit", 4000, 30000, GROQ_TPM_DEFAULT, step=500,
-                              help="Every Groq request is kept below this, and the passes (scout -> desk -> audit) are spaced so the rolling 60-second window never overflows. The app also learns the real limit from Groq's error messages.")
-        run_tokens = a2.number_input("Max AI tokens per analysis (all passes)", 10000, 120000, RUN_TOKEN_CAP_DEFAULT, step=2000,
-                                     help="Protects your daily Groq token allowance. One full analysis (scout + 3 desk calls + audit) normally uses 25-35k.")
-        two_pass = a1.checkbox("AI scout first: rank the qualified matches best-first before the per-ticket desk calls", True)
-        audit = a2.checkbox("Final AI risk-officer audit (tries to break every leg, swaps weak legs, fills gaps)", True)
-        rule_fix = a1.checkbox("Python rule-fix: replace a leg that breaks the AI's own hard rules with the best clean alternative", True)
-        min_ai_legs = a2.slider("Minimum AI-chosen legs per ticket (matters only if Python-built tickets are not allowed)", 3, 5, 3)
-        wide_menu = a1.checkbox("Widen the leg menu with clearly-flagged borderline legs (the AI decides)", True)
-        auto_relax = a2.checkbox("Auto-relax safety thresholds step by step when too few matches qualify (always labelled)", True)
-        tg_top_only = a1.checkbox("Send to Telegram only if the TOP model did the analysis", False)
-        st.markdown("##### 🆓 Free data sources & quota saving")
-        f1, f2 = st.columns(2)
-        use_free = f1.checkbox("Use free sources (football-data.co.uk, ClubElo, ESPN) first and as fallback - costs 0 API-Football calls", True)
-        save_calls = f2.checkbox("Skip API-Football predictions when free sources already cover the match (saves ~1 call per match)", True)
-        st.markdown(f"**AI order:** {' → '.join(GROQ_MODELS)} · Calls: scout → desk (one per ticket) → audit")
+        st.markdown(f"**AI order:** {' → '.join(GROQ_MODELS)} · **Hard cap:** {TOTAL_TOKEN_BUDGET} tokens per analysis (prompt + completion, all attempts)")
+        if st.button("🔌 Test data sources (checks ESPN, SofaScore, ClubElo and API-Football from THIS machine)"):
+            with st.spinner("Testing..."):
+                for name_, status_ in test_data_sources(tz, get_secret("API_FOOTBALL_KEY")):
+                    st.write(f"**{name_}** → {status_}")
         if st.button("📶 Check API quota now (free - does not use quota)"):
             key_ = get_secret("API_FOOTBALL_KEY")
             if key_:
@@ -3975,14 +3112,12 @@ def main():
         local_today = datetime.now(ZoneInfo(tz)).date()
         d = st.date_input("Match day to analyse", local_today)
         force = st.checkbox("Ignore cache (fresh API data - costs more calls)", False)
-        st.caption("Free API plan: one run now needs fewer calls because free sources are used first. The AI works in short focused calls (scout, one per ticket, audit) spaced to respect Groq's per-minute token limit, so expect several extra minutes. Re-running the same day reuses cached data; the API quota resets 00:00 UTC (03:00 Kampala).")
+        st.caption("ESPN source (default): free, no key, no daily quota - the first run builds a 60-day results database (a minute or two), later runs are quick. API-Football (optional): Free plan = 100 calls/day.")
         if st.button("🧠 Analyse Football Matches Now", type="primary"):
             cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "n_ai": n_ai, "max_calls": int(max_calls),
                    "depth": depth, "sims": int(sims), "w_model": w_model, "bookmaker": int(bookmaker), "effort": effort,
-                   "exclude_minor": exclude_minor, "breadth": breadth, "exclude_lower": exclude_lower, "force_leagues": force_leagues, "rate_override": rate_override,
-                   "force": force, "use_ai": use_ai, "allow_py_fallback": allow_py, "min_dq": min_dq, "allow_reuse": allow_reuse, "allow_est": allow_est, "tpm": int(tpm), "run_tokens": int(run_tokens), "two_pass": two_pass,
-                   "audit": audit, "use_free": use_free, "save_calls": save_calls, "auto_relax": auto_relax, "min_ai_legs": int(min_ai_legs),
-                   "wide_menu": wide_menu, "rule_fix": rule_fix}
+                   "exclude_minor": exclude_minor, "breadth": breadth, "source": ("ESPN" if source_label.startswith("ESPN") else "API-Football" if source_label.startswith("API") else "Auto"), "extra_slugs": extra_slugs, "exclude_lower": exclude_lower, "force_leagues": force_leagues, "rate_override": rate_override,
+                   "force": force, "use_ai": use_ai, "allow_py_fallback": allow_py, "min_dq": min_dq, "allow_reuse": allow_reuse, "allow_est": allow_est, "strict_gate": strict_gate, "backfill_days": backfill_days, "use_elo": use_elo}
             bar = st.progress(0.0)
             box = st.status("Running full analysis...", expanded=True)
             def log(m): box.write(m)
@@ -4001,9 +3136,7 @@ def main():
                 box.update(label=f"Done in {res['seconds']}s" + (" - NO BET" if res.get("no_bet") else ""), state="complete")
                 st.session_state.last_result = res
                 st.session_state.last_tz = tz
-                if send_tg and tg_top_only and res.get("fallback_model") and res["tickets"]:
-                    st.info("Telegram skipped: a fallback model took part and you asked for top-model-only delivery. Press Re-run AI analysis later.")
-                elif send_tg:
+                if send_tg:
                     msg = (build_nobet_message(res, tz) if res.get("no_bet") else build_aifail_message(res, tz) if res.get("ai_failed") and not res["tickets"]
                            else build_telegram_message(res, tz))
                     ok, why = send_telegram(msg)
@@ -4018,7 +3151,7 @@ def main():
                 if st.button("🔁 Re-run AI analysis on the data already collected (uses NO API-Football calls)"):
                     box2 = st.status("Re-running the AI stage...", expanded=True)
                     try:
-                        new = rerun_ai(lr, dict(lr["cfg"], effort=effort, use_ai=True, allow_py_fallback=allow_py, tpm=int(tpm), run_tokens=int(run_tokens), two_pass=two_pass, audit=audit, rule_fix=rule_fix, min_ai_legs=int(min_ai_legs)), box2.write)
+                        new = rerun_ai(lr, dict(lr["cfg"], effort=effort, use_ai=True, allow_py_fallback=allow_py), box2.write)
                         st.session_state.last_result = new
                         if send_tg and (new["tickets"] or new.get("ai_failed")):
                             ok, why = send_telegram(build_telegram_message(new, tz) if new["tickets"] else build_aifail_message(new, tz))
@@ -4035,9 +3168,10 @@ def main():
         state = load_state()
         if st.button("🔄 Settle finished matches"):
             key = get_secret("API_FOOTBALL_KEY")
-            save_state(settle_history(ApiFootball(key or "", 10), state))
-            st.success("Ledger updated (free results first, API-Football only for what is left).")
-            state = load_state()
+            if key:
+                save_state(settle_history(ApiFootball(key, 10), state))
+                st.success("Ledger updated.")
+                state = load_state()
         tk = [(e["date"], t) for e in state.get("history", []) for t in e["tickets"]]
         won, lost = sum(1 for _, t in tk if t.get("outcome") == "WON"), sum(1 for _, t in tk if t.get("outcome") == "LOST")
         legs_ = [l for _, t in tk for l in t["legs"] if l.get("result") is not None]
