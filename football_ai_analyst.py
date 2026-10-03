@@ -1,5 +1,5 @@
 # =============================================================================
-# Der-AI | Football Quant Desk — V2.5 (AI-first, quota-safe, free-source backed)
+# Der-AI | Football Quant Desk — V3.0 (AI Match Selector - No Tickets)
 # =============================================================================
 import os, re, json, math, time, html, hashlib, threading, random, traceback, csv, io, unicodedata, difflib
 from collections import defaultdict
@@ -33,22 +33,11 @@ NON_RETRYABLE = {400, 401, 403, 404, 422}
 GROQ_TPM_DEFAULT = 8000
 TPM_MARGIN = 350
 WINDOW_MARGIN = 150
-RUN_TOKEN_CAP_DEFAULT = 45000
+RUN_TOKEN_CAP_DEFAULT = 30000
 EFFORT_RESERVE = {"low": 2600, "medium": 3800, "high": 5000}
-SCOUT_RESERVE, AUDIT_RESERVE = 1500, 2000
-OUTPUT_RESERVE = 3000
 TOKEN_SAFETY = 100
 MIN_COMPLETION = 900
 DEFAULT_CHARS_PER_TOKEN = 2.3
-
-# ── Ticket rules ────────────────────────────────────────────────────────────
-N_TICKETS, LEGS_PER_TICKET, MIN_TICKET_ODDS = 3, 5, 3.0
-MIN_LEG_P, MIN_LEG_ODDS, MAX_LEG_ODDS = 0.62, 1.15, 2.00
-MIN_AGREE_P = 0.60
-BORDER_AGREE_P, BORDER_MIN_P = 0.55, 0.57
-MAX_MENU_LEGS = 7
-BASIS_TAG = {"season+recent": "S+R", "recent": "R", "season": "S", "elo": "E", "prior": "P"}
-TICKET_LABELS = ["Ticket 1 - Safest", "Ticket 2 - Balanced", "Ticket 3 - Value"]
 
 # ── League intelligence ─────────────────────────────────────────────────────
 TOP_LEAGUES = {39: "Premier League", 140: "La Liga", 135: "Serie A", 78: "Bundesliga", 61: "Ligue 1",
@@ -56,10 +45,6 @@ TOP_LEAGUES = {39: "Premier League", 140: "La Liga", 135: "Serie A", 78: "Bundes
 4: "Euro", 9: "Copa America", 5: "Nations League"}
 MID_LEAGUES = {88, 94, 40, 144, 203, 179, 71, 128, 262, 253, 307, 13, 11, 41, 42, 79, 136, 141, 62, 89, 95,
 145, 204, 180, 72, 218, 207, 119, 103, 113, 106, 197, 235, 98, 292, 188, 45, 48, 81, 66, 143, 137}
-CAT_WEIGHT = {"TOP": 100, "INTL": 80, "MID": 70, "LOW": 50}
-CAT_QUOTA = {"TOP": 0.40, "INTL": 0.20, "MID": 0.30, "LOW": 0.10}
-BREADTH_QUOTA = {"Focused": {"TOP": 0.50, "INTL": 0.20, "MID": 0.25, "LOW": 0.05}, "Balanced": CAT_QUOTA,
-"Wide": {"TOP": 0.25, "INTL": 0.20, "MID": 0.30, "LOW": 0.25}}
 LEAGUE_EXCLUDE_RE = re.compile(r"\b(U-?1[5-9]|U-?2[0-3]|Youth|Reserve|Reserves|Women|Feminine|Femenin|Femminile|Frauen|Junior|Juniors|Development)\b", re.I)
 LOWER_DIV_RE = re.compile(r"amateur|regionalliga|serie d\b|division [3-9]|liga alef|norrland|friendlies clubs|oberliga|landesliga|primera federaci|segunda federaci|tercera|copa federacion", re.I)
 TEAM_EXCLUDE_RE = re.compile(r"\s(II|B|U-?\d{2}|Youth|Women|W)$", re.I)
@@ -259,16 +244,6 @@ class ApiFootball:
     def resp(self, endpoint, params=None, ttl=3600):
         return self.get(endpoint, params, ttl).get("response") or []
 
-    def pages(self, endpoint, params, ttl=1200, max_pages=4):
-        out, page = [], 1
-        while page <= max_pages:
-            d = self.get(endpoint, dict(params, page=page), ttl)
-            out.extend(d.get("response") or [])
-            pg = d.get("paging") or {}
-            if int(pg.get("current", page) or page) >= int(pg.get("total", 1) or 1): break
-            page += 1
-        return out
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Parsers
 # ═════════════════════════════════════════════════════════════════════════════
@@ -391,18 +366,6 @@ def parse_h2h(fixtures, home_id):
     out.sort(key=lambda x: -x["ts"])
     return out[:8]
 
-def parse_standings(resp):
-    out = {}
-    for item in resp or []:
-        for group in (item.get("league") or {}).get("standings") or []:
-            size = len(group)
-            for row in group:
-                tid = (row.get("team") or {}).get("id")
-                if tid is not None and tid not in out:
-                    out[tid] = {"rank": row.get("rank"), "pts": row.get("points"), "of": size,
-                                "played": (row.get("all") or {}).get("played"), "desc": row.get("description")}
-    return out
-
 # ═════════════════════════════════════════════════════════════════════════════
 # FREE data sources
 # ═════════════════════════════════════════════════════════════════════════════
@@ -411,7 +374,6 @@ FD_MAIN = {39: "E0", 40: "E1", 41: "E2", 42: "E3", 140: "SP1", 141: "SP2", 135: 
            61: "F1", 62: "F2", 88: "N1", 94: "P1", 144: "B1", 203: "T1", 197: "G1", 179: "SC0", 180: "SC1"}
 FD_NEW = {128: "ARG", 71: "BRA", 262: "MEX", 253: "USA", 98: "JPN", 169: "CHN", 357: "IRL", 103: "NOR", 113: "SWE",
           244: "FIN", 119: "DNK", 106: "POL", 283: "ROU", 235: "RUS", 207: "SWZ", 218: "AUT"}
-FD_CODE_TO_LID = {v: k for k, v in FD_MAIN.items()}
 FD_ALL = set(FD_MAIN) | set(FD_NEW)
 ESPN_SLUG = {39: "eng.1", 40: "eng.2", 41: "eng.3", 42: "eng.4", 140: "esp.1", 141: "esp.2", 135: "ita.1", 136: "ita.2",
              78: "ger.1", 79: "ger.2", 61: "fra.1", 62: "fra.2", 88: "ned.1", 94: "por.1", 144: "bel.1", 203: "tur.1",
@@ -439,7 +401,7 @@ ELO_COUNTRIES = {"england", "spain", "italy", "germany", "france", "netherlands"
 ELO_LEAGUE_IDS = {2, 3, 848}
 INTL_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 FREE_TTL_S = 6 * 3600
-FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.5)"}
+FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/3.0)"}
 _STOP = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "fk", "sk", "bk", "if", "fsv", "vfb", "vfl", "sv", "cd", "ud", "sd",
          "ca", "club", "de", "the", "calcio", "and"}
 _TOKEN_FIX = {"st": "saint", "utd": "united"}
@@ -1412,14 +1374,14 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
             p_mkt = api_fair(key, ext, p)
         else: continue
         
-        if not (MIN_LEG_ODDS <= odds <= MAX_LEG_ODDS): continue
+        if not (1.15 <= odds <= 2.00): continue
         p_model = m["model_p"].get(key, p)
         agree = min(p_model, p_mkt)
         if src == "est":
             if p_model < 0.74 or p < 0.74: continue
             tier = "B"
-        elif agree >= MIN_AGREE_P: tier = "S"
-        elif wide and agree >= BORDER_AGREE_P: tier = "B"
+        elif agree >= 0.60: tier = "S"
+        elif wide and agree >= 0.55: tier = "B"
         else: continue
         
         pen = 0.05 * (1 - dq)
@@ -1431,7 +1393,7 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
         if tier == "B": pen += 0.02
         if src == "est": pen += 0.04
         p_adj = p - pen
-        if p_adj < (MIN_LEG_P if tier == "S" else BORDER_MIN_P): continue
+        if p_adj < (0.62 if tier == "S" else 0.57): continue
         edge = p * odds - 1
         eadj = float(np.clip(p_adj * odds - 1, -0.2, 0.15))
         legs.append({"key": key, "label": leg_label(key, m), "p": float(p), "p_adj": float(p_adj), "p_mkt": float(p_mkt),
@@ -1446,7 +1408,7 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
             nb += 1
         chosen.append(lg)
         fams.add(lg["fam"])
-        if len(chosen) >= MAX_MENU_LEGS: break
+        if len(chosen) >= 5: break
     return chosen
 
 def gate_reasons(m, cfg):
@@ -1477,7 +1439,7 @@ def fetch_coverage(api, ttl_s=86400):
     return cov
 
 def shortlist_matches(cands, max_n, force_leagues, quota=None):
-    quota = quota or CAT_QUOTA
+    quota = quota or {"TOP": 0.40, "INTL": 0.20, "MID": 0.30, "LOW": 0.10}
     buckets = defaultdict(list)
     forced = [c for c in cands if c["league_id"] in force_leagues]
     for c in cands:
@@ -1496,13 +1458,6 @@ def shortlist_matches(cands, max_n, force_leagues, quota=None):
             if len(picked) >= max_n: break
             if c not in picked: picked.append(c)
     return picked
-
-def estimate_calls(matches, deep):
-    leagues = len({m["league_id"] for m in matches})
-    return 2 + leagues * (2 if deep else 1) + len(matches) * (3.7 if deep else 3.2)
-
-def detail_cost(ms, deep):
-    return len(ms) * (3.9 if deep else 3.3) + (len({m["league_id"] for m in ms}) if deep else 0)
 
 def team_results(api, team_id, season, date_str, tz, ttl_s):
     if api.no_history: return []
@@ -1569,12 +1524,10 @@ def collect_free_only(api, free, cfg, log, progress, out):
                          "league": name, "country": country, "season": None, "round": None,
                          "home_id": _syn_id("T:" + e["home"]), "home": e["home"], "away_id": _syn_id("T:" + e["away"]), "away": e["away"],
                          "cat": league_category(lid, country), "free_odds": e["odds"], "free_src": e["src"]})
-    out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
-    log(f"   {len(fx)} fixtures found by free sources, {len(fixtures)} eligible {out['cat_counts']}")
     if not fixtures:
-        out["reason"] = "No fixtures were found by API-Football or by the free sources for this date. " + ("; ".join(free.fails[:2]) if free.fails else "")
+        out["reason"] = "No fixtures were found by API-Football or by the free sources for this date."
         return out
-    cand = shortlist_matches(fixtures, min(len(fixtures), cfg["max_matches"]), cfg["force_leagues"], BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
+    cand = shortlist_matches(fixtures, min(len(fixtures), cfg["max_matches"]), cfg["force_leagues"])
     out["warnings"].append("API-Football returned nothing usable, so this analysis was built ONLY from free sources (football-data.co.uk, ESPN, ClubElo). Injuries, lineups and API predictions are unavailable.")
     with ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(lambda lid: free.rows_for(lid, date_str), {c["league_id"] for c in cand}))
@@ -1601,7 +1554,6 @@ def collect_free_only(api, free, cfg, log, progress, out):
         out["matches"].append(rec)
         for t in c["free_tags"]: free.used[t.split(":")[0] if not t.startswith("odds") else "odds"] += 1
         progress(0.2 + 0.7 * (i + 1) / len(cand))
-    out["caps"] = {"history": False, "league_odds": False, "fixture_odds": False}
     out["deep"], out["budget"] = False, 0
     out["plan"] = out.get("plan") or {"plan": "free sources only"}
     if not out["matches"]: out["reason"] = "Free sources found fixtures but none had both team history and bookmaker odds."
@@ -1609,7 +1561,7 @@ def collect_free_only(api, free, cfg, log, progress, out):
 
 def collect_day(api, cfg, log, progress, free=None):
     free = free or FreeData(enabled=False)
-    out = {"warnings": [], "matches": [], "excluded": [], "raw_count": 0, "cat_counts": {}, "plan": None, "reason": None}
+    out = {"warnings": [], "matches": [], "excluded": [], "raw_count": 0, "plan": None, "reason": None}
     date_str, tz, force = cfg["date"], cfg["tz"], cfg["force"]
     free.target_date = date_str
     ttl = lambda t: 0 if force else t
@@ -1670,8 +1622,7 @@ def collect_day(api, cfg, log, progress, free=None):
         fixtures = [f for f in fixtures if not mem_bad(f["league_id"]) or f["league_id"] in cfg["force_leagues"] or (free.enabled and (f["league_id"] in FD_ALL or str(f.get("country") or "").lower() == "world"))]
         if n0 != len(fixtures): log(f"🧠 Skipped {n0 - len(fixtures)} fixtures in competitions that returned no usable team data recently.")
     
-    out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
-    log(f"   {out['raw_count']} fixtures on the day, {len(fixtures)} upcoming & eligible {out['cat_counts']}")
+    log(f"   {out['raw_count']} fixtures on the day, {len(fixtures)} upcoming & eligible")
     if not fixtures:
         if free.enabled:
             log("🆓 API-Football gave no usable fixtures - switching to free sources only...")
@@ -1682,11 +1633,11 @@ def collect_day(api, cfg, log, progress, free=None):
     
     progress(0.06)
     pool_n = min(len(fixtures), int(cfg["max_matches"] * 1.6) + 4)
-    cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"], BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
+    cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"])
     odds_cap = max(6, int(budget * 0.30))
     while len({c["league_id"] for c in cand}) > odds_cap and pool_n > 8:
         pool_n -= 1
-        cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"], BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
+        cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"])
     
     odds_by, odds_src = {}, {}
     def fetch_league_odds(lid, s_):
@@ -1731,7 +1682,6 @@ def collect_day(api, cfg, log, progress, free=None):
             team_results(api, sample["home_id"], sample["season"], date_str, tz, ttl(3 * 3600))
         caps = {"history": not api.no_history, "league_odds": None, "fixture_odds": False}
         items = fetch_league_odds(sample["league_id"], sample["season"])
-        probed_leagues = {(sample["league_id"], sample["season"])}
         store_odds(items)
         if items: caps["league_odds"] = True
         elif api.ep_fail.get("/odds", 0) > 0 and not api.ep_ok.get("/odds"): caps["league_odds"] = False
@@ -1744,7 +1694,7 @@ def collect_day(api, cfg, log, progress, free=None):
 
     log(f"💰 Stage 1: bookmaker odds for {len(cand)} candidate matches...")
     if caps["league_odds"] is not False:
-        todo = {(c["league_id"], c["season"]) for c in cand} - probed_leagues
+        todo = {(c["league_id"], c["season"]) for c in cand}
         with ThreadPoolExecutor(max_workers=cfg["workers"]) as ex:
             for fu in as_completed([ex.submit(fetch_league_odds, lid, s_) for lid, s_ in todo]):
                 try: store_odds(fu.result())
@@ -1970,201 +1920,82 @@ def collect_day(api, cfg, log, progress, free=None):
         out["matches"].append(rec)
 
     thin = sum(1 for r in out["matches"] if r["basis"] == "prior")
-    if thin: out["warnings"].append(f"{thin}/{len(out['matches'])} matches have NO team-specific data and are excluded from tickets.")
+    if thin: out["warnings"].append(f"{thin}/{len(out['matches'])} matches have NO team-specific data and are excluded.")
     if free.intl_extra: free.used["espn-recent-results"] = free.intl_extra
     if free.enabled and free.used: log(f"🆓 Free sources helped: {dict(free.used)} | ≈{free.saved_calls} API calls avoided")
     progress(0.90)
     return out
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Evidence packs for the AI
+# AI Analysis & Selection
 # ═════════════════════════════════════════════════════════════════════════════
-DESK_PROMPT = """You are a sharp sportsbook trader. Build ONE accumulator ticket from the CANDIDATES below.
-KEY: dq=data quality; xG home-away; mdl=model 1X2%; mkt=bookmaker 1/X/2; ppg/gf/ga=form; TRAP=risk score. LEGS: id@odds/p=blended%/m=market% (~=borderline, ^=estimated).
-RULES: 
-1) Use ONLY leg ids shown. 
-2) Select 3 to 5 legs from DIFFERENT matches. (If you can only find 3-4 strong legs, output them, Python will fill the rest).
-3) DIVERSITY IS MANDATORY: MAX ONE '12' (Either team to win) leg per ticket. MAX TWO legs of ANY single market type (e.g., max two Over/Under legs).
-4) Aim for product of odds >= 3.0. 
-5) Maximise joint probability: prefer p>=70%. 
-6) For each leg, state the losing scenario in <=6 words.
-OUTPUT: ONE valid JSON object only, no markdown, no other text. Start with { and end with }.
-{"tickets":[{"legs":[{"id":"m1.1X","why":"<=8 words","fail":"<=6 words"}],"logic":"<=20 words","risk":"LOW|MED"}]}"""
+AI_PROMPT = """You are an expert sports quant analyst. Below is a list of football matches with statistical data, model probabilities, and bookmaker odds.
+Your task: Select the TOP 10 safest and most valuable matches to bet on individually. If fewer than 10 are truly safe, return only the ones that meet a high standard (probability >= 65%, low trap risk, good data quality).
 
-BRIEF_ADDENDUM = "\nIMPORTANT: Output ONLY the JSON object. No markdown, no explanations. Ensure 'id' matches exactly the leg ids provided."
+For each selected match, output a JSON object in an array with:
+- "match": "Home v Away"
+- "league": "League Name"
+- "pick": "The specific market and selection (e.g., 'Home Win', 'Over 1.5 Goals', 'BTTS - Yes')"
+- "odds": The bookmaker odds (number)
+- "probability": The blended model+market probability in percent (number, e.g., 75)
+- "reason": A brief, 1-sentence explanation of why this is a safe/valuable pick based on the data (xG, form, trap score).
+- "risk": "LOW", "MED", or "HIGH"
 
-DESK_ROLES = ["This is Ticket 1: the SAFEST possible ticket.",
-              "This is Ticket 2: BALANCED - strong probability plus some positive edge.",
-              "This is Ticket 3: VALUE - the best price-versus-evidence legs that are still solid."]
+RULES:
+1. Output ONLY a valid JSON array `[...]`. No markdown, no other text.
+2. STRICTLY AVOID "Either team to win" (12) unless the data is overwhelmingly strong, as it offers poor value. Prefer 1X, X2, Over 1.5, or BTTS Yes.
+3. Avoid matches with TRAP scores >= 40 unless you explicitly justify it in the reason.
+4. Prioritize matches with Data Quality (dq) >= 0.6.
 
-SCOUT_PROMPT = """You are head of trading. Pick the @K@ best matches from the @N@ candidates for accumulator legs.
-REJECT: TRAP>=45 fav wins, dq<0.6, unknown injuries, friendlies, model vs market gap >8pts, only ~ legs.
-OUTPUT: ONE valid JSON object only.
-{"keep":["a3","a7"],"drop":[{"id":"a2","why":"<=8 words"}],"traps":[{"id":"a5","note":"<=14 words"}]}"""
+DATA:
+{data}
+"""
 
-AUDIT_PROMPT = """You are a risk officer. Review the @NT@ accumulator(s).
-RULES: no fav-win in TRAP>=45; Over1.5 needs xG>=2.6, Over2.5>=3.0, Under2.5<=2.3, BTTS-No needs side xG<=0.9; p vs m gaps >8% need evidence; distinct matches; ticket odds >=3.0.
-ok=true keeps a leg. ok=false needs a swap from ALT or POOL.
-OUTPUT: ONE valid JSON object only.
-{"legs":[{"id":"m3.1X","ok":true,"risk":"LOW|MED|HIGH","issue":"<=14 words"}],"swaps":[{"old":"m4.O2.5","new":"m4.O1.5"}],"fills":[{"t":2,"id":"m9.1X"}],"note":"<=30 words"}"""
+def format_matches_for_ai(matches, tz, max_n=15):
+    sorted_matches = sorted(matches, key=lambda m: (m["dq"], m["legs"][0]["rank"] if m["legs"] else 0), reverse=True)
+    top_matches = sorted_matches[:max_n]
+    
+    lines = []
+    for i, m in enumerate(top_matches):
+        mid = f"m{i+1}"
+        ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
+        legs_str = " | ".join([f"{l['label']} @{l['odds']:.2f} (p:{_pct(l['p'])}%)" for l in m["legs"][:3]])
+        trap_str = f" | TRAP:{m['trap']['risk']}" if m["trap"]["risk"] >= 25 else ""
+        lines.append(f"{mid}. {m['league']} | {m['home']} v {m['away']} ({ko}) | dq:{m['dq']}{trap_str}\n   Options: {legs_str}")
+    
+    return "\n".join(lines)
 
-def desk_prompt(ti, n_tickets, reuse, relaxed=False):
-    return (DESK_PROMPT.replace("@WHAT@", f"ticket {ti + 1} of {n_tickets}: one 5-leg accumulator")
-            .replace("@STRUCT@", "Exactly 1 ticket of 3 to 5 legs from different matches." + (" Earlier tickets are listed below; avoid their legs and matches wherever possible." if reuse and ti > 0 else ""))
-            .replace("@ROLE@", DESK_ROLES[min(ti, 2)])
-            .replace("@RELAXED@", "\n- The slate is thin so some safety thresholds were relaxed: be stricter yourself, prefer the best available legs, mark risk MED where honest." if relaxed else ""))
-
-def scout_prompt(n, k, n_tickets, need):
-    return SCOUT_PROMPT.replace("@N@", str(n)).replace("@K@", str(k)).replace("@NT@", str(n_tickets)).replace("@NEED@", str(need))
-
-def audit_prompt(n_tickets):
-    return AUDIT_PROMPT.replace("@NT@", str(n_tickets))
-
-def _leg_txt(mid, l):
-    s = f"{mid}.{l['key']}@{l['odds']:.2f}/p{_pct(l['p'])}/m{_pct(l['p_mkt'])}"
-    if l.get("tier") == "B": s += "~"
-    if l.get("src") in ("est", "derived"): s += "^"
-    return s
-
-def _inj_txt(pr, m):
-    if not m.get("inj_known"): return "n/a"
-    items = [f"{_short((i['name'] or '?').split(' ')[-1], 10)}{'*' if i['key'] else ''}({i['pos'] or '?'}){'?' if i['type'] != 'Missing Fixture' else ''}" for i in pr.get("inj", [])[:5]]
-    return ",".join(items) if items else "-"
-
-def _lu_txt(pr):
-    l = pr.get("lineup")
-    return "?" if not l else (l["formation"] or "ok") + ("ROT" if l["rotation"] else "")
-
-def _side_txt(pr, lab, last=False):
-    if not pr.get("n"): return f"{lab} n/a"
-    rt = f" rt{pr['team_rating']:.1f}" if pr.get("team_rating") else ""
-    lst = f" last[{','.join(pr['last'][:4])}]" if last and pr.get("last") else ""
-    return f"{lab} {pr['form5']} ppg{pr['ppg5']:.1f} gf{pr['gf_w']:.1f} ga{pr['ga_w']:.1f}{rt}{lst}"
-
-def _mkt_txt(m):
-    o = m["odds"]
-    if all(k in o for k in ("1", "X", "2")):
-        t = "/".join(f"{o[k]['odds']:.2f}" for k in ("1", "X", "2"))
-        return t + ("(fd)" if str(m.get("odds_src") or "").startswith("free") else "")
-    return "n/a"
-
-def _ext_txt(m):
-    d = m.get("ext_d")
-    if not d: return "n/a"
-    return f"{'elo' if m.get('ext_src') == 'elo' or (not m.get('api_1x2') and m.get('elo')) else 'API'} " + "/".join(str(_pct(d[k])) for k in ("1", "X", "2"))
-
-def format_match_block(mid, m, n_legs, tz, detail=3):
-    p = m["p"]
-    ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
-    ph, pa = m["ph"], m["pa"]
-    age = (m.get("form_age_days") or 0)
-    tags = (f" form{age}d" if age > 30 else "") + (" NATIONAL" if (m.get("elo") or {}).get("intl") else "")
-    legs = " ; ".join(_leg_txt(mid, l) for l in m["legs"][:n_legs])
-    goals = f" | BTTS{_pct(p['BTTS_Y'])} O1.5:{_pct(p['O1.5'])} O2.5:{_pct(p['O2.5'])} U2.5:{_pct(p['U2.5'])}" if detail >= 2 else ""
-    corn = f" crn{m['exp_corners']:.1f}" if detail >= 2 and m.get("corner_n", 0) >= 3 else ""
-    out = [f"#{mid} {m['cat']}|{_short(m['league'], 14)} {_short(m['home'], 14)} v {_short(m['away'], 14)} {ko} dq{m['dq']} {BASIS_TAG.get(m['basis'], '?')}{tags}",
-           f"xG{m['lam_h']:.2f}-{m['lam_a']:.2f} mdl{_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])} mkt{_mkt_txt(m)} {_ext_txt(m)}{goals}{corn}"]
-    if detail >= 2:
-        rk = f" rk{m['st_h']['rank']}/{m['st_a']['rank']}" if m.get("st_h") and m.get("st_a") else ""
-        h2 = f" | H2H{m['h2h']['n']} {m['h2h']['w']}-{m['h2h']['d']}-{m['h2h']['l']}" if m.get("h2h") else ""
-        out.append(f"{_side_txt(ph, 'H', detail >= 3)} | {_side_txt(pa, 'A', detail >= 3)}{rk}{h2}")
-    extra = []
-    if not m.get("inj_known"): extra.append("inj n/a")
+def get_ai_picks(matches, tz, log):
+    if not matches:
+        return [], "No matches passed the evidence gate."
+    
+    data_str = format_matches_for_ai(matches, tz, max_n=15)
+    prompt = AI_PROMPT.replace("{data}", data_str)
+    
+    budget = TokenBudget(30000)
+    gov = TpmGovernor(8000)
+    
+    log("🤖 AI Analyst: Selecting the top safest and most valuable matches...")
+    parsed, info = call_groq_budgeted(
+        "You are an expert sports quant analyst. Output ONLY valid JSON.",
+        prompt,
+        budget,
+        2.3,
+        effort="low",
+        gov=gov,
+        ceiling=8000,
+        expect="list",
+        log_fn=log
+    )
+    
+    if parsed and isinstance(parsed, list):
+        valid_picks = []
+        for item in parsed:
+            if isinstance(item, dict) and "match" in item and "pick" in item:
+                valid_picks.append(item)
+        return valid_picks, f"AI successfully returned {len(valid_picks)} picks."
     else:
-        hi, ai_ = _inj_txt(ph, m), _inj_txt(pa, m)
-        if hi != "-" or ai_ != "-": extra.append(f"inj H:{hi} A:{ai_}")
-    if ph.get("lineup") or pa.get("lineup"): extra.append(f"lu H:{_lu_txt(ph)} A:{_lu_txt(pa)}")
-    t = m["trap"]
-    if t["risk"] >= 25: extra.append(f"TRAP{t['risk']}: {', '.join(t['reasons'])}")
-    if extra: out.append(" | ".join(extra))
-    out.append("LEGS " + legs)
-    return "\n".join(out)
-
-def format_scout_block(aid, m, tz, n_legs=3):
-    ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
-    t = m["trap"]
-    if m.get("inj_known"):
-        ko_h = sum(1 for i in m["ph"].get("inj", []) if i["key"] and i["type"] == "Missing Fixture")
-        ko_a = sum(1 for i in m["pa"].get("inj", []) if i["key"] and i["type"] == "Missing Fixture")
-        inj = f"{ko_h}/{ko_a}"
-    else: inj = "n/a"
-    rot = "ROT" if any((pr.get("lineup") or {}).get("rotation") for pr in (m["ph"], m["pa"])) else ""
-    legs = " ".join(f"{l['key']}@{l['odds']:.2f}p{_pct(l['p'])}m{_pct(l['p_mkt'])}{'~' if l.get('tier') == 'B' else ''}" for l in m["legs"][:n_legs])
-    trap = f"T{t['risk']}" + (f":{t['reasons'][0]}" if t["risk"] >= 30 and t["reasons"] else "")
-    return (f"{aid} {m['cat']}|{_short(m['league'], 14)} {_short(m['home'], 13)} v {_short(m['away'], 13)} {ko} dq{m['dq']} {BASIS_TAG.get(m['basis'], '?')} "
-            f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f} mdl{_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])} mk{_mkt_txt(m)} "
-            f"{trap} inj{inj}{rot} | {legs}")
-
-def est_tokens(text, cpt): return int(len(text) / cpt) + 1
-
-def rank_matches(ms):
-    usable = [m for m in ms if m["legs"]]
-    usable.sort(key=lambda m: -(sum(l["rank"] for l in m["legs"][:2]) / min(2, len(m["legs"]))))
-    return usable
-
-PACK_LEVELS = [(3, 5), (3, 4), (2, 4), (2, 3), (1, 3), (1, 2)]
-
-def build_ai_pack(matches, tz, cpt, sys_prompt, floor, reserve, ceiling, labels, extra="", start_level=0, max_n=5):
-    top = [m for m in matches if m["legs"]][:max_n]
-    prompt_cap = ceiling - reserve - TOKEN_SAFETY
-    sys_tok = est_tokens(sys_prompt + extra, cpt)
-    floor = max(1, min(floor, len(top)))
-    for lvl in range(start_level, len(PACK_LEVELS)):
-        detail, n_legs = PACK_LEVELS[lvl]
-        for n in range(len(top), floor - 1, -1):
-            sel = top[:n]
-            user = (f"CANDIDATES: {len(sel)} matches. Build the ticket from these LEGS only.\n{extra}\n"
-                    + "\n".join(format_match_block(labels[id(m)], m, n_legs, tz, detail) for m in sel))
-            if sys_tok + est_tokens(user, cpt) <= prompt_cap:
-                return sel, {labels[id(m)]: m for m in sel}, user, n_legs, detail, lvl
-    sel = top[:floor]
-    user = "CANDIDATES:\n" + "\n".join(format_match_block(labels[id(m)], m, 2, tz, 1) for m in sel)
-    return sel, {labels[id(m)]: m for m in sel}, user, 2, 1, len(PACK_LEVELS) - 1
-
-def build_scout_pack(pool, tz, cpt, sys_prompt, reserve, ceiling):
-    prompt_cap = ceiling - reserve - TOKEN_SAFETY
-    sys_tok = est_tokens(sys_prompt, cpt)
-    for n_legs in (3, 2):
-        for n in range(len(pool), 5, -1):
-            sel = pool[:n]
-            ids = {f"a{i + 1}": m for i, m in enumerate(sel)}
-            user = f"SLATE ({len(sel)} matches):\n" + "\n".join(format_scout_block(a, m, tz, n_legs) for a, m in ids.items())
-            if sys_tok + est_tokens(user, cpt) <= prompt_cap:
-                return sel, ids, user
-    return None, {}, ""
-
-def _audit_leg_line(ti, li, l, m, match_legs, detail, flags):
-    mid = l["mid"]
-    alts = [x for x in match_legs.get(mid, []) if x["key"] != l["key"]][:3]
-    ev = (f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f} mdl{_pct(m['model_p']['1'])}/{_pct(m['model_p']['X'])}/{_pct(m['model_p']['2'])} dq{m['dq']} "
-          f"| {_side_txt(m['ph'], 'H', detail >= 2)} | {_side_txt(m['pa'], 'A', detail >= 2)} | inj H:{_inj_txt(m['ph'], m)} A:{_inj_txt(m['pa'], m)}")
-    if detail >= 2:
-        h2 = f" | H2H{m['h2h']['n']} {m['h2h']['w']}-{m['h2h']['d']}-{m['h2h']['l']}" if m.get("h2h") else ""
-        ev += f" | lu H:{_lu_txt(m['ph'])} A:{_lu_txt(m['pa'])}{h2}"
-    t = m["trap"]
-    return (f" {li + 1}) {_leg_txt(mid, l)} | {_short(m['home'], 14)} v {_short(m['away'], 14)} [{_short(m['league'], 14)}] {ev} | TRAP{t['risk']}"
-            f"{(':' + ','.join(t['reasons'][:2])) if t['risk'] >= 30 else ''} | ALT {' ; '.join(_leg_txt(mid, a) for a in alts) or '-'}"
-            f"{' | FLAGS ' + ','.join(flags) if flags else ''}")
-
-def build_audit_pack(tickets, match_legs, tz, cpt, sys_prompt, reserve, ceiling, per, distinct):
-    prompt_cap = ceiling - reserve - TOKEN_SAFETY
-    sys_tok = est_tokens(sys_prompt, cpt)
-    used = {l["mid"] for t in tickets for l in t["legs"]}
-    pool_mids = [mid for mid, lst in match_legs.items() if lst and (mid not in used or not distinct)]
-    pool_mids.sort(key=lambda mid: -match_legs[mid][0]["rank"])
-    for detail in (2, 1):
-        for n_pool in (6, 4, 2):
-            lines = []
-            for ti, t in enumerate(tickets):
-                lines.append(f"T{ti + 1} '{t['name']}' odds {_tprod(t['legs']):.2f} joint p~{_pct(_tprod(t['legs'], 'p'))}% ({len(t['legs'])}/{per} legs)")
-                for li, l in enumerate(t["legs"]):
-                    lines.append(_audit_leg_line(ti, li, l, l["match"], match_legs, detail, lint_leg(l)))
-                if len(t["legs"]) < per: lines.append(f" GAP: ticket {ti + 1} needs {per - len(t['legs'])} more leg(s)")
-            pool_lines = [f" {mid} {_short(match_legs[mid][0]['match']['home'], 13)} v {_short(match_legs[mid][0]['match']['away'], 13)}: "
-                          + " ; ".join(_leg_txt(mid, x) for x in match_legs[mid][:2]) for mid in pool_mids[:n_pool]]
-            user = "\n".join(lines) + "\nPOOL (unused matches):\n" + ("\n".join(pool_lines) if pool_lines else " none")
-            if sys_tok + est_tokens(user, cpt) <= prompt_cap: return user
-    return None
+        return [], f"AI failed to return valid JSON: {info.get('status')}. Check 'AI passes' for details."
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Groq: per-minute token governor, budgeted calls
@@ -2261,7 +2092,7 @@ def _mark_dead(model):
         save_state(st_)
     except Exception: pass
 
-def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov=None, ceiling=None, expect="tickets", log_fn=None, label="desk"):
+def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov=None, ceiling=None, expect="list", log_fn=None, label="desk"):
     api_key = get_secret("GROQ_API_KEY", "").strip()
     log = []
     info = {"attempts": log, "model": None, "prompt_tokens": 0, "completion_tokens": 0, "label": label, "waited": 0.0, "fallback": False}
@@ -2276,16 +2107,13 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
     too_large = False
     p_real_max = 0
     
-    def is_valid_tickets(p):
-        if not isinstance(p, dict): return False
-        # ACCEPT 3 to 5 legs. If AI finds only 3-4 strong legs, we accept it and let Python fill the rest.
-        if "ticket" in p and isinstance(p["ticket"], dict) and isinstance(p["ticket"].get("legs"), list) and 3 <= len(p["ticket"]["legs"]) <= 5:
-            return True
-        if "tickets" in p and isinstance(p["tickets"], list) and len(p["tickets"]) > 0 and isinstance(p["tickets"][0], dict) and isinstance(p["tickets"][0].get("legs"), list) and 3 <= len(p["tickets"][0]["legs"]) <= 5:
-            return True
-        return False
-
-    valid = is_valid_tickets if expect == "tickets" else (lambda p: isinstance(p, dict) and bool(p.get(expect)))
+    if expect == "list":
+        valid = lambda p: isinstance(p, list) and len(p) > 0 and isinstance(p[0], dict)
+    elif expect == "legs":
+        valid = lambda p: isinstance(p, dict) and isinstance(p.get("legs"), list)
+    else:
+        valid = lambda p: isinstance(p, dict) and bool(p.get(expect))
+        
     dead = _dead_models()
     models = [m for m in GROQ_MODELS if m not in dead] or GROQ_MODELS[:2]
     
@@ -2415,460 +2243,6 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
     return None, info
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Ticket validation / repair / deterministic optimiser
-# ═════════════════════════════════════════════════════════════════════════════
-def _tprod(legs, k="odds"):
-    return float(np.prod([l[k] for l in legs])) if legs else 0.0
-
-def optimize_tickets(match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, min_odds=MIN_TICKET_ODDS, iters=6000, seed=11):
-    mids = [m for m, l in match_legs.items() if l]
-    mids.sort(key=lambda m: -match_legs[m][0]["rank"])
-    if len(mids) < per: return []
-    need = n_tickets * per
-    strict = len(mids) >= need
-    pool = mids[: need + 6] if strict else mids
-    rnd = random.Random(seed)
-    tickets = []
-    for t in range(n_tickets):
-        if strict: tickets.append([[pool[i], 0] for i in range(t, need, n_tickets)][:per])
-        else: tickets.append([[pool[(t * per + j) % len(pool)], 0] for j in range(per)])
-    used = {e[0] for t in tickets for e in t}
-    def tscore(t):
-        legs = [match_legs[m][i] for m, i in t]
-        lp = sum(math.log(l["p_adj"]) for l in legs)
-        lo = sum(math.log(l["odds"]) for l in legs)
-        fam = defaultdict(int)
-        for l in legs: fam[l["fam"]] += 1
-        
-        # MASSIVE penalty for lack of diversification to prevent "12" spam
-        div = 0.0
-        for c in fam.values():
-            if c > 2:
-                div -= (c - 2) * 10.0
-        
-        count_12 = sum(1 for l in legs if l["key"] == "12")
-        if count_12 > 1:
-            div -= (count_12 - 1) * 20.0  # Extreme penalty for multiple 12s
-            
-        div -= 0.05 * sum(1 for l in legs if l.get("tier") == "B")
-        
-        return lp - 50 * max(0.0, math.log(min_odds) - lo) + div
-    def total(): return sum(tscore(t) for t in tickets)
-    best = total()
-    for _ in range(iters):
-        mv = rnd.random()
-        a = rnd.randrange(len(tickets))
-        ia = rnd.randrange(len(tickets[a]))
-        old = [list(map(list, t)) for t in tickets]
-        if mv < 0.4 and len(tickets) > 1:
-            b = rnd.randrange(len(tickets))
-            ib = rnd.randrange(len(tickets[b]))
-            tickets[a][ia], tickets[b][ib] = tickets[b][ib], tickets[a][ia]
-            if len({e[0] for e in tickets[a]}) < len(tickets[a]) or len({e[0] for e in tickets[b]}) < len(tickets[b]):
-                tickets = old
-                continue
-        elif mv < 0.75:
-            m_ = tickets[a][ia][0]
-            tickets[a][ia][1] = rnd.randrange(len(match_legs[m_]))
-        else:
-            free = [m for m in pool if m not in used] if strict else [m for m in pool if m not in {e[0] for e in tickets[a]}]
-            if not free: continue
-            new = rnd.choice(free)
-            tickets[a][ia] = [new, 0]
-        sc = total()
-        if sc >= best:
-            best = sc
-            used = {e[0] for t in tickets for e in t}
-        else: tickets = old
-    return [[dict(match_legs[m][i], mid=m) for m, i in t] for t in tickets]
-
-def enforce_min_odds(legs, match_legs, used, min_odds=MIN_TICKET_ODDS):
-    fixed = False
-    for _ in range(12):
-        if _tprod(legs) >= min_odds: break
-        cur = {l["mid"] for l in legs}
-        best, best_s = None, 0
-        for i, l in enumerate(legs):
-            opts = [dict(x, mid=l["mid"]) for x in match_legs.get(l["mid"], []) if x["odds"] > l["odds"]]
-            for mid, lst in match_legs.items():
-                if mid not in used and mid not in cur:
-                    opts += [dict(x, mid=mid) for x in lst if x["odds"] > l["odds"]]
-            for o in opts:
-                gain = math.log(o["odds"] / l["odds"])
-                loss = max(1e-4, math.log(l["p_adj"]) - math.log(o["p_adj"])) + 0.02
-                s = gain / loss
-                if s > best_s: best, best_s = (i, o), s
-        if not best: break
-        legs[best[0]] = dict(best[1], why="Python swap: AI ticket was below the 3.0 minimum odds", swapped=True, by="PY")
-        fixed = True
-    return legs, fixed
-
-def python_only_tickets(match_legs, n_tickets=N_TICKETS):
-    tks = optimize_tickets(match_legs, n_tickets=n_tickets)
-    out = []
-    for i, legs in enumerate(tks):
-        for l in legs: l["why"] = f"p{_pct(l['p'])}% odds {l['odds']:.2f}"; l["by"] = "PY"
-        out.append({"name": TICKET_LABELS[i], "legs": legs, "risk": "", "repaired": False, "odds": _tprod(legs),
-                    "p_joint": _tprod(legs, "p"), "valid": _tprod(legs) >= MIN_TICKET_ODDS, "ai_kept": 0,
-                    "logic": "Deterministic Python optimiser (AI unavailable): maximises joint probability with trap/data-quality penalties and odds >= 3.0."})
-    return out
-
-HARD_FLAGS = {"trap-fav", "xg-rule"}
-def lint_leg(l):
-    m, key = l["match"], l["key"]
-    flags = []
-    tot, lh, la = m["lam_h"] + m["lam_a"], m["lam_h"], m["lam_a"]
-    fav, risk = m["trap"]["fav"], m["trap"]["risk"]
-    if fav and key == fav and risk >= 45: flags.append("trap-fav")
-    if ((key == "O1.5" and tot < 2.6) or (key == "O2.5" and tot < 3.0) or (key == "U2.5" and tot > 2.3)
-        or (key == "BTTS_N" and min(lh, la) > 0.9) or (key == "H_O1.5" and lh < 1.9) or (key == "A_O1.5" and la < 1.9)):
-        flags.append("xg-rule")
-    if key.startswith("C_") and m["dq"] < 0.6: flags.append("corners-lowdq")
-    if str(l.get("by", "")).startswith("AI") and abs(l["p"] - l["p_mkt"]) > 0.08 and not l.get("vs"): flags.append("gap-unexplained")
-    if l.get("tier") == "B": flags.append("borderline")
-    if m["dq"] < 0.55: flags.append("thin-data")
-    if not m.get("inj_known") and fav and key == fav: flags.append("inj-unknown")
-    return flags
-
-def finish_ticket(t, per=LEGS_PER_TICKET):
-    legs = t["legs"]
-    t["odds"], t["p_joint"] = _tprod(legs), _tprod(legs, "p")
-    t["valid"] = len(legs) == per and t["odds"] >= MIN_TICKET_ODDS
-    t["ai_kept"] = sum(1 for l in legs if str(l.get("by", "")).startswith("AI"))
-    t["py_legs"] = sum(1 for l in legs if l.get("by") == "PY")
-    fam = defaultdict(int)
-    for l in legs:
-        l["flags"] = lint_leg(l)
-        fam[l["fam"]] += 1
-    t["stacked"] = any(c >= 4 for c in fam.values())
-    return t
-
-def parse_ai_tickets(ai, leg_index, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, distinct=True):
-    raw = (ai or {}).get("tickets")
-    if not raw:
-        single = (ai or {}).get("ticket")
-        if single and isinstance(single, dict):
-            raw = [single]
-        else:
-            raw = []
-    
-    used, tickets = set(), []
-    for ti in range(n_tickets):
-        t = raw[ti] if ti < len(raw) and isinstance(raw[ti], dict) else {}
-        legs, repaired = [], False
-        for it in t.get("legs") or []:
-            d = it if isinstance(it, dict) else {"id": str(it)}
-            raw_id = str(d.get("id") or "").strip().lower()
-            
-            lg = leg_index.get(raw_id)
-            if not lg:
-                parts = raw_id.split(".")
-                if len(parts) == 2:
-                    match_id, key_part = parts[0], parts[1]
-                    for lid, leg in leg_index.items():
-                        if lid.startswith(match_id + ".") and leg["key"].lower() == key_part:
-                            lg = leg
-                            break
-                            
-            if not lg or lg["mid"] in used or lg["mid"] in {l["mid"] for l in legs}:
-                repaired = True
-                continue
-            legs.append(dict(lg, why=d.get("why", ""), fail=d.get("fail", ""), vs=d.get("vs", ""), by="AI"))
-        
-        if len(legs) > per:
-            legs, repaired = legs[:per], True
-            
-        if distinct:
-            used |= {l["mid"] for l in legs}
-            
-        tickets.append({
-            "name": t.get("name") or TICKET_LABELS[min(ti, 2)], 
-            "legs": legs, 
-            "logic": t.get("logic", ""),
-            "risk": t.get("risk", ""), 
-            "repaired": repaired, 
-            "audit_swaps": 0
-        })
-    return tickets
-
-def apply_audit(tickets, aud, leg_index, match_legs, per=LEGS_PER_TICKET, distinct=True):
-    changes = []
-    verdict = {}
-    for v in (aud or {}).get("legs") or []:
-        if isinstance(v, dict) and v.get("id"): verdict[str(v["id"]).strip().lower()] = v
-    for t in tickets:
-        for l in t["legs"]:
-            v = verdict.get(l["id"].lower())
-            if v: l["audit"] = {"ok": bool(v.get("ok", True)), "risk": str(v.get("risk", "") or "")[:6], "issue": str(v.get("issue", "") or "")[:140]}
-        def others(t, leg=None): return {x["mid"] for x in t["legs"] if x is not leg}
-        def taken_elsewhere(t): return {x["mid"] for tt in tickets if tt is not t for x in tt["legs"]} if distinct else set()
-        for sw in (aud or {}).get("swaps") or []:
-            if not isinstance(sw, dict): continue
-            old, new = str(sw.get("old") or "").strip().lower(), leg_index.get(str(sw.get("new") or "").strip().lower())
-            if not new: continue
-            for t in tickets:
-                for i, l in enumerate(t["legs"]):
-                    if l["id"].lower() != old or l["id"].lower() == new["id"].lower(): continue
-                    if new["mid"] != l["mid"] and (new["mid"] in others(t, l) or new["mid"] in taken_elsewhere(t)): continue
-                    cand = dict(new, why=(l.get("why") or "") + " | audit swap", fail=l.get("fail", ""), vs="", by="AI2",
-                                audit={"ok": True, "risk": "", "issue": (l.get("audit") or {}).get("issue", "")})
-                    trial = t["legs"][:i] + [cand] + t["legs"][i + 1:]
-                    if _tprod(trial) < MIN_TICKET_ODDS <= _tprod(t["legs"]): continue
-                    t["legs"] = trial
-                    t["audit_swaps"] = t.get("audit_swaps", 0) + 1
-                    changes.append(f"{l['id']} -> {new['id']}")
-                    break
-        for fl in (aud or {}).get("fills") or []:
-            if not isinstance(fl, dict): continue
-            try: ti = int(fl.get("t")) - 1
-            except Exception: continue
-            new = leg_index.get(str(fl.get("id") or "").strip().lower())
-            if not new or not (0 <= ti < len(tickets)): continue
-            t = tickets[ti]
-            if len(t["legs"]) >= per or new["mid"] in others(t) or new["mid"] in taken_elsewhere(t): continue
-            t["legs"].append(dict(new, why="audit gap-fill", fail="", vs="", by="AI2", audit={"ok": True, "risk": "", "issue": ""}))
-            changes.append(f"gap-fill T{ti + 1}: {new['id']}")
-    return changes
-
-def py_fix_breaches(tickets, match_legs):
-    fixed = []
-    for t in tickets:
-        for i, l in enumerate(t["legs"]):
-            hard = [f for f in lint_leg(l) if f in HARD_FLAGS]
-            if not hard: continue
-            alts = [x for x in match_legs.get(l["mid"], []) if x["key"] != l["key"] and not [f for f in lint_leg(x) if f in HARD_FLAGS] and x["tier"] == "S"]
-            if not alts: continue
-            best = max(alts, key=lambda x: x["p_adj"])
-            trial = t["legs"][:i] + [dict(best, why=f"Python rule-fix: '{l['label']}' broke rule {hard[0]}", fail="", vs="", by="PY")] + t["legs"][i + 1:]
-            if _tprod(trial) < MIN_TICKET_ODDS <= _tprod(t["legs"]): continue
-            t["legs"] = trial
-            t["repaired"] = True
-            fixed.append(f"{l['id']} -> {best['id']} ({hard[0]})")
-    return fixed
-
-def complete_tickets(tickets, match_legs, per=LEGS_PER_TICKET, distinct=True):
-    fallback = None
-    n = len(tickets)
-    valid_tickets = []
-    for ti, t in enumerate(tickets):
-        legs = t["legs"]
-        taken_other = {l["mid"] for tj, tk in enumerate(tickets) if tj != ti for l in tk["legs"]} if distinct else set()
-        if len(legs) < per:
-            t["repaired"] = True
-            if fallback is None: fallback = optimize_tickets(match_legs, n_tickets=max(1, n))
-            pool_ = [l for tk in fallback for l in tk] + [dict(x, mid=k) for k, v in match_legs.items() for x in v[:3]]
-            while len(legs) < per:
-                cur_m = {x["mid"] for x in legs}
-                avail = [c for c in pool_ if c["mid"] not in taken_other and c["mid"] not in cur_m]
-                if not avail: break
-                
-                # STRICT DIVERSITY CHECK before adding a leg
-                fam = defaultdict(int)
-                for l in legs: fam[l["fam"]] += 1
-                count_12 = sum(1 for l in legs if l["key"] == "12")
-                
-                safe_avail = []
-                for c in avail:
-                    test_fam = defaultdict(int, fam)
-                    test_fam[c["fam"]] += 1
-                    test_count_12 = count_12 + (1 if c["key"] == "12" else 0)
-                    
-                    if test_count_12 <= 1 and max(test_fam.values()) <= 2:
-                        safe_avail.append(c)
-                
-                if not safe_avail:
-                    break # No safe diverse legs available
-                    
-                cur, need = max(_tprod(legs), 1.0), per - len(legs)
-                target = (MIN_TICKET_ODDS * 1.03 / cur) ** (1 / need) if cur < MIN_TICKET_ODDS * 1.03 else 1.15
-                c = max(safe_avail, key=lambda x: x["rank"] - 0.4 * max(0.0, math.log(x["odds"] / (target * 1.15))))
-                legs.append(dict(c, why="Python fill-in (AI leg missing/invalid/duplicate)", fail="", vs="", by="PY"))
-            
-            legs, up = enforce_min_odds(legs, match_legs, taken_other)
-            t["legs"] = legs
-            t["repaired"] = bool(t.get("repaired") or up)
-        
-        finish_ticket(t, per)
-        
-        # FINAL DIVERSITY CHECK: If the ticket still has >1 "12" legs or >2 of any market type, REJECT IT.
-        fam = defaultdict(int)
-        for l in t["legs"]: fam[l["fam"]] += 1
-        count_12 = sum(1 for l in t["legs"] if l["key"] == "12")
-        
-        if count_12 <= 1 and max(fam.values()) <= 2 and t["valid"] and t["odds"] >= MIN_TICKET_ODDS:
-            valid_tickets.append(t)
-            
-    return valid_tickets
-
-def finalize_tickets(ai, leg_index, match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, distinct=True):
-    return complete_tickets(parse_ai_tickets(ai, leg_index, n_tickets, per, distinct), match_legs, per, distinct)
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Telegram
-# ═════════════════════════════════════════════════════════════════════════════
-def send_telegram(text):
-    tok, chat = get_secret("TELEGRAM_BOT_TOKEN"), get_secret("TELEGRAM_CHAT_ID")
-    if not tok or not chat: return False, "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing"
-    chunks, cur = [], ""
-    for para in text.split("\n"):
-        if len(cur) + len(para) + 2 > 3800:
-            chunks.append(cur)
-            cur = ""
-        cur += (("\n" if cur else "") + para)
-    chunks.append(cur)
-    for c in chunks:
-        try:
-            r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                              json={"chat_id": chat, "text": c, "parse_mode": "HTML", "disable_web_page_preview": True}, timeout=15)
-            if r.status_code != 200: return False, f"HTTP {r.status_code}: {r.text[:120]}"
-        except Exception as e: return False, str(e)
-        time.sleep(0.4)
-    return True, "sent"
-
-def build_aifail_message(res, tz):
-    return (f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])}\n🤖 <b>AI analysis did not complete - no tickets sent.</b>\n"
-            f"{_esc(res.get('ai_note') or 'See the app for details.')[:400]}\n"
-            "The data was collected successfully. Open the app and press 'Re-run AI analysis' - it reuses the data and costs no API-Football calls.")
-
-def build_nobet_message(res, tz):
-    reasons = defaultdict(int)
-    for e in res.get("excluded", []): reasons[e["reason"]] += 1
-    lines = "\n".join(f"• {_esc(k)}: {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:6])
-    return (f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])}\n🛑 <b>NO BET TODAY</b>\n{_esc(res.get('reason', 'No valid diverse tickets found meeting the 3.0 odds requirement.'))}"
-            + (f"\n<b>Why matches were excluded</b>\n{lines}" if lines else "")
-            + f"\nAPI calls used: {res.get('api_calls', 0)}. AI analysis requires strict adherence to value and odds thresholds. No Python fallback is used to ensure quality.")
-
-def _flag_txt(l):
-    show = [f for f in (l.get("flags") or []) if f in HARD_FLAGS or f in ("gap-unexplained", "thin-data", "inj-unknown", "corners-lowdq")]
-    return ("⚠ " + ",".join(show)) if show else ""
-
-def _by_txt(l):
-    b = str(l.get("by") or "")
-    return "🤖✓ AI+audit" if b == "AI2" else "🤖 AI" if b == "AI" else "🐍 Python" if b == "PY" else ""
-
-def build_telegram_message(res, tz):
-    nums = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-    L = [f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])} | {res['n_analysed']} matches analysed | {res['n_ai']} studied by the AI desk"]
-    if res.get("fallback_model"): L.append("⚠️ <b>A smaller fallback AI model took part</b> (the top model was rate-limited). Treat this slate with extra caution or re-run later.")
-    if res.get("relaxed"): L.append("⚠️ <b>Thin slate - safety thresholds relaxed:</b> " + _esc("; ".join(res["relaxed"])) + ". Stakes should be smaller than usual.")
-    if res.get("est_mode"): L.append("⚠️ <b>Approximate odds:</b> bookmaker prices were unavailable for some legs, so odds are model-estimated. Confirm the price on your bookmaker.")
-    for t in res["tickets"]:
-        ok = "✅" if t["valid"] else "⚠️"
-        s = (f"🎟 <b>{_esc(t['name'])}</b> {ok}\nOdds <b>{t['odds']:.2f}</b> | joint prob ~{_pct(t['p_joint'])}% | risk {_esc(t.get('risk') or '-')} | evidence {t.get('grade', '?')}"
-             f" | 🤖 AI legs {t.get('ai_kept', 0)}/{len(t['legs'])}" + (f" | 🐍 Python legs {t.get('py_legs', 0)}" if t.get("py_legs") else ""))
-        for i, l in enumerate(t["legs"]):
-            m = l["match"]
-            ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
-            px = ""
-            if l.get("src") == "est": px = " est.odds"
-            elif l.get("src") == "derived": px = " derived odds"
-            s += (f"\n{nums[i]} <i>{_esc(_short(m['league'], 22))}</i> {ko}\n{_esc(m['home'])} v {_esc(m['away'])}\n"
-                  f"   ➜ <b>{_esc(l['label'])}</b> @{l['odds']:.2f}{' (books ' + format(l['odds_lo'], '.2f') + '-' + format(l['odds_hi'], '.2f') + ')' if l.get('odds_lo') else ''}"
-                  f" (p {_pct(l['p'])}%{px}) {_by_txt(l)}")
-            if l.get("why"): s += f"\n💡 {_esc(l['why'])}"
-            if l.get("fail"): s += f"\n🧯 loses if: {_esc(l['fail'])}"
-            au = l.get("audit") or {}
-            if au.get("issue") and (not au.get("ok", True) or au.get("risk") in ("MED", "HIGH")): s += f"\n🔎 audit: {_esc(au['issue'])}"
-            ft = _flag_txt(l)
-            if ft: s += f"\n{_esc(ft)}"
-        if t.get("logic"): s += f"\n🧠 {_esc(t['logic'])}"
-        if t.get("repaired"): s += "\n🔧 Python completed/adjusted part of this ticket (🐍 legs): AI leg missing/invalid, rule breach or odds below 3.0."
-        L.append(s)
-    ai = res.get("ai") or {}
-    traps = [f"• {_esc(res['id_map'][x['id']]['home'])} v {_esc(res['id_map'][x['id']]['away'])}: {_esc(x.get('note'))}"
-             for x in (ai.get("traps") or [])[:4] if x.get("id") in res["id_map"]]
-    traps += [f"• {_esc(x['match'])}: {_esc(x.get('note'))}" for x in ((res.get("scout") or {}).get("traps") or [])[:3]]
-    if traps: L.append("🪤 <b>Trap watch</b>\n" + "\n".join(traps[:6]))
-    if ai.get("avoid"):
-        L.append("🚫 <b>Avoid</b>\n" + "\n".join(f"• {_esc(res['id_map'][x['id']]['home'])} v {_esc(res['id_map'][x['id']]['away'])}: {_esc(x.get('why'))}"
-                         for x in ai["avoid"][:4] if x.get("id") in res["id_map"]))
-    if ai.get("audit_note"): L.append(f"🕵️ <b>Risk officer</b>\n{_esc(ai['audit_note'])}")
-    if ai.get("summary"): L.append(f"📝 <b>Slate read</b>\n{_esc(ai['summary'])}")
-    if not res.get("model"):
-        L.append("ℹ️ <b>AI reasoning was not applied</b> - these tickets come from the Python Monte Carlo optimiser only (🐍)."
-                 + (f" ({_esc(res.get('ai_note'))[:180]})" if res.get("ai_note") else ""))
-    ps = "/".join(p["pass"].split(" ")[0] for p in res.get("passes", []) if p.get("status") == "SUCCESS") or "-"
-    foot = (f"🤖 {_esc(res.get('model') or 'Python optimiser')} | passes {ps} | AI tokens {res.get('tokens', 0)} | "
-            f"API calls {res.get('api_calls', 0)}" + (f" | 🆓 free sources used" if (res.get("free") or {}).get("used") else "")
-            + " | ⚠️ Odds are bookmaker snapshots; betting carries risk.")
-    L.append(foot)
-    return "\n".join(L)
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Ticket ledger (settlement + calibration)
-# ═════════════════════════════════════════════════════════════════════════════
-def load_state():
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as fh: return json.load(fh)
-    except Exception: return {"history": [], "cpt": DEFAULT_CHARS_PER_TOKEN}
-
-def save_state(s):
-    try:
-        with open(STATE_PATH, "w", encoding="utf-8") as fh: json.dump(s, fh)
-    except Exception: pass
-
-def evaluate_leg(key, f):
-    h, a = _ft_goals(f)
-    if h is None or a is None: return None
-    tot = h + a
-    if key == "1": return h > a
-    if key == "X": return h == a
-    if key == "2": return h < a
-    if key == "1X": return h >= a
-    if key == "X2": return h <= a
-    if key == "12": return h != a
-    if key == "BTTS_Y": return h > 0 and a > 0
-    if key == "BTTS_N": return not (h > 0 and a > 0)
-    mm = re.match(r"(H_|A_|HT_|C_)?(O|U)([\d.]+)$", key)
-    if not mm: return None
-    pre, ou, line = mm.groups()
-    line = float(line)
-    if pre == "HT_":
-        ht = (f.get("score") or {}).get("halftime") or {}
-        if ht.get("home") is None: return None
-        val = ht["home"] + ht["away"]
-    elif pre == "C_":
-        c = []
-        for s in f.get("statistics") or []:
-            v = _stat_val(s.get("statistics"), "Corner Kicks")
-            if v is None: return None
-            c.append(v)
-        if len(c) < 2: return None
-        val = sum(c)
-    else: val = {None: tot, "H_": h, "A_": a}[pre]
-    return val > line if ou == "O" else val < line
-
-def settle_history(api, state, free=None):
-    free = free or FreeData(enabled=True)
-    free.target_date = datetime.now(timezone.utc).date().isoformat()
-    pend = [(e, l) for e in state["history"] if e.get("status") != "SETTLED" for t in e["tickets"] for l in t["legs"] if l.get("result") is None]
-    for e, l in pend:
-        home, away = l.get("home"), l.get("away")
-        if not home and " v " in (l.get("match") or ""): home, away = l["match"].split(" v ", 1)
-        if home and away and l.get("league_id") in FD_ALL:
-            f = free.result_for(home, away, l["league_id"], e["date"])
-            if f: l["result"] = evaluate_leg(l["key"], f)
-    ids = sorted({l["fid"] for e in state["history"] if e.get("status") != "SETTLED" for t in e["tickets"] for l in t["legs"]
-                  if l.get("result") is None and isinstance(l.get("fid"), int) and l["fid"] > 0})
-    fx = {}
-    if not api.offline:
-        for i in range(0, len(ids), 20):
-            for f in api.resp("/fixtures", {"ids": "-".join(map(str, ids[i:i + 20]))}, ttl=0):
-                if ((f.get("fixture") or {}).get("status") or {}).get("short") in PLAYED_OK:
-                    fx[f["fixture"]["id"]] = f
-    for e in state["history"]:
-        alive = False
-        for t in e["tickets"]:
-            for l in t["legs"]:
-                if l.get("result") is None and l["fid"] in fx:
-                    l["result"] = evaluate_leg(l["key"], fx[l["fid"]])
-            res = [l.get("result") for l in t["legs"]]
-            t["outcome"] = "LOST" if any(r is False for r in res) else "WON" if all(r is True for r in res) else "PENDING"
-            alive |= t["outcome"] == "PENDING"
-        e["status"] = "PENDING" if alive else "SETTLED"
-    return state
-
-# ═════════════════════════════════════════════════════════════════════════════
 # Orchestrator
 # ═════════════════════════════════════════════════════════════════════════════
 def run_full_analysis(cfg, log, progress):
@@ -2890,338 +2264,44 @@ def run_full_analysis(cfg, log, progress):
     matches = data["matches"]
     
     def result(**kw):
-        base = {"date": cfg["date"], "tickets": [], "ai": None, "model": None, "info": {"attempts": []}, "tokens": 0,
-                "n_analysed": len(matches), "n_ai": 0, "matches": matches, "id_map": {}, "user_prompt": "",
+        base = {"date": cfg["date"], "picks": [], "ai_note": "", "n_analysed": len(matches), "n_eligible": 0, "matches": matches,
                 "api_calls": api.calls, "cache_hits": api.cache_hits, "warnings": data["warnings"], "est_mode": False,
-                "cat_counts": data["cat_counts"], "plan": data["plan"], "deep": data.get("deep"),
-                "api_errors": api.error_summary(), "seconds": round(time.time() - t0, 1),
-                "excluded": data["excluded"], "no_bet": False, "reason": "", "caps": data.get("caps"), "ai_failed": False,
-                "python_draft": None, "ai_note": "", "cfg": cfg, "quota": (api.remaining, api.limit),
-                "free": free.summary(), "relaxed": [], "passes": [], "wasted_tokens": 0, "fallback_model": False, "scout": None, "audit_changes": [], "rule_fixes": []}
+                "api_errors": api.error_summary(), "seconds": round(time.time() - t0, 1), "no_bet": False, "reason": "",
+                "caps": data.get("caps"), "quota": (api.remaining, api.limit), "free": free.summary()}
         base.update(kw)
         return base
 
     if not matches:
         return result(no_bet=True, reason=data.get("reason") or "No matches could be analysed.")
 
-    def run_gate(c):
-        el = []
-        for m in matches:
-            m["legs"] = build_legs(m, allow_est=c["allow_est"], wide=c.get("wide_menu", True))
-            why = gate_reasons(m, c)
-            m["eligible"], m["excl"] = (not why), "; ".join(why)
-            if not why: el.append(m)
-        return el
-
-    cur = dict(cfg)
-    elig = run_gate(cur)
-    need_all, relaxed = N_TICKETS * LEGS_PER_TICKET, []
-    if cfg.get("auto_relax", True) and len(elig) < need_all:
-        for label, upd in (("minimum data quality lowered to 0.40", {"min_dq": min(cfg["min_dq"], 0.40)}),
-                           ("matches with only borderline legs allowed", {"allow_b_only": True}),
-                           ("model-estimated odds allowed for matches without prices", {"allow_est": True})):
-            if len(elig) >= need_all: break
-            trial = dict(cur, **upd)
-            new = run_gate(trial)
-            if len(new) > len(elig): cur, elig = trial, new; relaxed.append(label)
-            else: elig = run_gate(cur)
-        if len(elig) < need_all and len(elig) >= 8 and not cur.get("allow_reuse"):
-            cur["allow_reuse"] = True
-            relaxed.append("the same match may appear in more than one ticket")
-        cur["relaxed_notes"] = bool(relaxed)
-        cfg = dict(cur, relaxed=relaxed)
-        for m in matches:
-            if not m["eligible"]: data["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": m["excl"]})
-        if relaxed: data["warnings"].append("The slate was thin, so safety thresholds were relaxed step by step: " + "; ".join(relaxed) + ".")
-    log(f"🛡 Evidence gate: {len(elig)}/{len(matches)} matches qualify" + (f" (after relaxing: {'; '.join(relaxed)})" if relaxed else ""))
+    elig = [m for m in matches if m.get("eligible")]
+    log(f"🛡 Evidence gate: {len(elig)}/{len(matches)} matches qualify for AI analysis.")
     
-    n_t = plan_ticket_count(len(elig), cfg)
-    if n_t == 0:
-        tip = (f" Only ~{data.get('budget')} API calls were available this run - retry after the daily quota resets." if (data.get("budget") or 999) < 60 else "")
-        return result(no_bet=True, cfg=cfg, relaxed=relaxed,
-                      reason=f"Only {len(elig)} match(es) passed the evidence gate even after relaxing; a 5-leg ticket needs at least 5. "
-                             "Betting on thin data would just be guessing, so nothing is recommended." + tip)
-    if n_t < N_TICKETS:
-        data["warnings"].append(f"Only {len(elig)} matches qualified, so {n_t} ticket(s) were built instead of {N_TICKETS} (no match is reused).")
+    if not elig:
+        return result(no_bet=True, reason="No matches passed the evidence gate (minimum data quality and odds requirements not met).")
     
-    stage = run_ai_stage(elig, n_t, cfg, log, progress)
-    data["warnings"] += stage["warnings"]
+    picks, ai_note = get_ai_picks(elig, cfg["tz"], log)
     
-    if stage["ai_failed"] or not stage["tickets"]:
-        return result(no_bet=True, cfg=cfg, relaxed=relaxed,
-                      reason="AI analysis failed to find a valid diverse 3-5 leg accumulator meeting the 3.0 odds requirement. No Python fallback is used to ensure quality.",
-                      ai_failed=True, ai_note=stage.get("ai_note", ""), passes=stage.get("passes", []), user_prompt=stage.get("user_prompt", ""))
-
-    res = result(tickets=stage["tickets"], ai=stage["ai"], model=stage["model"], info=stage["info"], tokens=stage["tokens"], n_ai=len(stage["sel"]),
-                 id_map=stage["id_map"], user_prompt=stage["user_prompt"], est_mode=stage["est_mode"], ai_note=stage["ai_note"],
-                 ai_failed=stage["ai_failed"], python_draft=stage["python_draft"], cfg=cfg, relaxed=relaxed, passes=stage["passes"],
-                 fallback_model=stage["fallback_model"], scout=stage["scout"], audit_changes=stage["audit_changes"], rule_fixes=stage["rule_fixes"],
-                 wasted_tokens=stage["wasted_tokens"])
-    if stage["tickets"]: save_tickets_to_ledger(cfg["date"], stage["tickets"])
+    res = result(picks=picks, ai_note=ai_note, n_eligible=len(elig))
     return res
 
-def plan_ticket_count(n_elig, cfg):
-    n_t = min(N_TICKETS, n_elig // LEGS_PER_TICKET)
-    if cfg.get("allow_reuse") and n_elig >= LEGS_PER_TICKET: n_t = N_TICKETS
-    return n_t
-
-def save_tickets_to_ledger(date_str, tickets):
-    state = load_state()
-    state.setdefault("history", []).append({
-        "created": datetime.now(timezone.utc).isoformat(), "date": date_str, "status": "PENDING",
-        "tickets": [{"name": t["name"], "odds": round(t["odds"], 2), "outcome": "PENDING", "grade": t.get("grade"),
-                     "legs": [{"fid": l["fid"], "key": l["key"], "label": l["label"], "odds": round(l["odds"], 2),
-                               "p": round(l["p"], 3), "by": l.get("by"), "match": f"{l['match']['home']} v {l['match']['away']}",
-                               "home": l["match"]["home"], "away": l["match"]["away"], "league_id": l["match"].get("league_id"), "result": None}
-                              for l in t["legs"]]} for t in tickets]})
-    state["history"] = state["history"][-60:]
-    save_state(state)
-
-def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
-    warnings = []
-    state = load_state()
-    tpm = int(min(int(cfg.get("tpm", GROQ_TPM_DEFAULT)), int(state.get("tpm_limit", 10 ** 9))))
-    ceiling = max(3500, tpm - TPM_MARGIN)
-    gov = TpmGovernor(max(ceiling + 50, tpm - WINDOW_MARGIN))
-    budget = TokenBudget(int(cfg.get("run_tokens", RUN_TOKEN_CAP_DEFAULT)))
-    cpt = min(max(float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN)) * 0.95, 1.9), 3.2)
-    need, reuse = n_t * LEGS_PER_TICKET, bool(cfg["allow_reuse"])
-    distinct = not reuse
-    eff = cfg.get("effort") if cfg.get("effort") in EFFORT_RESERVE else "medium"
-    use_ai = cfg["use_ai"]
-    n_ai = max(int(cfg.get("n_ai", 28)), need)
-    passes, attempts, learned, cpt_obs = [], [], [], []
-    
-    def record(label, info):
-        passes.append({"pass": label, "model": info.get("model"), "prompt": info.get("prompt_tokens", 0),
-                       "completion": info.get("completion_tokens", 0), "status": info.get("status"), "waited": round(info.get("waited", 0.0)),
-                       "fallback": bool(info.get("fallback"))})
-        for a in info.get("attempts", []): attempts.append(dict(a, **{"pass": label}))
-        if info.get("learned_limit"): learned.append(info["learned_limit"])
-        if info.get("actual_cpt"): cpt_obs.append(info["actual_cpt"])
-
-    ordered = rank_matches(elig)
-    scout_info = None
-    k_keep = min(len(ordered), need + 4)
-    if use_ai and cfg.get("two_pass", True) and len(ordered) > k_keep:
-        pool = ordered[:max(n_ai, k_keep + 1)]
-        sys_sc = scout_prompt(len(pool), k_keep, n_t, need)
-        s_sel, s_ids, s_user = build_scout_pack(pool, cfg["tz"], cpt, sys_sc, SCOUT_RESERVE, ceiling)
-        if s_sel:
-            log(f"🔭 AI scout: reading a compact view of {len(s_sel)} qualified matches and choosing the {k_keep} best, ranked...")
-            sc, sinfo = call_groq_budgeted(sys_sc, s_user, budget, cpt, "low", gov, ceiling, "keep", log, "scout")
-            record("scout", sinfo)
-            if sinfo.get("actual_cpt"): cpt = min(cpt, max(1.8, sinfo["actual_cpt"] * 0.97))
-            if sc:
-                chosen = []
-                for x in sc.get("keep") or []:
-                    mm = s_ids.get(str(x).strip().lower())
-                    if mm is not None and mm not in chosen: chosen.append(mm)
-                chosen = chosen[:k_keep]
-                topped = 0
-                for mm in rank_matches(s_sel):
-                    if len(chosen) >= need: break
-                    if mm not in chosen: chosen.append(mm); topped += 1
-                ordered = chosen
-                nm = lambda aid: (lambda mm: f"{mm['home']} v {mm['away']}" if mm else None)(s_ids.get(str(aid).strip().lower()))
-                scout_info = {"model": sinfo.get("model"), "kept": len(chosen), "of": len(s_sel), "topped_up": topped,
-                              "drops": [{"match": nm(x.get("id")), "why": x.get("why")} for x in (sc.get("drop") or []) if isinstance(x, dict) and nm(x.get("id"))][:8],
-                              "traps": [{"match": nm(x.get("id")), "note": x.get("note")} for x in (sc.get("traps") or []) if isinstance(x, dict) and nm(x.get("id"))][:6]}
-                log(f"   🔭 scout kept {len(chosen)} of {len(s_sel)} matches" + (f" (+{topped} added by Python rank to reach the {need} needed)" if topped else ""))
-            else:
-                ordered = ordered[:n_ai]
-                warnings.append("The AI scout pass failed, so the desk used Python's ranking to order the matches.")
-        else: ordered = ordered[:n_ai]
-    else: ordered = ordered[:n_ai]
-    progress(0.92)
-
-    labels = {id(m): f"m{i + 1}" for i, m in enumerate(ordered)}
-    match_legs, leg_index, id_map = {}, {}, {}
-    for m in ordered:
-        mid = labels[id(m)]
-        id_map[mid] = m
-        lst = [dict(l, mid=mid, fid=m["id"], match=m, id=f"{mid}.{l['key']}") for l in m["legs"]]
-        match_legs[mid] = lst
-        for l2 in lst: leg_index[l2["id"].lower()] = l2
-
-    def pack_for_call(avail, sys_i, cpt_, extra, start_level=0, force_low=False):
-        floor = min(6, len(avail))
-        efforts = ["low"] if force_low else [e for e in ("high", "medium", "low") if EFFORT_RESERVE[e] <= EFFORT_RESERVE[eff]]
-        for eff_try in efforts:
-            reserve = EFFORT_RESERVE[eff_try]
-            sel_, idm_, user_, n_legs_, detail_, lvl_ = build_ai_pack(avail, cfg["tz"], cpt_, sys_i, floor, reserve, ceiling, labels, extra, start_level)
-            if est_tokens(sys_i + user_, cpt_) <= ceiling - reserve - TOKEN_SAFETY: break
-        return sel_, idm_, user_, n_legs_, detail_, eff_try, lvl_
-
-    ai_tickets, ai_traps, ai_avoid, ai_summ, shown, prompts = [], [], [], [], [], []
-    used_labels, model_used, last_info = set(), None, {"attempts": []}
-    level, trunc_fails, stop_ai, force_low = 0, 0, False, False
-    
-    if use_ai:
-        for ti in range(n_t):
-            if stop_ai: ai_tickets.append({}); continue
-            avail = ([m for m in ordered if labels[id(m)] not in used_labels] if distinct
-                     else sorted(ordered, key=lambda m: labels[id(m)] in used_labels))
-            if len(avail) < 3:
-                warnings.append(f"Ticket {ti + 1}: fewer than 3 unused matches were left, so the AI could not build it.")
-                ai_tickets.append({}); continue
-            
-            extra = ""
-            if reuse and ti > 0:
-                extra = "EARLIER TICKETS (do not copy): " + "; ".join(f"T{k + 1}: " + ",".join(x["id"] for x in tk.get("_legs", [])) for k, tk in enumerate(ai_tickets) if tk) + "\n"
-            sys_base = desk_prompt(ti, n_t, reuse, bool(cfg.get("relaxed_notes")))
-            log(f"🤖 AI desk - ticket {ti + 1} of {n_t}: studying the best candidate matches in detail...")
-            ai_i, info_i, sel_i, idm_i, user_i = None, {"attempts": []}, [], {}, ""
-            for attempt in range(2):
-                sys_i = sys_base + (BRIEF_ADDENDUM if attempt else "")
-                sel_i, idm_i, user_i, n_legs, detail, eff_try, lvl = pack_for_call(avail, sys_i, cpt, extra, level, force_low)
-                log(f"   📦 {'retry ' if attempt else ''}pack: {len(sel_i)} matches x {n_legs} legs (detail {detail}/3), est. prompt {est_tokens(sys_i + user_i, cpt)} tokens, effort '{eff_try}'")
-                ai_i, info_i = call_groq_budgeted(sys_i, user_i, budget, cpt, eff_try, gov, ceiling, "tickets", log, f"desk{ti + 1}")
-                record(f"desk{ti + 1}" + (" (retry)" if attempt else ""), info_i)
-                if info_i.get("actual_cpt"): cpt = min(cpt, max(1.8, info_i["actual_cpt"] * 0.97))
-                st_ = info_i.get("status")
-                if ai_i:
-                    level = max(level, lvl)
-                    break
-                if st_ == "PROMPT_TOO_LARGE":
-                    log("   ℹ️ The real prompt was bigger than estimated - rebuilding a smaller pack.")
-                    continue
-                if st_ == "TRUNCATED":
-                    level, force_low = min(lvl + 2, len(PACK_LEVELS) - 1), True
-                    log("   ℹ️ The model used its whole reply room before finishing - retrying ONCE with a smaller, briefer request.")
-                    continue
-                break
-            last_info = info_i
-            if not ai_i and info_i.get("attempts") and all(("per day" in a["status"].lower() or "(tpd)" in a["status"].lower() or a["status"].startswith("HTTP_404")) for a in info_i["attempts"]):
-                warnings.append("Groq's DAILY token allowance is used up for every available model. The remaining AI calls were skipped.")
-                ai_tickets += [{}] * (n_t - len(ai_tickets))
-                break
-            
-            shown += [m for m in sel_i if m not in shown]
-            prompts.append(f"===== desk call {ti + 1} (ticket {ti + 1}) =====\n{user_i}")
-            if ai_i:
-                model_used = model_used or info_i.get("model")
-                if "ticket" in ai_i and isinstance(ai_i["ticket"], dict):
-                    t0 = ai_i["ticket"]
-                else:
-                    t0 = next((t for t in (ai_i.get("tickets") or []) if isinstance(t, dict)), {})
-                
-                legs_ok = []
-                for it in t0.get("legs") or []:
-                    d = it if isinstance(it, dict) else {"id": str(it)}
-                    lid = str(d.get("id") or "").strip().lower()
-                    if lid in leg_index and lid.split(".")[0] in idm_i and leg_index[lid]["mid"] not in {leg_index[x["id"].lower()]["mid"] for x in legs_ok}:
-                        legs_ok.append(d)
-                
-                t0 = dict(t0, legs=legs_ok, name=TICKET_LABELS[min(ti, 2)])
-                t0["_legs"] = legs_ok
-                ai_tickets.append(t0)
-                
-                if distinct: used_labels |= {str(x["id"]).strip().lower().split(".")[0] for x in legs_ok}
-                else: used_labels |= {str(x["id"]).strip().lower().split(".")[0] for x in legs_ok}
-                ai_traps += [x for x in (ai_i.get("traps") or []) if isinstance(x, dict) and x.get("id") in id_map]
-                ai_avoid += [x for x in (ai_i.get("avoid") or []) if isinstance(x, dict) and x.get("id") in id_map]
-                if ai_i.get("summary"): ai_summ.append(str(ai_i["summary"]))
-                if info_i.get("salvaged"): warnings.append(f"Ticket {ti + 1}: the AI reply was cut short; the complete part was recovered and the rest verified/completed.")
-            else:
-                ai_tickets.append({})
-                warnings.append(f"Ticket {ti + 1}: the AI desk call failed ({info_i.get('status')}); it will be completed by the audit / Python.")
-                if info_i.get("status") in ("TRUNCATED", "PROMPT_TOO_LARGE"):
-                    trunc_fails += 1
-                    if trunc_fails >= 1:
-                        stop_ai = True
-                        warnings.append("An AI desk call ran out of reply room even after being retried smaller, so the remaining AI calls were SKIPPED.")
-    
-    if cpt_obs: state["cpt"] = round(0.6 * min(cpt_obs) + 0.4 * (sum(cpt_obs) / len(cpt_obs)), 3)
-    if learned: state["tpm_limit"] = int(min(learned))
-    save_state(state)
-    
-    ai = None
-    if any(t.get("legs") for t in ai_tickets):
-        seen, traps_u = set(), []
-        for x in ai_traps:
-            if x["id"] not in seen: seen.add(x["id"]); traps_u.append(x)
-        ai = {"tickets": ai_tickets, "traps": traps_u[:6], "avoid": ai_avoid[:6], "summary": " ".join(ai_summ)[:320]}
-    sel = shown or ordered
-    user_prompt = "\n".join(prompts)
-    info = dict(last_info, attempts=attempts)
-    python_draft, ai_note, audit_changes, rule_fixes = None, "", [], []
-    
-    if ai:
-        tickets = parse_ai_tickets(ai, leg_index, n_t, LEGS_PER_TICKET, distinct)
-        if cfg.get("audit", True) and not stop_ai:
-            if budget.remaining >= AUDIT_RESERVE + 1800:
-                sys_au = audit_prompt(n_t)
-                a_user = build_audit_pack(tickets, match_legs, cfg["tz"], cpt, sys_au, AUDIT_RESERVE, ceiling, LEGS_PER_TICKET, distinct)
-                if a_user:
-                    log("🕵️ AI risk-officer audit: trying to break every leg and filling any gap...")
-                    aud, ainfo = call_groq_budgeted(sys_au, a_user, budget, cpt, "low", gov, ceiling, "legs", log, "audit")
-                    record("audit", ainfo)
-                    if aud:
-                        audit_changes = apply_audit(tickets, aud, leg_index, match_legs, LEGS_PER_TICKET, distinct)
-                        if aud.get("note"): ai["audit_note"] = str(aud["note"])[:240]
-                    else: warnings.append("The AI audit pass failed; the desk's tickets were verified by Python rules only.")
-                else: warnings.append("The audit pass was skipped because its evidence did not fit one request.")
-            else: warnings.append("The audit pass was skipped: the per-analysis AI token cap was nearly used up.")
-        
-        tickets = complete_tickets(tickets, match_legs, LEGS_PER_TICKET, distinct)
-        if cfg.get("rule_fix", True): rule_fixes = py_fix_breaches(tickets, match_legs)
-        for t in tickets: finish_ticket(t, LEGS_PER_TICKET)
-        
-        if not cfg.get("allow_py_fallback"):
-            keep = [t for t in tickets if t["ai_kept"] >= int(cfg.get("min_ai_legs", 3))]
-            if len(keep) < len(tickets):
-                warnings.append(f"{len(tickets) - len(keep)} ticket(s) were mostly Python-built because the AI did not supply enough valid legs, so they were withheld.")
-            python_draft = [t for t in tickets if t not in keep]
-            tickets = keep
-        else:
-            draft = python_only_tickets(match_legs, n_t)
-            for t in draft: finish_ticket(t, LEGS_PER_TICKET)
-            if use_ai:
-                ai_note = " | ".join(f"{a['model'].split('/')[-1]}: {a['status'][:110]}" for a in attempts[-3:])
-                if cfg.get("allow_py_fallback"):
-                    tickets = draft
-                    warnings.append(f"AI analysis failed ({info.get('status')}): {ai_note}. Python-built tickets (🐍, NOT AI-approved) were used because you allowed that fallback.")
-                else:
-                    tickets, python_draft = [], draft
-                    warnings.append(f"AI analysis failed ({info.get('status')}): {ai_note}. No tickets were produced because AI analysis is required.")
-            else: tickets = draft
-    else:
-        draft = python_only_tickets(match_legs, n_t)
-        for t in draft: finish_ticket(t, LEGS_PER_TICKET)
-        tickets = draft
-
-    for t in tickets + (python_draft or []):
-        dqm = min([l["match"]["dq"] for l in t["legs"]] or [0])
-        t["grade"] = "A" if dqm >= 0.75 and not t["repaired"] and not cfg.get("relaxed_notes") else "B" if dqm >= 0.6 else "C"
-    
-    est_mode = any(l.get("src") == "est" for t in tickets for l in t["legs"])
-    if est_mode: warnings.append("Some legs use MODEL-ESTIMATED odds (fair odds x 0.93, no market check). Bookmakers differ slightly - confirm the price on yours.")
-    
-    wasted = sum(p["prompt"] + p["completion"] for p in passes if p.get("status") != "SUCCESS")
-    if wasted > 1500: warnings.append(f"🔥 {wasted} AI tokens went to calls that produced no usable answer.")
-    
-    fallback_model = any(p["fallback"] for p in passes)
-    if fallback_model: warnings.append("⚠️ At least one AI pass ran on a smaller FALLBACK model. Analysis quality may be lower - consider pressing 'Re-run AI analysis' after a minute.")
-    
-    return {"tickets": tickets, "ai": ai, "model": model_used, "info": info, "tokens": budget.used, "sel": sel, "id_map": id_map,
-            "user_prompt": user_prompt, "est_mode": est_mode, "ai_failed": bool(use_ai and not ai), "python_draft": python_draft,
-            "ai_note": ai_note, "warnings": warnings, "passes": passes, "fallback_model": fallback_model, "scout": scout_info, "wasted_tokens": wasted,
-            "audit_changes": audit_changes, "rule_fixes": rule_fixes}
-
 def rerun_ai(res, cfg, log):
-    elig = [m for m in res["matches"] if m.get("eligible") and m.get("legs")]
-    n_t = plan_ticket_count(len(elig), cfg)
-    if n_t == 0: return res
-    stage = run_ai_stage(elig, n_t, cfg, log)
-    old = [w for w in res.get("warnings", []) if not any(k in w for k in ("AI analysis failed", "AI unavailable", "MODEL-ESTIMATED", "token cap", "mostly Python-built", "FALLBACK model", "scout pass", "audit pass"))]
-    new = dict(res, tickets=stage["tickets"], ai=stage["ai"], model=stage["model"], info=stage["info"], tokens=stage["tokens"], n_ai=len(stage["sel"]),
-               id_map=stage["id_map"], user_prompt=stage["user_prompt"], est_mode=stage["est_mode"], ai_note=stage["ai_note"],
-               ai_failed=stage["ai_failed"], python_draft=stage["python_draft"], warnings=old + stage["warnings"], cfg=cfg,
-               passes=stage["passes"], fallback_model=stage["fallback_model"], scout=stage["scout"], audit_changes=stage["audit_changes"], rule_fixes=stage["rule_fixes"],
-               wasted_tokens=stage["wasted_tokens"])
-    if new["tickets"]: save_tickets_to_ledger(cfg["date"], new["tickets"])
+    elig = [m for m in res["matches"] if m.get("eligible")]
+    if not elig:
+        return res
+    picks, ai_note = get_ai_picks(elig, cfg["tz"], log)
+    new = dict(res, picks=picks, ai_note=ai_note)
     return new
+
+def load_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as fh: return json.load(fh)
+    except Exception: return {"history": [], "cpt": DEFAULT_CHARS_PER_TOKEN}
+
+def save_state(s):
+    try:
+        with open(STATE_PATH, "w", encoding="utf-8") as fh: json.dump(s, fh)
+    except Exception: pass
 
 def test_groq_connection():
     key = get_secret("GROQ_API_KEY", "").strip()
@@ -3245,104 +2325,52 @@ def test_groq_connection():
 # ═════════════════════════════════════════════════════════════════════════════
 def render_results(res, tz):
     for w in res.get("warnings", []): st.warning(w)
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Matches analysed", res["n_analysed"])
-    c2.metric("Studied by AI desk", res["n_ai"])
-    c3.metric("AI tokens (all passes)", res["tokens"])
-    c4.metric("API calls", res["api_calls"], f"cache {res['cache_hits']}")
-    c5.metric("Model", (res.get("model") or "Python optimiser").split("/")[-1] if res["tickets"] else "-")
-    if res.get("tokens"):
-        w = res.get("wasted_tokens", 0)
-        st.caption(f"🧮 AI tokens: **{res['tokens'] - w}** went into answers that were used" + (f" · 🔥 **{w}** went to calls that produced nothing (see 'AI passes')" if w else " · none wasted ✅"))
-    if res.get("quota") and res["quota"][0] is not None:
-        st.caption(f"📶 API quota left today: **{res['quota'][0]}** of {res['quota'][1]} (resets 00:00 UTC / 03:00 Kampala)")
-    if res.get("caps"):
-        cp = res["caps"]
-        st.caption(f"API plan capabilities detected - team history: {'✅' if cp['history'] else '❌ (free sources / predictions last-5 form used)'} · "
-                   f"odds by league: {'✅' if cp['league_odds'] else '❌' if cp['league_odds'] is False else '?'} · odds by fixture: {'✅' if cp['fixture_odds'] else '❌'}")
-    fr = res.get("free") or {}
-    if fr.get("used") or fr.get("saved_calls"):
-        st.caption("🆓 Free sources (no API quota): " + " · ".join(f"{k} ×{v}" for k, v in fr.get("used", {}).items())
-                   + (f" · ≈{fr['saved_calls']} API calls avoided" if fr.get("saved_calls") else ""))
-    if res.get("relaxed"): st.info("🪜 Thin slate - thresholds relaxed: " + "; ".join(res["relaxed"]))
-    if res.get("no_bet"): st.error(f"🛑 **NO BET** - {res.get('reason')}")
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Matches Analysed", res["n_analysed"])
+    c2.metric("Eligible for AI", res["n_eligible"])
+    c3.metric("AI Picks Returned", len(res.get("picks", [])))
+    
+    if res.get("no_bet"):
+        st.error(f"🛑 **NO BET** - {res.get('reason')}")
+        
+    if not res.get("picks"):
+        st.error(f"🤖 **AI Analysis Failed or Returned No Picks:** {res.get('ai_note')}")
+        st.info("Tip: Try lowering the 'Minimum data-quality score' in Settings, or press 'Re-run AI analysis' to give the AI another attempt with the same data.")
+    else:
+        st.success(f"✅ {res.get('ai_note')}")
+        
+        st.markdown("### 🏆 AI Top Picks")
+        rows = []
+        for p in res["picks"]:
+            rows.append({
+                "Match": p.get("match", "N/A"),
+                "League": p.get("league", "N/A"),
+                "Pick": p.get("pick", "N/A"),
+                "Odds": p.get("odds", "N/A"),
+                "Probability": f"{p.get('probability', 0)}%",
+                "Risk": p.get("risk", "N/A"),
+                "Reason": p.get("reason", "N/A")
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
     if res.get("api_errors"):
         st.markdown("**API messages (send these if you need help):**")
         st.code("\n".join(res["api_errors"]), language="text")
-    if res.get("ai_failed"):
-        st.error("🤖 **AI analysis did not complete.** " + (res.get("ai_note") or ""))
-        st.info("Nothing needs to be re-collected: press **Re-run AI analysis** below (no API-Football calls are used).")
-    if res.get("python_draft"):
-        with st.expander("🐍 Python reference draft - NOT AI-approved (withheld)"):
-            for t in res["python_draft"]:
-                st.write(f"**{t['name']}** - odds {t['odds']:.2f}: " + " | ".join(f"{l['match']['home']} v {l['match']['away']}: {l['label']} @{l['odds']:.2f}" for l in t["legs"]))
-    
-    for t in res["tickets"]:
-        st.markdown(f"### 🎟 {t['name']} — odds **{t['odds']:.2f}** {'✅' if t['valid'] else '⚠️ below 3.0'} · joint prob ~{_pct(t['p_joint'])}% · evidence grade **{t.get('grade', '?')}**")
-        rows = []
-        for l in t["legs"]:
-            m = l["match"]
-            au = l.get("audit") or {}
-            rows.append({"Kick-off": datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M"), "League": m["league"],
-                         "Match": f"{m['home']} v {m['away']}", "Pick": l["label"], "Odds": round(l["odds"], 2),
-                         "Price": (f"{l['odds_lo']:.2f}-{l['odds_hi']:.2f}" if l.get("odds_lo") else "derived" if l.get("src") == "derived" else "est."),
-                         "By": _by_txt(l), "Model+Mkt %": _pct(l["p"]), "Market fair %": _pct(l["p_mkt"]), "Trap": m["trap"]["risk"],
-                         "Data": BASIS_TAG.get(m["basis"]), "Why": l.get("why", ""), "Loses if": l.get("fail", ""),
-                         "Audit": (("✅ " if au.get("ok", True) else "⚠️ ") + (au.get("issue") or au.get("risk") or "")) if au else "",
-                         "Flags": ",".join(l.get("flags") or [])})
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-        if res.get("model"):
-            st.caption(f"🤖 AI chose {t.get('ai_kept', 0)} of {len(t['legs'])} legs"
-                       + (f" ({t.get('audit_swaps', 0)} improved by the audit)" if t.get("audit_swaps") else "")
-                       + (f"; 🐍 Python supplied {t.get('py_legs', 0)}" if t.get("py_legs") else "; Python only verified prices, uniqueness, rules and the 3.0 minimum") + ".")
-        if t.get("logic"): st.info(t["logic"])
-        if t.get("repaired"): st.caption("🔧 Python completed/adjusted part of this ticket (🐍 legs): AI leg missing/invalid, rule breach or odds below 3.0.")
-        if t.get("stacked"): st.caption("⚠️ 4+ legs of the same market type - correlated failure risk.")
-    
-    if res.get("audit_changes") or res.get("rule_fixes"):
-        with st.expander("🕵️ Audit & rule-check changes"):
-            for c in res.get("audit_changes", []): st.write(f"🤖 audit: {c}")
-            for c in res.get("rule_fixes", []): st.write(f"🐍 rule-fix: {c}")
-    
-    ai = res.get("ai") or {}
-    for title, key, fld in (("🪤 Trap watch", "traps", "note"), ("🚫 Avoid", "avoid", "why")):
-        items = [(res["id_map"][x["id"]], x.get(fld)) for x in (ai.get(key) or []) if x.get("id") in res["id_map"]]
-        if key == "traps": items += [({"home": x["match"], "away": ""}, x.get("note")) for x in ((res.get("scout") or {}).get("traps") or [])]
-        if items:
-            st.markdown(f"#### {title}")
-            for m, note in items: st.write(f"**{m['home']}{' v ' + m['away'] if m.get('away') else ''}** — {note}")
-    if ai.get("audit_note"): st.markdown(f"#### 🕵️ Risk officer\n{ai['audit_note']}")
-    if ai.get("summary"): st.markdown(f"#### 📝 Slate read\n{ai['summary']}")
-    
-    sc = res.get("scout")
-    if sc:
-        with st.expander(f"🔭 AI scout - kept {sc['kept']} of {sc['of']} qualified matches for the full analysis"):
-            for x in sc.get("drops", []): st.write(f"❌ {x['match']} — {x.get('why')}")
-    if res.get("excluded"):
-        with st.expander(f"🛡 Excluded by the evidence gate ({len(res['excluded'])})"):
-            st.dataframe(pd.DataFrame(res["excluded"]), hide_index=True, width="stretch")
+        
     with st.expander("📋 All analysed matches (Monte Carlo + market blend)"):
         rows = []
         for m in res["matches"]:
             p = m["p"]
             rows.append({"Cat": m["cat"], "League": m["league"], "Match": f"{m['home']} v {m['away']}",
                          "KO": datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M"),
-                         "Data": BASIS_TAG.get(m["basis"]), "Sources": ",".join(sorted(set(m.get("free_tags") or []))) or "api",
+                         "Data": {"season+recent": "S+R", "recent": "R", "season": "S", "elo": "E", "prior": "P"}.get(m["basis"], "?"),
+                         "Sources": ",".join(sorted(set(m.get("free_tags") or []))) or "api",
                          "xG": f"{m['lam_h']:.2f}-{m['lam_a']:.2f}",
                          "1": _pct(p["1"]), "X": _pct(p["X"]), "2": _pct(p["2"]), "1X": _pct(p["1X"]), "X2": _pct(p["X2"]),
                          "BTTS": _pct(p["BTTS_Y"]), "O1.5": _pct(p["O1.5"]), "O2.5": _pct(p["O2.5"]),
-                         "Corners": round(m["exp_corners"], 1) if m["corner_n"] >= 3 else None,
-                         "Trap": m["trap"]["risk"], "DQ": m["dq"], "Qualified": "yes" if m.get("eligible") else "no",
-                         "Likely": ",".join(m["top_scores"])})
+                         "Trap": m["trap"]["risk"], "DQ": m["dq"], "Qualified": "yes" if m.get("eligible") else "no"})
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    if res.get("user_prompt"):
-        with st.expander("🔎 Exact evidence pack sent to the AI desk"):
-            st.code(res["user_prompt"], language="text")
-    with st.expander("🛠 AI passes / model attempts / API errors"):
-        if res.get("passes"): st.dataframe(pd.DataFrame(res["passes"]), hide_index=True, width="stretch")
-        for a in (res.get("info") or {}).get("attempts", []): st.caption(f"[{a.get('pass', '-')}] {a['model']} → {a['status']}")
-        for e in res.get("api_errors", []): st.caption(f"API: {e}")
-        for e in (res.get("free") or {}).get("fails", []): st.caption(f"free source: {e}")
 
 def main():
     st.set_page_config(page_title="Der-AI | Football Quant Desk", page_icon="⚽", layout="wide")
@@ -3350,77 +2378,48 @@ def main():
 .stButton>button{background:linear-gradient(90deg,#065f46 0%,#10b981 100%);color:white;border:none;padding:10px 24px;border-radius:8px;font-weight:bold;font-size:16px;width:100%}
 .stButton>button:hover{background:linear-gradient(90deg,#047857 0%,#059669 100%)}
 </style>""", unsafe_allow_html=True)
-    for k, v in (("notifications", []), ("last_result", None)):
-        st.session_state.setdefault(k, v)
-    tab1, tab2, tab3, tab4 = st.tabs(["⚽ Match Analysis", "📜 Ticket Ledger", "🔔 Notifications", "⚙️ Settings"])
     
-    with tab4:
+    tab1, tab2 = st.tabs(["⚽ Match Analysis", "⚙️ Settings"])
+    
+    with tab2:
         st.header("⚙️ Settings")
-        st.info("Secrets needed: `API_FOOTBALL_KEY`, `GROQ_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.")
+        st.info("Secrets needed: `API_FOOTBALL_KEY`, `GROQ_API_KEY`.")
         s1, s2 = st.columns(2)
-        tz = s1.text_input("Time zone", DEFAULT_TZ)
+        tz = s1.text_input("Time zone", "Africa/Kampala")
         max_matches = s1.slider("Max matches to collect deep data for", 10, 60, 30)
-        n_ai = s1.slider("Max matches the AI scout reads", 15, 40, 28)
-        max_calls = s1.number_input("Max API-Football calls per run", 30, 5000, 95, step=5, help="Free plan = 100/day. Pro = 7,500/day.")
-        breadth = s1.selectbox("Search breadth", ["Focused", "Balanced", "Wide"], index=1)
-        depth = s1.selectbox("Data depth", ["Auto", "Full", "Lite"], help="Full adds corners/shots/xG history, player ratings, lineups and standings via batched calls.")
-        sims = s2.select_slider("Monte Carlo simulations per match", [10000, 20000, 40000, 80000], 40000)
-        w_model = s2.slider("Weight of Monte Carlo model vs bookmaker price", 0.2, 0.8, 0.5, 0.05)
-        bookmaker = s2.number_input("Preferred bookmaker id (8 = Bet365, 11 = 1xBet, 4 = Pinnacle)", 1, 500, 8)
-        effort = s2.selectbox("AI reasoning effort (gpt-oss)", ["low", "medium", "high"], index=0, help="LOW is recommended on the free Groq tier (8,000 tokens per request).")
+        max_calls = s1.number_input("Max API-Football calls per run", 30, 5000, 95, step=5)
+        depth = s1.selectbox("Data depth", ["Auto", "Full", "Lite"])
+        effort = s2.selectbox("AI reasoning effort (gpt-oss)", ["low", "medium", "high"], index=0)
         exclude_minor = s2.checkbox("Exclude youth / women / reserve teams", True)
         exclude_lower = s2.checkbox("Exclude amateur / regional lower divisions & club friendlies", True)
-        force_leagues = {int(x) for x in re.findall(r"\d+", s2.text_input("Always include league ids (comma separated)", ""))}
-        rate_override = int(s2.number_input("Requests/minute override (0 = auto by plan)", 0, 900, 0))
-        send_tg = st.checkbox("Send tickets to Telegram automatically", True)
-        use_ai = st.checkbox("Use AI (Groq)", True)
-        allow_py = st.checkbox("Always deliver tickets: if the AI cannot supply a leg or fails, allow Python-built legs/tickets (clearly marked 🐍, never presented as AI-approved)", True)
-        if st.button("🧪 Test AI connection (~100 tokens per model)"):
+        use_free = s2.checkbox("Use free sources (football-data.co.uk, ClubElo, ESPN) first", True)
+        allow_est = s2.checkbox("Use model-estimated odds if no bookmaker odds", True)
+        min_dq = s2.slider("Minimum data-quality score for a match to qualify", 0.3, 0.9, 0.5, 0.05)
+        
+        if st.button("🧪 Test AI connection"):
             for mdl, status in test_groq_connection(): st.write(f"`{mdl}` → {status}")
-        min_dq = st.slider("Minimum data-quality score for a match to qualify", 0.3, 0.9, 0.5, 0.05)
-        allow_reuse = st.checkbox("Allow the same match in more than one ticket (only if too few matches qualify)", False)
-        allow_est = st.checkbox("If the API has no odds for a match, use model-estimated approximate odds (clearly labelled)", True)
-        st.markdown("##### 🤖 AI pacing & quality")
-        a1, a2 = st.columns(2)
-        tpm = a1.number_input("Groq tokens-per-minute limit", 4000, 30000, GROQ_TPM_DEFAULT, step=500)
-        run_tokens = a2.number_input("Max AI tokens per analysis (all passes)", 10000, 120000, RUN_TOKEN_CAP_DEFAULT, step=2000)
-        two_pass = a1.checkbox("AI scout first: rank the qualified matches best-first before the per-ticket desk calls", True)
-        audit = a2.checkbox("Final AI risk-officer audit (tries to break every leg, swaps weak legs, fills gaps)", True)
-        rule_fix = a1.checkbox("Python rule-fix: replace a leg that breaks the AI's own hard rules with the best clean alternative", True)
-        min_ai_legs = a2.slider("Minimum AI-chosen legs per ticket (matters only if Python-built tickets are not allowed)", 3, 5, 3)
-        wide_menu = a1.checkbox("Widen the leg menu with clearly-flagged borderline legs (the AI decides)", True)
-        auto_relax = a2.checkbox("Auto-relax safety thresholds step by step when too few matches qualify (always labelled)", True)
-        tg_top_only = a1.checkbox("Send to Telegram only if the TOP model did the analysis", False)
-        st.markdown("##### 🆓 Free data sources & quota saving")
-        f1, f2 = st.columns(2)
-        use_free = f1.checkbox("Use free sources (football-data.co.uk, ClubElo, ESPN) first and as fallback - costs 0 API-Football calls", True)
-        save_calls = f2.checkbox("Skip API-Football predictions when free sources already cover the match (saves ~1 call per match)", True)
-        st.markdown(f"**AI order:** {' → '.join(GROQ_MODELS)} · Calls: scout → desk (one per ticket) → audit")
-        if st.button("📶 Check API quota now (free - does not use quota)"):
+        if st.button("📶 Check API quota now"):
             key_ = get_secret("API_FOOTBALL_KEY")
             if key_:
-                s_ = ApiFootball(key_, 10).status()
-                st.info(f"Plan: {s_.get('plan')} · used {s_.get('used')} of {s_.get('limit')} calls today (resets 00:00 UTC / 03:00 Kampala)")
-            else: st.warning("API_FOOTBALL_KEY not set.")
-        if st.button("🧹 Clear API cache"):
-            try:
-                for fn in os.listdir(CACHE_DIR): os.remove(os.path.join(CACHE_DIR, fn))
-                st.success("Cache cleared.")
-            except Exception as e: st.error(str(e))
+                from requests import Session
+                r = Session().get("https://v3.football.api-sports.io/status", headers={"x-apisports-key": key_}, timeout=10)
+                d = r.json()
+                req = (d.get("response") or [{}])[0].get("requests") or {}
+                st.info(f"Used {req.get('current')} of {req.get('limit_day')} calls today.")
+            else:
+                st.warning("API_FOOTBALL_KEY not set.")
 
     with tab1:
         st.header("🚀 Football Quant Desk")
         local_today = datetime.now(ZoneInfo(tz)).date()
         d = st.date_input("Match day to analyse", local_today)
         force = st.checkbox("Ignore cache (fresh API data - costs more calls)", False)
-        st.caption("Free API plan: one run now needs fewer calls because free sources are used first. The AI works in short focused calls (scout, one per ticket, audit) spaced to respect Groq's per-minute token limit, so expect several extra minutes. Re-running the same day reuses cached data; the API quota resets 00:00 UTC (03:00 Kampala).")
+        st.caption("Free API plan: one run now needs fewer calls because free sources are used first. The AI works in short focused calls spaced to respect Groq's per-minute token limit. Re-running the same day reuses cached data; the API quota resets 00:00 UTC (03:00 Kampala).")
+        
         if st.button("🧠 Analyse Football Matches Now", type="primary"):
-            cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "n_ai": n_ai, "max_calls": int(max_calls),
-                   "depth": depth, "sims": int(sims), "w_model": w_model, "bookmaker": int(bookmaker), "effort": effort,
-                   "exclude_minor": exclude_minor, "breadth": breadth, "exclude_lower": exclude_lower, "force_leagues": force_leagues, "rate_override": rate_override,
-                   "force": force, "use_ai": use_ai, "allow_py_fallback": allow_py, "min_dq": min_dq, "allow_reuse": allow_reuse, "allow_est": allow_est, "tpm": int(tpm), "run_tokens": int(run_tokens), "two_pass": two_pass,
-                   "audit": audit, "use_free": use_free, "save_calls": save_calls, "auto_relax": auto_relax, "min_ai_legs": int(min_ai_legs),
-                   "wide_menu": wide_menu, "rule_fix": rule_fix}
+            cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "max_calls": int(max_calls),
+                   "depth": depth, "effort": effort, "exclude_minor": exclude_minor, "exclude_lower": exclude_lower,
+                   "force": force, "use_free": use_free, "allow_est": allow_est, "min_dq": min_dq, "w_model": 0.5, "bookmaker": 8, "sims": 40000, "rate_override": 0}
             bar = st.progress(0.0)
             box = st.status("Running full analysis...", expanded=True)
             def log(m): box.write(m)
@@ -3433,65 +2432,25 @@ def main():
             if "error" in res:
                 box.update(label="Analysis stopped", state="error")
                 st.error(res["error"])
-                for w in res.get("warnings", []) + res.get("api_errors", []): st.caption(w)
             else:
                 box.update(label=f"Done in {res['seconds']}s" + (" - NO BET" if res.get("no_bet") else ""), state="complete")
                 st.session_state.last_result = res
                 st.session_state.last_tz = tz
-                if send_tg and tg_top_only and res.get("fallback_model") and res["tickets"]:
-                    st.info("Telegram skipped: a fallback model took part and you asked for top-model-only delivery. Press Re-run AI analysis later.")
-                elif send_tg:
-                    msg = (build_nobet_message(res, tz) if res.get("no_bet") else build_aifail_message(res, tz) if res.get("ai_failed") and not res["tickets"]
-                           else build_telegram_message(res, tz))
-                    ok, why = send_telegram(msg)
-                    (st.success if ok else st.warning)("✅ Sent to Telegram" if ok else f"Telegram failed: {why}")
-                    st.session_state.notifications.append({"time": datetime.now().strftime("%H:%M"), "ok": ok,
-                                                           "msg": f"{cfg['date']}: " + ("NO-BET notice " if res.get("no_bet") else f"{len(res['tickets'])} ticket(s) ") + ("sent" if ok else f"not sent ({why})")})
-            if st.session_state.last_result:
                 render_results(st.session_state.last_result, st.session_state.get("last_tz", tz))
+            
             lr = st.session_state.last_result
-            if lr.get("cfg") and any(m.get("eligible") for m in lr.get("matches", [])):
+            if lr and lr.get("matches"):
                 st.divider()
                 if st.button("🔁 Re-run AI analysis on the data already collected (uses NO API-Football calls)"):
                     box2 = st.status("Re-running the AI stage...", expanded=True)
                     try:
-                        new = rerun_ai(lr, dict(lr["cfg"], effort=effort, use_ai=True, allow_py_fallback=allow_py, tpm=int(tpm), run_tokens=int(run_tokens), two_pass=two_pass, audit=audit, rule_fix=rule_fix, min_ai_legs=int(min_ai_legs)), box2.write)
+                        new = rerun_ai(lr, cfg, box2.write)
                         st.session_state.last_result = new
-                        if send_tg and (new["tickets"] or new.get("ai_failed")):
-                            ok, why = send_telegram(build_telegram_message(new, tz) if new["tickets"] else build_aifail_message(new, tz))
-                            st.session_state.notifications.append({"time": datetime.now().strftime("%H:%M"), "ok": ok,
-                                                                   "msg": "AI re-run: " + (f"{len(new['tickets'])} ticket(s) " if new["tickets"] else "no tickets ") + ("sent" if ok else f"not sent ({why})")})
                         box2.update(label="AI re-run finished", state="complete")
                         st.rerun()
                     except Exception:
                         box2.update(label="AI re-run failed", state="error")
                         st.error(traceback.format_exc())
-
-    with tab2:
-        st.header("📜 Ticket Ledger & Calibration")
-        state = load_state()
-        if st.button("🔄 Settle finished matches"):
-            key = get_secret("API_FOOTBALL_KEY")
-            save_state(settle_history(ApiFootball(key or "", 10), state))
-            st.success("Ledger updated (free results first, API-Football only for what is left).")
-        state = load_state()
-        tk = [(e["date"], t) for e in state.get("history", []) for t in e["tickets"]]
-        won, lost = sum(1 for _, t in tk if t.get("outcome") == "WON"), sum(1 for _, t in tk if t.get("outcome") == "LOST")
-        legs_ = [l for _, t in tk for l in t["legs"] if l.get("result") is not None]
-        a, b, c = st.columns(3)
-        a.metric("Tickets won / lost", f"{won} / {lost}")
-        b.metric("Ticket hit rate", f"{100 * won / (won + lost):.0f}%" if won + lost else "—")
-        c.metric("Leg hit rate", f"{100 * sum(1 for l in legs_ if l['result']) / len(legs_):.0f}%" if legs_ else "—")
-        if tk:
-            st.dataframe(pd.DataFrame([{"Date": dt, "Ticket": t["name"], "Odds": t["odds"], "Outcome": t.get("outcome"),
-                                        "Legs": " | ".join(f"{l['match']}: {l['label']}{'✅' if l.get('result') else '❌' if l.get('result') is False else '⏳'}" for l in t["legs"])}
-                                       for dt, t in reversed(tk)]), hide_index=True, width="stretch")
-
-    with tab3:
-        st.header("🔔 Notifications")
-        for n in reversed(st.session_state.notifications):
-            (st.success if n["ok"] else st.warning)(f"[{n['time']}] {n['msg']}")
-        if not st.session_state.notifications: st.info("No notifications yet.")
 
 if __name__ == "__main__":
     main()
