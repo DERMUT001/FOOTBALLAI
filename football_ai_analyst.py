@@ -1644,6 +1644,8 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
         if not (MIN_LEG_ODDS <= odds <= MAX_LEG_ODDS):
             continue
         p_model = m["model_p"].get(key, p)
+        if key == "12" and min(p, p_model, p_mkt) < 0.80:
+            continue
         agree = min(p_model, p_mkt)
         if src == "est":
             if p_model < 0.74 or p < 0.74:
@@ -1678,16 +1680,16 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
                      "p_model": float(p_model), "odds": float(odds), "odds_lo": lo, "odds_hi": hi, "edge": float(edge), "src": src,
                      "tier": tier, "rank": float(p_adj + 0.5 * eadj - (0.03 if tier == "B" else 0.0)), "fam": _family(key)})
     legs.sort(key=lambda x: -x["rank"])
-    chosen, fams, nb = [], set(), 0
+    chosen, fams, nb = [], defaultdict(int), 0
     for lg in legs:
-        if lg["fam"] in fams:
+        if fams[lg["fam"]] >= 2:
             continue
         if lg["tier"] == "B":
             if nb >= 2:
                 continue
             nb += 1
         chosen.append(lg)
-        fams.add(lg["fam"])
+        fams[lg["fam"]] += 1
         if len(chosen) >= MAX_MENU_LEGS:
             break
     return chosen
@@ -2304,8 +2306,8 @@ DATA KEY:
 - Options: available bets with odds and blended probability
 
 SELECTION RULES:
-1. Prefer a mix of match winners, double chance (1X/X2), Over/Under goals, and BTTS when similarly safe options exist; safety takes priority over diversity.
-2. STRICTLY AVOID "Either team to win (12)" unless probability is above 80% AND the data overwhelmingly supports it — it offers poor value at typical odds.
+1. Compare all listed options, not just the first option for each match. Across the final list, choose a variety of market types whenever the listed options support it; do not repeat one market type for every match.
+2. Avoid "Either team to win (12)" unless its listed probability is at least 80% and both the model and market support it. Prefer double chance or a suitable goals/BTTS option when they are comparably safe.
 3. PREFER: Double Chance (1X or X2), Over 1.5 Goals, BTTS Yes, clear match winners with strong form evidence.
 4. Prefer matches with TRAP score below 45; a higher-trap match may be chosen only with a clear reason.
 5. Prioritize matches where the MODEL and the MARKET agree (small gap between mdl% and implied market%).
@@ -2335,7 +2337,7 @@ def format_matches_for_ai(matches, tz, max_n=15):
         p = m["p"]
         t = m["trap"]
         opts = []
-        for l in m.get("legs", [])[:4]:
+        for l in m.get("legs", []):
             opts.append(f"{l['label']}@{l['odds']:.2f}(p:{_pct(l['p'])}%)")
         opts_str = " | ".join(opts) if opts else "no clear options"
         o = m["odds"]
@@ -2620,20 +2622,35 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     progress(1.0)
     if picks and isinstance(picks, list):
         valid_picks = []
+        matches_by_name = {f"{m['home']} v {m['away']}".casefold(): m for m in ai_pool}
+        seen_matches = set()
         for item in picks:
             mt_ = item.get("match") or item.get("fixture") or item.get("game")
             pk_ = item.get("pick") or item.get("selection") or item.get("bet") or item.get("market")
-            if isinstance(item, dict) and mt_ and pk_:
-                valid_picks.append({
-                    "match": str(mt_),
-                    "league": str(item.get("league", "")),
-                    "pick": str(pk_),
-                    "odds": _num(item.get("odds")),
-                    "probability": _num(item.get("probability")),
-                    "confidence": str(item.get("confidence", "MED")),
-                    "reason": str(item.get("reason", "")),
-                    "risk_if_fails": str(item.get("risk_if_fails", "")),
-                })
+            if not mt_ or not pk_:
+                continue
+            match = matches_by_name.get(re.sub(r"\s+", " ", str(mt_).strip()).casefold())
+            if not match:
+                continue
+            leg = next((option for option in match["legs"]
+                        if re.sub(r"\s+", " ", option["label"].strip()).casefold()
+                        == re.sub(r"\s+", " ", str(pk_).strip()).casefold()), None)
+            if not leg or (leg["key"] == "12" and min(leg["p"], leg["p_model"], leg["p_mkt"]) < 0.80):
+                continue
+            match_name = f"{match['home']} v {match['away']}"
+            if match_name in seen_matches:
+                continue
+            seen_matches.add(match_name)
+            valid_picks.append({
+                "match": match_name,
+                "league": str(match["league"]),
+                "pick": leg["label"],
+                "odds": leg["odds"],
+                "probability": _pct(leg["p"]),
+                "confidence": "HIGH" if str(item.get("confidence", "MED")).upper() == "HIGH" else "MED",
+                "reason": str(item.get("reason", "")),
+                "risk_if_fails": str(item.get("risk_if_fails", "")),
+            })
         if valid_picks:
             log(f"   ✅ AI returned {len(valid_picks)} picks using {info.get('model', 'unknown')}")
             return {"picks": valid_picks, "ai_note": f"AI selected {len(valid_picks)} picks ({budget.used} tokens used)",
