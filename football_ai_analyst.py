@@ -2291,7 +2291,7 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 AI_MATCH_PROMPT = """You are an expert football quant analyst at a sharp sportsbook. Python has collected data, run Monte Carlo simulations, and blended model probabilities with de-vigged bookmaker prices for every match below.
 
-YOUR TASK: Select up to {target} safest and most valuable INDIVIDUAL match predictions from the supplied qualified matches, ranked safest first. Prefer returning {target} picks when enough suitable options exist, but never invent a match, market, price, or evidence to fill the target. Return an empty list only if no supplied option is suitable. Select at most one option per match.
+YOUR TASK: Return exactly {target} picks, one from each of {target} distinct matches, ranked safest first. Python has already applied the safety and evidence gate: every supplied match has at least one qualifying option. Do not apply another eligibility filter and do not return an empty or shorter list. Choose the strongest available options from the supplied matches; mark weaker selections MED. Never invent a match, market, price, or evidence.
 
 DATA KEY:
 - xG: expected goals home-away
@@ -2311,14 +2311,14 @@ SELECTION RULES:
 5. Prioritize matches where the MODEL and the MARKET agree (small gap between mdl% and implied market%).
 6. For each pick, state the most likely way it LOSES (the failure scenario).
 7. 'inj:n/a' (unknown injuries) appears on every match when injury data is unavailable. Do NOT reject a match just for that; simply prefer higher-probability picks.
-8. Use only a match and selection shown in the supplied data. Copy its option label and odds exactly; use the option's listed probability as "probability".
+8. Use only a match and selection shown in the supplied data. Copy its option label and odds exactly. Copy the listed probability number exactly (for example, p:74% means "probability": 74).
 
 OUTPUT FORMAT: A compact JSON object with one key "picks" holding an array. Each array item has:
 - "match": "Home v Away"
 - "league": "League name"
 - "pick": "The specific selection (e.g. 'Home Win', 'Home or Draw (1X)', 'Over 1.5 Goals', 'BTTS - Yes')"
 - "odds": decimal odds (number)
-- "probability": your estimated probability in percent (number)
+- "probability": the option's listed probability in percent (number)
 - "confidence": "HIGH" or "MED"
 - "reason": max 12 words explaining why this is safe
 - "risk_if_fails": max 8 words describing how it loses
@@ -2598,16 +2598,17 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     cpt = float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN))
     eff = cfg.get("effort") if cfg.get("effort") in EFFORT_RESERVE else "low"
     use_ai = cfg.get("use_ai", True)
-    target = max(1, min(int(cfg.get("target_picks", TARGET_PICKS)), len(elig))) if elig else 0
+    requested_target = max(1, min(int(cfg.get("target_picks", TARGET_PICKS)), len(elig))) if elig else 0
     if not use_ai:
-        return {"picks": [], "ai_note": "AI disabled in settings.", "warnings": ["AI is disabled."], "model": None, "passes": [], "tokens": 0}
+        return {"picks": [], "ai_note": "AI disabled in settings.", "warnings": ["AI is disabled."], "model": None, "passes": [], "tokens": 0, "n_ai": 0}
     if not elig:
-        return {"picks": [], "ai_note": "No matches passed the evidence gate.", "warnings": [], "model": None, "passes": [], "tokens": 0}
+        return {"picks": [], "ai_note": "No matches passed the evidence gate.", "warnings": [], "model": None, "passes": [], "tokens": 0, "n_ai": 0}
     ranked = sorted(elig, key=lambda m: -(sum(l["rank"] for l in m.get("legs", [])[:2]) / max(1, len(m.get("legs", [])[:2]))))
-    prompt = AI_MATCH_PROMPT.replace("{target}", str(target))
     n_pool = min(len(ranked), 14)
     while True:
         ai_pool = ranked[:n_pool]
+        target = min(requested_target, len(ai_pool))
+        prompt = AI_MATCH_PROMPT.replace("{target}", str(target))
         data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool))
         user_msg = f"{prompt}\n\nMATCH DATA:\n{data_str}"
         if n_pool <= 3 or est_tokens(user_msg, cpt) + 1700 <= ceiling:
@@ -2636,13 +2637,15 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
         if valid_picks:
             log(f"   ✅ AI returned {len(valid_picks)} picks using {info.get('model', 'unknown')}")
             return {"picks": valid_picks, "ai_note": f"AI selected {len(valid_picks)} picks ({budget.used} tokens used)",
-                    "warnings": warnings, "model": info.get("model"), "passes": info.get("attempts", []), "tokens": budget.used}
+                    "warnings": warnings, "model": info.get("model"), "passes": info.get("attempts", []), "tokens": budget.used,
+                    "n_ai": len(ai_pool)}
         warnings.append("AI returned data but no valid picks could be extracted.")
     else:
         warnings.append(f"AI analysis failed: {info.get('status', 'unknown error')}. Check AI passes for details.")
     last_ = ((info.get("attempts") or [{}])[-1]).get("status", "")
     return {"picks": [], "ai_note": f"AI failed: {info.get('status', 'unknown')} - last attempt: {last_}",
-            "warnings": warnings, "model": info.get("model"), "passes": info.get("attempts", []), "tokens": budget.used}
+            "warnings": warnings, "model": info.get("model"), "passes": info.get("attempts", []), "tokens": budget.used,
+            "n_ai": len(ai_pool)}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2803,7 +2806,7 @@ def run_full_analysis(cfg, log, progress):
     stage = run_ai_stage(elig, cfg, log, progress)
     data["warnings"] += stage["warnings"]
     res = result(picks=stage["picks"], ai_note=stage["ai_note"], model=stage["model"],
-                 tokens=stage.get("tokens", 0), n_ai=len(elig), cfg=cfg, relaxed=relaxed,
+                 tokens=stage.get("tokens", 0), n_ai=stage.get("n_ai", 0), cfg=cfg, relaxed=relaxed,
                  passes=stage.get("passes", []))
     if stage["picks"]:
         save_picks_to_ledger(cfg["date"], stage["picks"])
@@ -2820,7 +2823,7 @@ def rerun_ai(res, cfg, log):
     stage = run_ai_stage(elig, cfg, log)
     old = [w for w in res.get("warnings", []) if "AI" not in w]
     new = dict(res, picks=stage["picks"], ai_note=stage["ai_note"], model=stage["model"], tokens=stage.get("tokens", 0),
-               n_ai=len(elig), warnings=old + stage["warnings"], cfg=cfg, passes=stage.get("passes", []))
+               n_ai=stage.get("n_ai", 0), warnings=old + stage["warnings"], cfg=cfg, passes=stage.get("passes", []))
     if new["picks"]:
         save_picks_to_ledger(cfg["date"], new["picks"])
         new["no_bet"] = False
