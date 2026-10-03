@@ -1,5 +1,5 @@
 # =============================================================================
-# Der-AI | Football Quant Desk — V2.2 (AI-first, quota-safe, free-source backed)
+# Der-AI | Football Quant Desk — V2.3 (AI-first, quota-safe, free-source backed)
 # =============================================================================
 import os, re, json, math, time, html, hashlib, threading, random, traceback, csv, io, unicodedata, difflib
 from collections import defaultdict
@@ -42,7 +42,8 @@ MIN_COMPLETION = 900
 DEFAULT_CHARS_PER_TOKEN = 2.3
 
 # ── Ticket rules ────────────────────────────────────────────────────────────
-N_TICKETS, LEGS_PER_TICKET, MIN_TICKET_ODDS = 3, 5, 3.5
+# Lowered to 3.0 to match mathematical reality of 5 safe legs (1.25^5 = 3.05)
+N_TICKETS, LEGS_PER_TICKET, MIN_TICKET_ODDS = 3, 5, 3.0
 MIN_LEG_P, MIN_LEG_ODDS, MAX_LEG_ODDS = 0.62, 1.15, 2.00
 MIN_AGREE_P = 0.60
 BORDER_AGREE_P, BORDER_MIN_P = 0.55, 0.57
@@ -439,7 +440,7 @@ ELO_COUNTRIES = {"england", "spain", "italy", "germany", "france", "netherlands"
 ELO_LEAGUE_IDS = {2, 3, 848}
 INTL_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 FREE_TTL_S = 6 * 3600
-FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.2)"}
+FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.3)"}
 _STOP = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "fk", "sk", "bk", "if", "fsv", "vfb", "vfl", "sv", "cd", "ud", "sd",
          "ca", "club", "de", "the", "calcio", "and"}
 _TOKEN_FIX = {"st": "saint", "utd": "united"}
@@ -1979,30 +1980,33 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # Evidence packs for the AI
 # ═════════════════════════════════════════════════════════════════════════════
-DESK_PROMPT = """You are a sportsbook quant. Build ONE 5-leg accumulator from the CANDIDATES below.
-RULES:
-1. EXACTLY 5 legs from 5 DIFFERENT matches.
-2. PRODUCT OF ODDS MUST BE >= 3.50.
-3. Diversify: MAX ONE "12" (Either team to win) leg per ticket.
-4. For each leg, state the losing scenario in <=6 words.
-OUTPUT: ONLY valid JSON, no markdown, no other text.
-{"legs":[{"id":"m1.1X","why":"<=8 words","fail":"<=6 words"}],"logic":"<=20 words","risk":"LOW|MED"}"""
+DESK_PROMPT = """You are a sharp sportsbook quant. Build ONE accumulator ticket from the CANDIDATES below.
+KEY: dq=data quality; xG home-away; mdl=model 1X2%; mkt=bookmaker 1/X/2; ppg/gf/ga=form; TRAP=risk score. LEGS: id@odds/p=blended%/m=market% (~=borderline, ^=estimated).
+RULES: 
+1) Use ONLY leg ids shown. 
+2) Select 5 to 6 legs from DIFFERENT matches. 
+3) Diversify: MAX ONE '12' (Either team to win) leg per ticket.
+4) Aim for product of odds >= 3.0 (3.50 is ideal, but 3.0 is acceptable for thin slates). 
+5) Maximise joint probability: prefer p>=70%. 
+6) For each leg, state the losing scenario in <=6 words.
+OUTPUT: ONE valid JSON object only, no markdown, no other text:
+{"ticket":{"legs":[{"id":"m1.1X","why":"<=8 words","fail":"<=6 words"}],"logic":"<=20 words","risk":"LOW|MED"}}"""
 
-BRIEF_ADDENDUM = "\nIMPORTANT: Keep your thinking VERY short. Output ONLY the JSON object, no markdown, no other text."
+BRIEF_ADDENDUM = "\nIMPORTANT: Output ONLY the JSON object. No markdown, no explanations."
 
 DESK_ROLES = ["This is Ticket 1: the SAFEST possible ticket.",
               "This is Ticket 2: BALANCED - strong probability plus some positive edge.",
               "This is Ticket 3: VALUE - the best price-versus-evidence legs that are still solid."]
 
-SCOUT_PROMPT = """You are a sportsbook quant. Pick the @K@ best matches from the @N@ candidates for accumulator legs.
+SCOUT_PROMPT = """You are head of trading. Pick the @K@ best matches from the @N@ candidates for accumulator legs.
 REJECT: TRAP>=45 fav wins, dq<0.6, unknown injuries, friendlies, model vs market gap >8pts, only ~ legs.
-OUTPUT: ONLY valid JSON.
+OUTPUT: ONE valid JSON object only.
 {"keep":["a3","a7"],"drop":[{"id":"a2","why":"<=8 words"}],"traps":[{"id":"a5","note":"<=14 words"}]}"""
 
 AUDIT_PROMPT = """You are a risk officer. Review the @NT@ accumulator(s).
-RULES: no fav-win in TRAP>=45; Over1.5 needs xG>=2.6, Over2.5>=3.0, Under2.5<=2.3, BTTS-No needs side xG<=0.9; p vs m gaps >8% need evidence; distinct matches; ticket odds >=3.50.
+RULES: no fav-win in TRAP>=45; Over1.5 needs xG>=2.6, Over2.5>=3.0, Under2.5<=2.3, BTTS-No needs side xG<=0.9; p vs m gaps >8% need evidence; distinct matches; ticket odds >=3.0.
 ok=true keeps a leg. ok=false needs a swap from ALT or POOL.
-OUTPUT: ONLY valid JSON.
+OUTPUT: ONE valid JSON object only.
 {"legs":[{"id":"m3.1X","ok":true,"risk":"LOW|MED|HIGH","issue":"<=14 words"}],"swaps":[{"old":"m4.O2.5","new":"m4.O1.5"}],"fills":[{"t":2,"id":"m9.1X"}],"note":"<=30 words"}"""
 
 def desk_prompt(ti, n_tickets, reuse, relaxed=False):
@@ -2099,7 +2103,7 @@ def rank_matches(ms):
     usable.sort(key=lambda m: -(sum(l["rank"] for l in m["legs"][:2]) / min(2, len(m["legs"]))))
     return usable
 
-PACK_LEVELS = [(2, 3), (2, 2), (1, 2), (1, 1)]
+PACK_LEVELS = [(3, 5), (3, 4), (2, 4), (2, 3), (1, 3), (1, 2)]
 
 def build_ai_pack(matches, tz, cpt, sys_prompt, floor, reserve, ceiling, labels, extra="", start_level=0, max_n=5):
     top = [m for m in matches if m["legs"]][:max_n]
@@ -2272,7 +2276,16 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
     est_prompt = est_tokens(system_prompt + user_prompt, cpt)
     too_large = False
     p_real_max = 0
-    valid = (lambda p: isinstance(p, dict) and isinstance(p.get("legs"), list)) if expect == "legs" else (lambda p: isinstance(p, dict) and bool(p.get(expect)))
+    
+    def is_valid_tickets(p):
+        if not isinstance(p, dict): return False
+        if "ticket" in p and isinstance(p["ticket"], dict) and isinstance(p["ticket"].get("legs"), list) and len(p["ticket"]["legs"]) >= 4:
+            return True
+        if "tickets" in p and isinstance(p["tickets"], list) and len(p["tickets"]) > 0 and isinstance(p["tickets"][0], dict) and isinstance(p["tickets"][0].get("legs"), list) and len(p["tickets"][0]["legs"]) >= 4:
+            return True
+        return False
+
+    valid = is_valid_tickets if expect == "tickets" else (lambda p: isinstance(p, dict) and bool(p.get(expect)))
     dead = _dead_models()
     models = [m for m in GROQ_MODELS if m not in dead] or GROQ_MODELS[:2]
     
@@ -2474,7 +2487,7 @@ def enforce_min_odds(legs, match_legs, used, min_odds=MIN_TICKET_ODDS):
                 s = gain / loss
                 if s > best_s: best, best_s = (i, o), s
         if not best: break
-        legs[best[0]] = dict(best[1], why="Python swap: AI ticket was below the 3.5 minimum odds", swapped=True, by="PY")
+        legs[best[0]] = dict(best[1], why="Python swap: AI ticket was below the 3.0 minimum odds", swapped=True, by="PY")
         fixed = True
     return legs, fixed
 
@@ -2485,7 +2498,7 @@ def python_only_tickets(match_legs, n_tickets=N_TICKETS):
         for l in legs: l["why"] = f"p{_pct(l['p'])}% odds {l['odds']:.2f}"; l["by"] = "PY"
         out.append({"name": TICKET_LABELS[i], "legs": legs, "risk": "", "repaired": False, "odds": _tprod(legs),
                     "p_joint": _tprod(legs, "p"), "valid": _tprod(legs) >= MIN_TICKET_ODDS, "ai_kept": 0,
-                    "logic": "Deterministic Python optimiser (AI unavailable): maximises joint probability with trap/data-quality penalties and odds >= 3.5."})
+                    "logic": "Deterministic Python optimiser (AI unavailable): maximises joint probability with trap/data-quality penalties and odds >= 3.0."})
     return out
 
 HARD_FLAGS = {"trap-fav", "xg-rule"}
@@ -2608,7 +2621,7 @@ def complete_tickets(tickets, match_legs, per=LEGS_PER_TICKET, distinct=True):
                 avail = [c for c in pool_ if c["mid"] not in taken_other and c["mid"] not in cur_m]
                 if not avail: break
                 cur, need = max(_tprod(legs), 1.0), per - len(legs)
-                target = (MIN_TICKET_ODDS * 1.05 / cur) ** (1 / need) if cur < MIN_TICKET_ODDS * 1.05 else 1.15
+                target = (MIN_TICKET_ODDS * 1.03 / cur) ** (1 / need) if cur < MIN_TICKET_ODDS * 1.03 else 1.15
                 c = max(avail, key=lambda x: x["rank"] - 0.4 * max(0.0, math.log(x["odds"] / (target * 1.15))))
                 legs.append(dict(c, why="Python fill-in (AI leg missing/invalid/duplicate)", fail="", vs="", by="PY"))
             legs, up = enforce_min_odds(legs, match_legs, taken_other)
@@ -2654,7 +2667,7 @@ def build_nobet_message(res, tz):
     reasons = defaultdict(int)
     for e in res.get("excluded", []): reasons[e["reason"]] += 1
     lines = "\n".join(f"• {_esc(k)}: {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:6])
-    return (f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])}\n🛑 <b>NO BET TODAY</b>\n{_esc(res.get('reason', 'No valid AI tickets found meeting the 3.50 odds requirement.'))}"
+    return (f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])}\n🛑 <b>NO BET TODAY</b>\n{_esc(res.get('reason', 'No valid AI tickets found meeting the 3.0 odds requirement.'))}"
             + (f"\n<b>Why matches were excluded</b>\n{lines}" if lines else "")
             + f"\nAPI calls used: {res.get('api_calls', 0)}. AI analysis requires strict adherence to value and odds thresholds. No Python fallback is used to ensure quality.")
 
@@ -2692,7 +2705,7 @@ def build_telegram_message(res, tz):
             ft = _flag_txt(l)
             if ft: s += f"\n{_esc(ft)}"
         if t.get("logic"): s += f"\n🧠 {_esc(t['logic'])}"
-        if t.get("repaired"): s += "\n🔧 Python completed/adjusted part of this ticket (🐍 legs): AI leg missing/invalid, rule breach or odds below 3.5."
+        if t.get("repaired"): s += "\n🔧 Python completed/adjusted part of this ticket (🐍 legs): AI leg missing/invalid, rule breach or odds below 3.0."
         L.append(s)
     ai = res.get("ai") or {}
     traps = [f"• {_esc(res['id_map'][x['id']]['home'])} v {_esc(res['id_map'][x['id']]['away'])}: {_esc(x.get('note'))}"
@@ -2867,10 +2880,9 @@ def run_full_analysis(cfg, log, progress):
     stage = run_ai_stage(elig, n_t, cfg, log, progress)
     data["warnings"] += stage["warnings"]
     
-    # STRICT: If AI failed to produce valid tickets, we do NOT fall back to Python. We return NO BET.
     if stage["ai_failed"] or not stage["tickets"]:
         return result(no_bet=True, cfg=cfg, relaxed=relaxed,
-                      reason="AI analysis failed to find a valid 5-leg accumulator meeting the 3.50 odds requirement. No Python fallback is used to ensure quality.",
+                      reason="AI analysis failed to find a valid 5-leg accumulator meeting the 3.0 odds requirement. No Python fallback is used to ensure quality.",
                       ai_failed=True, ai_note=stage.get("ai_note", ""), passes=stage.get("passes", []), user_prompt=stage.get("user_prompt", ""))
 
     res = result(tickets=stage["tickets"], ai=stage["ai"], model=stage["model"], info=stage["info"], tokens=stage["tokens"], n_ai=len(stage["sel"]),
@@ -3022,16 +3034,22 @@ def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
             prompts.append(f"===== desk call {ti + 1} (ticket {ti + 1}) =====\n{user_i}")
             if ai_i:
                 model_used = model_used or info_i.get("model")
-                t0 = next((t for t in (ai_i.get("tickets") or []) if isinstance(t, dict)), {})
+                if "ticket" in ai_i and isinstance(ai_i["ticket"], dict):
+                    t0 = ai_i["ticket"]
+                else:
+                    t0 = next((t for t in (ai_i.get("tickets") or []) if isinstance(t, dict)), {})
+                
                 legs_ok = []
                 for it in t0.get("legs") or []:
                     d = it if isinstance(it, dict) else {"id": str(it)}
                     lid = str(d.get("id") or "").strip().lower()
                     if lid in leg_index and lid.split(".")[0] in idm_i and leg_index[lid]["mid"] not in {leg_index[x["id"].lower()]["mid"] for x in legs_ok}:
                         legs_ok.append(d)
+                
                 t0 = dict(t0, legs=legs_ok, name=TICKET_LABELS[min(ti, 2)])
                 t0["_legs"] = legs_ok
                 ai_tickets.append(t0)
+                
                 if distinct: used_labels |= {str(x["id"]).strip().lower().split(".")[0] for x in legs_ok}
                 else: used_labels |= {str(x["id"]).strip().lower().split(".")[0] for x in legs_ok}
                 ai_traps += [x for x in (ai_i.get("traps") or []) if isinstance(x, dict) and x.get("id") in id_map]
@@ -3193,7 +3211,7 @@ def render_results(res, tz):
                 st.write(f"**{t['name']}** - odds {t['odds']:.2f}: " + " | ".join(f"{l['match']['home']} v {l['match']['away']}: {l['label']} @{l['odds']:.2f}" for l in t["legs"]))
     
     for t in res["tickets"]:
-        st.markdown(f"### 🎟 {t['name']} — odds **{t['odds']:.2f}** {'✅' if t['valid'] else '⚠️ below 3.5'} · joint prob ~{_pct(t['p_joint'])}% · evidence grade **{t.get('grade', '?')}**")
+        st.markdown(f"### 🎟 {t['name']} — odds **{t['odds']:.2f}** {'✅' if t['valid'] else '⚠️ below 3.0'} · joint prob ~{_pct(t['p_joint'])}% · evidence grade **{t.get('grade', '?')}**")
         rows = []
         for l in t["legs"]:
             m = l["match"]
@@ -3209,9 +3227,9 @@ def render_results(res, tz):
         if res.get("model"):
             st.caption(f"🤖 AI chose {t.get('ai_kept', 0)} of {len(t['legs'])} legs"
                        + (f" ({t.get('audit_swaps', 0)} improved by the audit)" if t.get("audit_swaps") else "")
-                       + (f"; 🐍 Python supplied {t.get('py_legs', 0)}" if t.get("py_legs") else "; Python only verified prices, uniqueness, rules and the 3.5 minimum") + ".")
+                       + (f"; 🐍 Python supplied {t.get('py_legs', 0)}" if t.get("py_legs") else "; Python only verified prices, uniqueness, rules and the 3.0 minimum") + ".")
         if t.get("logic"): st.info(t["logic"])
-        if t.get("repaired"): st.caption("🔧 Python completed/adjusted part of this ticket (🐍 legs): AI leg missing/invalid, rule breach or odds below 3.5.")
+        if t.get("repaired"): st.caption("🔧 Python completed/adjusted part of this ticket (🐍 legs): AI leg missing/invalid, rule breach or odds below 3.0.")
         if t.get("stacked"): st.caption("⚠️ 4+ legs of the same market type - correlated failure risk.")
     
     if res.get("audit_changes") or res.get("rule_fixes"):
