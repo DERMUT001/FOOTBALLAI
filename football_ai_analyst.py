@@ -2291,7 +2291,7 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 AI_MATCH_PROMPT = """You are an expert football quant analyst at a sharp sportsbook. Python has collected data, run Monte Carlo simulations, and blended model probabilities with de-vigged bookmaker prices for every match below.
 
-YOUR TASK: Select the TOP {target} safest and most valuable INDIVIDUAL match predictions from the data below. If fewer than {target} are truly safe, return only the ones that meet a high standard — never pad the list with weak picks.
+YOUR TASK: Select the TOP {target} safest and most valuable INDIVIDUAL match predictions from the data below. Always return the best {target} picks that exist in the data, ranked safest first. Mark weaker ones with confidence "MED". Only return fewer than {target} if there are fewer matches than that, and NEVER return an empty list when matches are provided.
 
 DATA KEY:
 - xG: expected goals home-away
@@ -2307,10 +2307,10 @@ SELECTION RULES:
 1. DIVERSITY IS MANDATORY: Avoid picking the same market type for every match. Mix: match winners, double chance (1X/X2), Over/Under goals, BTTS.
 2. STRICTLY AVOID "Either team to win (12)" unless probability is above 80% AND the data overwhelmingly supports it — it offers poor value at typical odds.
 3. PREFER: Double Chance (1X or X2), Over 1.5 Goals, BTTS Yes, clear match winners with strong form evidence.
-4. Avoid matches with TRAP score >= 45 unless you explicitly justify why.
+4. Prefer matches with TRAP score below 45; a higher-trap match may be chosen only with a clear reason.
 5. Prioritize matches where the MODEL and the MARKET agree (small gap between mdl% and implied market%).
 6. For each pick, state the most likely way it LOSES (the failure scenario).
-7. If a match has 'inj n/a' (unknown injuries), demand extra margin.
+7. 'inj:n/a' (unknown injuries) appears on every match when injury data is unavailable. Do NOT reject a match just for that; simply prefer higher-probability picks.
 8. Never pick more than 2 legs of the same market type across all your selections.
 9. Only use odds that appear in the Options list of that match.
 
@@ -2454,6 +2454,23 @@ def _parse_json_ex(content):
     return _salvage_json(c), True
 
 
+def _extract_picks(parsed):
+    """Find the list of pick dicts in whatever shape the model returned."""
+    if isinstance(parsed, list):
+        return [x for x in parsed if isinstance(x, dict)]
+    if isinstance(parsed, dict):
+        for k in ("picks", "selections", "top_picks", "predictions", "recommendations", "results", "bets"):
+            v = parsed.get(k)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+        for v in parsed.values():
+            if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
+                return v
+        if ("match" in parsed or "fixture" in parsed) and ("pick" in parsed or "selection" in parsed or "bet" in parsed):
+            return [parsed]
+    return []
+
+
 def _dead_models():
     try:
         d = load_state().get("dead_models") or {}
@@ -2526,16 +2543,14 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                 ch = (d.get("choices") or [{}])[0]
                 content = (ch.get("message") or {}).get("content") or ""
                 parsed, salvaged = _parse_json_ex(content) if content else (None, False)
-                if parsed:
-                    if isinstance(parsed, list) and len(parsed) > 0:
-                        log.append({"model": model, "status": "SUCCESS"})
-                        info.update({"model": model, "status": "SUCCESS"})
-                        return parsed, info
-                    elif isinstance(parsed, dict) and isinstance(parsed.get("picks"), list) and len(parsed["picks"]) > 0:
-                        log.append({"model": model, "status": "SUCCESS"})
-                        info.update({"model": model, "status": "SUCCESS"})
-                        return parsed["picks"], info
-                log.append({"model": model, "status": f"BAD_OUTPUT finish={ch.get('finish_reason')} ({ct} tokens)"})
+                found = _extract_picks(parsed) if parsed is not None else []
+                if found:
+                    log.append({"model": model, "status": f"SUCCESS ({len(found)} picks)"})
+                    info.update({"model": model, "status": "SUCCESS"})
+                    return found, info
+                why_ = ("EMPTY_CONTENT" if not content.strip() else
+                        "EMPTY_PICKS_LIST" if parsed is not None else "UNPARSEABLE_JSON")
+                log.append({"model": model, "status": f"{why_} finish={ch.get('finish_reason')} ({ct} tokens) raw={content.strip()[:220]!r}"})
                 if ch.get("finish_reason") == "length":
                     info["status"] = "TRUNCATED"
                     return None, info
@@ -2605,11 +2620,13 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     if picks and isinstance(picks, list):
         valid_picks = []
         for item in picks:
-            if isinstance(item, dict) and "match" in item and "pick" in item:
+            mt_ = item.get("match") or item.get("fixture") or item.get("game")
+            pk_ = item.get("pick") or item.get("selection") or item.get("bet") or item.get("market")
+            if isinstance(item, dict) and mt_ and pk_:
                 valid_picks.append({
-                    "match": str(item.get("match", "")),
+                    "match": str(mt_),
                     "league": str(item.get("league", "")),
-                    "pick": str(item.get("pick", "")),
+                    "pick": str(pk_),
                     "odds": _num(item.get("odds")),
                     "probability": _num(item.get("probability")),
                     "confidence": str(item.get("confidence", "MED")),
