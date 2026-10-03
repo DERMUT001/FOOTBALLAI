@@ -203,6 +203,10 @@ class ApiFootball:
         try:
             r = self.session.get(f"{APIF_BASE}/status", timeout=20)
             d = r.json()
+            errs_ = d.get("errors")
+            if isinstance(errs_, dict) and errs_.get("access"):
+                self.offline = True
+                return {"plan": None, "errors": errs_}
             resp = d.get("response") or {}
             if isinstance(resp, list):
                 resp = resp[0] if resp else {}
@@ -2332,7 +2336,7 @@ def format_matches_for_ai(matches, tz, max_n=15):
         p = m["p"]
         t = m["trap"]
         opts = []
-        for l in m.get("legs", [])[:5]:
+        for l in m.get("legs", [])[:4]:
             opts.append(f"{l['label']}@{l['odds']:.2f}(p:{_pct(l['p'])}%)")
         opts_str = " | ".join(opts) if opts else "no clear options"
         o = m["odds"]
@@ -2543,8 +2547,13 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
             elif r.status_code == 429:
                 log.append({"model": model, "status": f"RATE_LIMIT: {r.text[:100]}"})
                 time.sleep(15)
-            elif r.status_code in NON_RETRYABLE:
-                log.append({"model": model, "status": f"HTTP_{r.status_code}: {r.text[:100]}"})
+            elif r.status_code == 400 and "response_format" in payload:
+                log.append({"model": model, "status": f"HTTP_400 retrying plain: {r.text[:100]}"})
+                for k_ in ("response_format", "include_reasoning", "reasoning_effort"):
+                    payload.pop(k_, None)
+                continue
+            elif r.status_code in NON_RETRYABLE or r.status_code == 413:
+                log.append({"model": model, "status": f"HTTP_{r.status_code}: {r.text[:140]}"})
                 break
             else:
                 log.append({"model": model, "status": f"HTTP_{r.status_code}"})
@@ -2580,11 +2589,16 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     if not elig:
         return {"picks": [], "ai_note": "No matches passed the evidence gate.", "warnings": [], "model": None, "passes": [], "tokens": 0}
     ranked = sorted(elig, key=lambda m: -(sum(l["rank"] for l in m.get("legs", [])[:2]) / max(1, len(m.get("legs", [])[:2]))))
-    ai_pool = ranked[:min(len(ranked), 20)]
-    log(f"🤖 AI Analyst: sending {len(ai_pool)} qualified matches for selection (target: {target} picks)...")
-    data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool))
     prompt = AI_MATCH_PROMPT.replace("{target}", str(target))
-    user_msg = f"{prompt}\n\nMATCH DATA:\n{data_str}"
+    n_pool = min(len(ranked), 14)
+    while True:
+        ai_pool = ranked[:n_pool]
+        data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool))
+        user_msg = f"{prompt}\n\nMATCH DATA:\n{data_str}"
+        if n_pool <= 3 or est_tokens(user_msg, cpt) + 1700 <= ceiling:
+            break
+        n_pool -= 1
+    log(f"🤖 AI Analyst: sending {len(ai_pool)} qualified matches for selection (target: {target} picks)...")
     sys_msg = "You are an expert football quant analyst. Output ONLY a valid JSON object with a 'picks' array. No markdown. No explanation."
     picks, info = call_groq_for_picks(sys_msg, user_msg, budget, cpt, eff, gov, ceiling, log)
     progress(1.0)
@@ -2609,7 +2623,8 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
         warnings.append("AI returned data but no valid picks could be extracted.")
     else:
         warnings.append(f"AI analysis failed: {info.get('status', 'unknown error')}. Check AI passes for details.")
-    return {"picks": [], "ai_note": f"AI failed: {info.get('status', 'unknown')}",
+    last_ = ((info.get("attempts") or [{}])[-1]).get("status", "")
+    return {"picks": [], "ai_note": f"AI failed: {info.get('status', 'unknown')} - last attempt: {last_}",
             "warnings": warnings, "model": info.get("model"), "passes": info.get("attempts", []), "tokens": budget.used}
 
 
@@ -2886,6 +2901,8 @@ def render_results(res, tz):
     with st.expander("🛠 AI passes / errors"):
         if res.get("passes"):
             st.dataframe(pd.DataFrame(res["passes"]), hide_index=True, use_container_width=True)
+        else:
+            st.caption("No AI attempts were recorded.")
         for e in res.get("api_errors", []):
             st.caption(f"API: {e}")
         for e in (res.get("free") or {}).get("fails", []):
