@@ -1,5 +1,5 @@
 # =============================================================================
-# Der-AI | Football Quant Desk — V2.3 (AI-first, quota-safe, free-source backed)
+# Der-AI | Football Quant Desk — V2.4 (AI-first, quota-safe, free-source backed)
 # =============================================================================
 import os, re, json, math, time, html, hashlib, threading, random, traceback, csv, io, unicodedata, difflib
 from collections import defaultdict
@@ -440,7 +440,7 @@ ELO_COUNTRIES = {"england", "spain", "italy", "germany", "france", "netherlands"
 ELO_LEAGUE_IDS = {2, 3, 848}
 INTL_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 FREE_TTL_S = 6 * 3600
-FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.3)"}
+FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.4)"}
 _STOP = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "fk", "sk", "bk", "if", "fsv", "vfb", "vfl", "sv", "cd", "ud", "sd",
          "ca", "club", "de", "the", "calcio", "and"}
 _TOKEN_FIX = {"st": "saint", "utd": "united"}
@@ -1983,16 +1983,16 @@ def collect_day(api, cfg, log, progress, free=None):
 DESK_PROMPT = """You are a sharp sportsbook quant. Build ONE accumulator ticket from the CANDIDATES below.
 KEY: dq=data quality; xG home-away; mdl=model 1X2%; mkt=bookmaker 1/X/2; ppg/gf/ga=form; TRAP=risk score. LEGS: id@odds/p=blended%/m=market% (~=borderline, ^=estimated).
 RULES: 
-1) Use ONLY leg ids shown. 
-2) Select 5 to 6 legs from DIFFERENT matches. 
-3) Diversify: MAX ONE '12' (Either team to win) leg per ticket.
-4) Aim for product of odds >= 3.0 (3.50 is ideal, but 3.0 is acceptable for thin slates). 
+1) Use ONLY leg ids shown (e.g., "m1.12", "m2.X"). 
+2) Select 5 legs from 5 DIFFERENT matches. 
+3) Diversify: MAX ONE '12' (Either team to win) leg per ticket. Prefer 1X, X2, BTTS, or Over/Under.
+4) Aim for product of odds >= 3.0 (3.50 is ideal, but 3.0 is acceptable). 
 5) Maximise joint probability: prefer p>=70%. 
 6) For each leg, state the losing scenario in <=6 words.
 OUTPUT: ONE valid JSON object only, no markdown, no other text:
-{"ticket":{"legs":[{"id":"m1.1X","why":"<=8 words","fail":"<=6 words"}],"logic":"<=20 words","risk":"LOW|MED"}}"""
+{"tickets":[{"legs":[{"id":"m1.12","why":"Home form strong","fail":"Away scores early"}],"logic":"<=20 words","risk":"LOW|MED"}]}"""
 
-BRIEF_ADDENDUM = "\nIMPORTANT: Output ONLY the JSON object. No markdown, no explanations."
+BRIEF_ADDENDUM = "\nIMPORTANT: Output ONLY the JSON object. No markdown, no explanations. Ensure 'id' matches exactly the leg ids provided (e.g., 'm1.12')."
 
 DESK_ROLES = ["This is Ticket 1: the SAFEST possible ticket.",
               "This is Ticket 2: BALANCED - strong probability plus some positive edge.",
@@ -2439,7 +2439,16 @@ def optimize_tickets(match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, min_o
         lo = sum(math.log(l["odds"]) for l in legs)
         fam = defaultdict(int)
         for l in legs: fam[l["fam"]] += 1
-        div = -0.06 * sum(max(0, c - 2) for c in fam.values()) - 0.05 * sum(1 for l in legs if l.get("tier") == "B")
+        
+        # HEAVY penalty for lack of diversification (e.g., five "12" legs)
+        div = -0.06 * sum(max(0, c - 1) * 2.0 for c in fam.values()) 
+        div -= 0.05 * sum(1 for l in legs if l.get("tier") == "B")
+        
+        # Specific heavy penalty for multiple "12" (Either team to win) legs
+        count_12 = sum(1 for l in legs if l["key"] == "12")
+        if count_12 > 1:
+            div -= (count_12 - 1) * 2.0
+            
         return lp - 40 * max(0.0, math.log(min_odds) - lo) + div
     def total(): return sum(tscore(t) for t in tickets)
     best = total()
@@ -2532,22 +2541,55 @@ def finish_ticket(t, per=LEGS_PER_TICKET):
     return t
 
 def parse_ai_tickets(ai, leg_index, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, distinct=True):
-    raw = (ai or {}).get("tickets") or []
+    # Handle both "tickets" (list) and "ticket" (single dict)
+    raw = (ai or {}).get("tickets")
+    if not raw:
+        single = (ai or {}).get("ticket")
+        if single and isinstance(single, dict):
+            raw = [single]
+        else:
+            raw = []
+    
     used, tickets = set(), []
     for ti in range(n_tickets):
         t = raw[ti] if ti < len(raw) and isinstance(raw[ti], dict) else {}
         legs, repaired = [], False
         for it in t.get("legs") or []:
             d = it if isinstance(it, dict) else {"id": str(it)}
-            lg = leg_index.get(str(d.get("id") or "").strip().lower())
+            raw_id = str(d.get("id") or "").strip().lower()
+            
+            # Exact match first
+            lg = leg_index.get(raw_id)
+            
+            # Fuzzy match fallback if exact ID fails (e.g., AI outputs "m1.1x" instead of "m1.1X")
+            if not lg:
+                parts = raw_id.split(".")
+                if len(parts) == 2:
+                    match_id, key_part = parts[0], parts[1]
+                    for lid, leg in leg_index.items():
+                        if lid.startswith(match_id + ".") and leg["key"].lower() == key_part:
+                            lg = leg
+                            break
+                            
             if not lg or lg["mid"] in used or lg["mid"] in {l["mid"] for l in legs}:
                 repaired = True
                 continue
             legs.append(dict(lg, why=d.get("why", ""), fail=d.get("fail", ""), vs=d.get("vs", ""), by="AI"))
-        if len(legs) > per: legs, repaired = legs[:per], True
-        if distinct: used |= {l["mid"] for l in legs}
-        tickets.append({"name": t.get("name") or TICKET_LABELS[min(ti, 2)], "legs": legs, "logic": t.get("logic", ""),
-                        "risk": t.get("risk", ""), "repaired": repaired, "audit_swaps": 0})
+        
+        if len(legs) > per:
+            legs, repaired = legs[:per], True
+            
+        if distinct:
+            used |= {l["mid"] for l in legs}
+            
+        tickets.append({
+            "name": t.get("name") or TICKET_LABELS[min(ti, 2)], 
+            "legs": legs, 
+            "logic": t.get("logic", ""),
+            "risk": t.get("risk", ""), 
+            "repaired": repaired, 
+            "audit_swaps": 0
+        })
     return tickets
 
 def apply_audit(tickets, aud, leg_index, match_legs, per=LEGS_PER_TICKET, distinct=True):
