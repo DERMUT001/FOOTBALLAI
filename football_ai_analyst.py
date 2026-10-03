@@ -61,7 +61,7 @@ MIN_PICKS = 1
 MIN_LEG_P, MIN_LEG_ODDS, MAX_LEG_ODDS = 0.62, 1.15, 2.00
 MIN_AGREE_P = 0.60
 BORDER_AGREE_P, BORDER_MIN_P = 0.55, 0.57
-MAX_MENU_LEGS = 7
+MAX_MENU_LEGS = 10
 BASIS_TAG = {"season+recent": "S+R", "recent": "R", "season": "S", "elo": "E", "prior": "P"}
 
 # ── League intelligence ─────────────────────────────────────────────────────
@@ -1262,7 +1262,7 @@ def team_history_stats(team_id, ids, hist):
 def build_profile(team_id, results, hs, injuries, lineup):
     r10 = results[:10]
     w = np.array([0.88 ** i for i in range(len(r10))]) if r10 else np.array([])
-    prof = {"n": len(r10), "last": [f"{x['gf']}-{x['ga']}{x['res']}" for x in r10[:5]]}
+    prof = {"n": len(r10), "last": [f"{'H' if x['home'] else 'A'}-{_short(x.get('opp'), 12)} {x['gf']}-{x['ga']}{x['res']}" for x in r10[:5]]}
     if r10:
         gf = np.array([x["gf"] for x in r10], float)
         ga = np.array([x["ga"] for x in r10], float)
@@ -1597,6 +1597,24 @@ def _family(key):
     return pre + ("O" if "O" in key.split("_")[-1][:1] else "U")
 
 
+def _pick_market_group(key):
+    if key in ("1X", "X2"):
+        return "double chance"
+    if key in ("1", "X", "2", "12"):
+        return "match result"
+    if key.startswith("BTTS"):
+        return "both teams score"
+    if key.startswith(("H_", "A_")):
+        return "team totals"
+    if key.startswith("HT_"):
+        return "first-half totals"
+    if key.startswith("C_"):
+        return "corners"
+    if key.startswith(("O", "U")):
+        return "full-time goals totals"
+    return "other"
+
+
 def market_fair_prob(key, om):
     d = _devig(om, ["1", "X", "2"])
     if d:
@@ -1680,10 +1698,15 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
                      "p_model": float(p_model), "odds": float(odds), "odds_lo": lo, "odds_hi": hi, "edge": float(edge), "src": src,
                      "tier": tier, "rank": float(p_adj + 0.5 * eadj - (0.03 if tier == "B" else 0.0)), "fam": _family(key)})
     legs.sort(key=lambda x: -x["rank"])
+    first_by_family, extra_by_family, fams = [], [], defaultdict(int)
+    for leg in legs:
+        if fams[leg["fam"]] == 0:
+            first_by_family.append(leg)
+        elif fams[leg["fam"]] == 1:
+            extra_by_family.append(leg)
+        fams[leg["fam"]] += 1
     chosen, fams, nb = [], defaultdict(int), 0
-    for lg in legs:
-        if fams[lg["fam"]] >= 2:
-            continue
+    for lg in first_by_family + extra_by_family:
         if lg["tier"] == "B":
             if nb >= 2:
                 continue
@@ -2299,21 +2322,20 @@ DATA KEY:
 - xG: expected goals home-away
 - mdl: Monte Carlo model 1X2 probabilities (%)
 - mkt: bookmaker 1/X/2 odds (fd = free source prices)
-- ppg/gf/ga: recent form (points per game, goals for, goals against)
+- Form: recent results and rates for goals, clean sheets, failed-to-score, overs and BTTS
 - TRAP: Python trap score (>=40 = dangerous, >=60 = very dangerous)
 - dq: data quality 0-1
-- H2H: head-to-head W-D-L
-- Options: available bets with odds and blended probability
+- H2H: head-to-head W-D-L and average total goals
+- Options: qualifying bets with odds, blended/model/market probabilities, and tier
 
 SELECTION RULES:
-1. Compare all listed options, not just the first option for each match. Across the final list, choose a variety of market types whenever the listed options support it; do not repeat one market type for every match.
-2. Avoid "Either team to win (12)" unless its listed probability is at least 80% and both the model and market support it. Prefer double chance or a suitable goals/BTTS option when they are comparably safe.
-3. PREFER: Double Chance (1X or X2), Over 1.5 Goals, BTTS Yes, clear match winners with strong form evidence.
-4. Prefer matches with TRAP score below 45; a higher-trap match may be chosen only with a clear reason.
-5. Prioritize matches where the MODEL and the MARKET agree (small gap between mdl% and implied market%).
-6. For each pick, state the most likely way it LOSES (the failure scenario).
-7. 'inj:n/a' (unknown injuries) appears on every match when injury data is unavailable. Do NOT reject a match just for that; simply prefer higher-probability picks.
-8. Use only a match and selection shown in the supplied data. Copy its option label and odds exactly. Copy the listed probability number exactly (for example, p:74% means "probability": 74).
+1. Analyze the recent results, scoring rates, H2H, trap risk, data quality, and each option's blended/model/market probabilities before choosing. Do not base the decision on Monte Carlo probability alone.
+2. Compare every listed option, not just the first. Choose at least {min_categories} different market categories and no more than {max_per_market} picks from any one category. Categories: double chance, match result, full-time goals totals, team totals, both teams score, first-half totals, corners. Prefer balance across categories when the evidence is comparable.
+3. Avoid "Either team to win (12)" unless its listed probability is at least 80% and both the model and market support it. Prefer double chance or suitable goals/BTTS options when comparably safe.
+4. Prefer matches with TRAP below 45; a higher-trap match requires clear supporting evidence.
+5. Treat missing injury/lineup data as unknown, not as evidence for or against a pick. Do not invent external facts.
+6. For each pick, state which supplied form or market evidence supports it and the most likely failure scenario.
+7. Use only an exact match and option shown in the supplied data. Copy its label and odds; copy the listed blended probability (p:74% means "probability": 74).
 
 OUTPUT FORMAT: A compact JSON object with one key "picks" holding an array. Each array item has:
 - "match": "Home v Away"
@@ -2338,7 +2360,8 @@ def format_matches_for_ai(matches, tz, max_n=15):
         t = m["trap"]
         opts = []
         for l in m.get("legs", []):
-            opts.append(f"{l['label']}@{l['odds']:.2f}(p:{_pct(l['p'])}%)")
+            group = _pick_market_group(l["key"])
+            opts.append(f"{l['label']}@{l['odds']:.2f}(p:{_pct(l['p'])},mdl:{_pct(l['p_model'])},mkt:{_pct(l['p_mkt'])},{group},{l['tier']})")
         opts_str = " | ".join(opts) if opts else "no clear options"
         o = m["odds"]
         if all(k in o for k in ("1", "X", "2")):
@@ -2348,13 +2371,22 @@ def format_matches_for_ai(matches, tz, max_n=15):
         else:
             mkt_str = "no market prices"
         trap_str = f" | TRAP:{t['risk']}" if t["risk"] >= 25 else ""
-        h2h_str = f" | H2H:{m['h2h']['w']}-{m['h2h']['d']}-{m['h2h']['l']}" if m.get("h2h") else ""
+        h2h_str = (f" | H2H:{m['h2h']['w']}-{m['h2h']['d']}-{m['h2h']['l']} avgG:{m['h2h']['g']:.1f}"
+                   if m.get("h2h") else " | H2H:n/a")
         inj_str = "inj:n/a" if not m.get("inj_known") else ""
+        def rate(profile, key):
+            value = profile.get(key)
+            return "-" if value is None else f"{_pct(value)}%"
+
+        home_recent = ",".join(ph.get("last", [])[:5]) or "n/a"
+        away_recent = ",".join(pa.get("last", [])[:5]) or "n/a"
         block = (f"{i + 1}. {m['league']} | {m['home']} v {m['away']} ({ko}) | dq:{m['dq']}{trap_str}\n"
                  f"   xG:{m['lam_h']:.2f}-{m['lam_a']:.2f} | mdl 1:{_pct(m['model_p']['1'])}% X:{_pct(m['model_p']['X'])}% 2:{_pct(m['model_p']['2'])}% | {mkt_str}\n"
-                 f"   Home: {ph.get('form5', '?')} ppg{ph.get('ppg5', 0):.1f} gf{ph.get('gf_w', 0):.1f} ga{ph.get('ga_w', 0):.1f} | "
-                 f"Away: {pa.get('form5', '?')} ppg{pa.get('ppg5', 0):.1f} gf{pa.get('gf_w', 0):.1f} ga{pa.get('ga_w', 0):.1f}\n"
-                 f"   BTTS:{_pct(p['BTTS_Y'])}% O1.5:{_pct(p['O1.5'])}% O2.5:{_pct(p['O2.5'])}% U2.5:{_pct(p['U2.5'])}%{h2h_str}{' | ' + inj_str if inj_str else ''}\n"
+                 f"   Home form:{ph.get('form5', '?')} last:{home_recent} PPG5:{ph.get('ppg5', 0):.1f} PPG10:{ph.get('ppg10', 0):.1f} GF:{ph.get('gf_w', 0):.1f} GA:{ph.get('ga_w', 0):.1f}\n"
+                 f"   Home rates CS:{rate(ph, 'cs')} FTS:{rate(ph, 'fts')} O1.5:{rate(ph, 'o15')} O2.5:{rate(ph, 'o25')} BTTS:{rate(ph, 'btts')} | "
+                 f"Away form:{pa.get('form5', '?')} last:{away_recent} PPG5:{pa.get('ppg5', 0):.1f} PPG10:{pa.get('ppg10', 0):.1f} GF:{pa.get('gf_w', 0):.1f} GA:{pa.get('ga_w', 0):.1f}\n"
+                 f"   Away rates CS:{rate(pa, 'cs')} FTS:{rate(pa, 'fts')} O1.5:{rate(pa, 'o15')} O2.5:{rate(pa, 'o25')} BTTS:{rate(pa, 'btts')}\n"
+                 f"   Match probs BTTS:{_pct(p['BTTS_Y'])}% O1.5:{_pct(p['O1.5'])}% O2.5:{_pct(p['O2.5'])}% U2.5:{_pct(p['U2.5'])}%{h2h_str}{' | ' + inj_str if inj_str else ''}\n"
                  f"   Options: {opts_str}")
         lines.append(block)
     return "\n\n".join(lines)
@@ -2610,7 +2642,12 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     while True:
         ai_pool = ranked[:n_pool]
         target = min(requested_target, len(ai_pool))
-        prompt = AI_MATCH_PROMPT.replace("{target}", str(target))
+        available_categories = {_pick_market_group(leg["key"]) for match in ai_pool for leg in match.get("legs", [])}
+        min_categories = min(target, 3, len(available_categories))
+        max_per_market = max(1, math.ceil(target * 0.4), math.ceil(target / max(1, len(available_categories))))
+        prompt = (AI_MATCH_PROMPT.replace("{target}", str(target))
+                  .replace("{min_categories}", str(min_categories))
+                  .replace("{max_per_market}", str(max_per_market)))
         data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool))
         user_msg = f"{prompt}\n\nMATCH DATA:\n{data_str}"
         if n_pool <= 3 or est_tokens(user_msg, cpt) + 1700 <= ceiling:
@@ -2620,11 +2657,13 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     sys_msg = "You are an expert football quant analyst. Output ONLY a valid JSON object with a 'picks' array. No markdown. No explanation."
     picks, info = call_groq_for_picks(sys_msg, user_msg, budget, cpt, eff, gov, ceiling, log)
     progress(1.0)
-    if picks and isinstance(picks, list):
-        valid_picks = []
+    def validate_picks(items):
+        valid, groups = [], defaultdict(int)
         matches_by_name = {f"{m['home']} v {m['away']}".casefold(): m for m in ai_pool}
         seen_matches = set()
-        for item in picks:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             mt_ = item.get("match") or item.get("fixture") or item.get("game")
             pk_ = item.get("pick") or item.get("selection") or item.get("bet") or item.get("market")
             if not mt_ or not pk_:
@@ -2641,7 +2680,9 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
             if match_name in seen_matches:
                 continue
             seen_matches.add(match_name)
-            valid_picks.append({
+            group = _pick_market_group(leg["key"])
+            groups[group] += 1
+            valid.append({
                 "match": match_name,
                 "league": str(match["league"]),
                 "pick": leg["label"],
@@ -2651,6 +2692,34 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                 "reason": str(item.get("reason", "")),
                 "risk_if_fails": str(item.get("risk_if_fails", "")),
             })
+        return valid, groups
+
+    if picks and isinstance(picks, list):
+        valid_picks, groups = validate_picks(picks)
+        if valid_picks and (len(groups) < min_categories or any(n > max_per_market for n in groups.values())):
+            log(f"   ⚖️ AI market mix needs adjustment ({dict(groups)}); requesting a balanced re-selection...")
+            correction_system = (sys_msg + f" Select exactly {target} picks across at least {min_categories} market categories, "
+                                f"with no more than {max_per_market} picks per category.")
+            correction_user = (user_msg + f"\n\nPORTFOLIO BALANCE CORRECTION: Your previous selection violated the portfolio rules. "
+                              f"Return a fresh set of exactly {target} picks from at least {min_categories} different market categories, "
+                              f"with at most {max_per_market} picks in each category. Preserve one pick per match and follow all evidence rules.")
+            revised, revised_info = call_groq_for_picks(correction_system, correction_user, budget, cpt, eff, gov, ceiling, log)
+            revised_info["attempts"] = info.get("attempts", []) + revised_info.get("attempts", [])
+            if revised and isinstance(revised, list):
+                revised_valid, revised_groups = validate_picks(revised)
+                if revised_valid:
+                    valid_picks, groups, info = revised_valid, revised_groups, revised_info
+            if len(groups) < min_categories or any(n > max_per_market for n in groups.values()):
+                warnings.append("AI did not fully meet the requested market mix after re-selection.")
+                balanced, used = [], defaultdict(int)
+                for pick in valid_picks:
+                    match = next(m for m in ai_pool if f"{m['home']} v {m['away']}" == pick["match"])
+                    leg = next(l for l in match["legs"] if l["label"] == pick["pick"])
+                    group = _pick_market_group(leg["key"])
+                    if used[group] < max_per_market:
+                        balanced.append(pick)
+                        used[group] += 1
+                valid_picks, groups = balanced, used
         if valid_picks:
             log(f"   ✅ AI returned {len(valid_picks)} picks using {info.get('model', 'unknown')}")
             return {"picks": valid_picks, "ai_note": f"AI selected {len(valid_picks)} picks ({budget.used} tokens used)",
