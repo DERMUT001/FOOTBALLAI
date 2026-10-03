@@ -1,5 +1,5 @@
 # =============================================================================
-# Der-AI | Football Quant Desk — V2.1 (AI-first, quota-safe, free-source backed)
+# Der-AI | Football Quant Desk — V2.2 (AI-first, quota-safe, free-source backed)
 # =============================================================================
 import os, re, json, math, time, html, hashlib, threading, random, traceback, csv, io, unicodedata, difflib
 from collections import defaultdict
@@ -439,7 +439,7 @@ ELO_COUNTRIES = {"england", "spain", "italy", "germany", "france", "netherlands"
 ELO_LEAGUE_IDS = {2, 3, 848}
 INTL_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 FREE_TTL_S = 6 * 3600
-FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.1)"}
+FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.2)"}
 _STOP = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "fk", "sk", "bk", "if", "fsv", "vfb", "vfl", "sv", "cd", "ud", "sd",
          "ca", "club", "de", "the", "calcio", "and"}
 _TOKEN_FIX = {"st": "saint", "utd": "united"}
@@ -1616,7 +1616,6 @@ def collect_day(api, cfg, log, progress, free=None):
     stt = api.status()
     out["plan"] = stt
     
-    # Graceful handling of suspended API accounts
     if stt.get("errors") and "suspended" in str(stt.get("errors")).lower():
         log("ℹ️ API-Football account is suspended. Switching to free sources only (football-data.co.uk, ESPN, ClubElo).")
         api.offline = True
@@ -1980,27 +1979,31 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # Evidence packs for the AI
 # ═════════════════════════════════════════════════════════════════════════════
-DESK_PROMPT = """You are a sharp sportsbook trader. Python gathered data, ran Monte Carlo, and blended it with de-vigged bookmaker prices. YOU choose legs for ONE 5-leg accumulator.
-KEY: dq=data quality; R/S/S+R/E=data source; xG home-away; mdl=model 1X2%; mkt=bookmaker 1/X/2; ppg/gf/ga=form; H2H W-D-L; TRAP=risk score. LEGS: id@odds/p=blended%/m=market% (~=borderline, ^=estimated).
-RULES: 1) Use ONLY leg ids shown. 2) Exactly 5 legs from 5 DIFFERENT matches. 3) PRODUCT OF ODDS MUST BE >= 3.50. 4) Maximize joint probability: prefer p>=75%. 5) For each leg, state the losing scenario.
-OUTPUT: ONE JSON object only, no markdown, no other text:
-{"tickets":[{"legs":[{"id":"m3.1X","why":"<=10 words","fail":"<=6 words","vs":"<=8 words if p/m gap>8%"}]}],"traps":[{"id":"m5","note":"<=10 words"}],"summary":"<=20 words"}"""
+DESK_PROMPT = """You are a sportsbook quant. Build ONE 5-leg accumulator from the CANDIDATES below.
+RULES:
+1. EXACTLY 5 legs from 5 DIFFERENT matches.
+2. PRODUCT OF ODDS MUST BE >= 3.50.
+3. Diversify: MAX ONE "12" (Either team to win) leg per ticket.
+4. For each leg, state the losing scenario in <=6 words.
+OUTPUT: ONLY valid JSON, no markdown, no other text.
+{"legs":[{"id":"m1.1X","why":"<=8 words","fail":"<=6 words"}],"logic":"<=20 words","risk":"LOW|MED"}"""
 
-BRIEF_ADDENDUM = "\nIMPORTANT: keep your thinking VERY short, then output the JSON at once. why/fail <= 6 words each."
+BRIEF_ADDENDUM = "\nIMPORTANT: Keep your thinking VERY short. Output ONLY the JSON object, no markdown, no other text."
 
 DESK_ROLES = ["This is Ticket 1: the SAFEST possible ticket.",
               "This is Ticket 2: BALANCED - strong probability plus some positive edge.",
               "This is Ticket 3: VALUE - the best price-versus-evidence legs that are still solid."]
 
-SCOUT_PROMPT = """You are head of trading. Python analysed @N@ matches. There is room to study only @K@ of them in depth, and @NT@ accumulator(s) x 5 legs from separate matches are needed (at least @NEED@ usable matches).
-Pick the @K@ matches you trust MOST as sources of safe accumulator legs, best first. Reject matches with thin, contradictory or trap-prone evidence: TRAP>=45 where legs are favourite wins, dq<0.6, big favourite with unknown injuries, friendlies, model vs market gap >8pts, only ~ legs.
-DATA KEY: xG home-away; mdl=model 1X2%; mk=bookmaker 1/X/2; T=trap; inj=missing starters; ROT=rotation; legs: key@odds p=blended% m=market%, ~=borderline.
-OUTPUT: ONE JSON object only: {"keep":["a3","a7", ...up to @K@ ids, best first],"drop":[{"id":"a2","why":"<=8 words"}],"traps":[{"id":"a5","note":"<=14 words"}]}"""
+SCOUT_PROMPT = """You are a sportsbook quant. Pick the @K@ best matches from the @N@ candidates for accumulator legs.
+REJECT: TRAP>=45 fav wins, dq<0.6, unknown injuries, friendlies, model vs market gap >8pts, only ~ legs.
+OUTPUT: ONLY valid JSON.
+{"keep":["a3","a7"],"drop":[{"id":"a2","why":"<=8 words"}],"traps":[{"id":"a5","note":"<=14 words"}]}"""
 
-AUDIT_PROMPT = """You are a risk officer. A trader drafted @NT@ accumulator(s). BREAK each leg: find the most likely way it loses, then rule.
-Rules: no fav-win in TRAP>=45; Over1.5 needs xG>=2.6, Over2.5>=3.0, Under2.5<=2.3, BTTS-No needs side xG<=0.9; p vs m gaps >8% need evidence; unknown injuries, thin data and borderline (~) legs need extra margin; distinct matches; ticket odds >=3.50.
-ok=true keeps a leg. ok=false needs a swap: an id from that leg's ALT list or POOL. GAPS: fill from POOL.
-OUTPUT: ONE JSON object only: {"legs":[{"id":"m3.1X","ok":true,"risk":"LOW|MED|HIGH","issue":"<=14 words"}],"swaps":[{"old":"m4.O2.5","new":"m4.O1.5"}],"fills":[{"t":2,"id":"m9.1X"}],"note":"<=30 words"}"""
+AUDIT_PROMPT = """You are a risk officer. Review the @NT@ accumulator(s).
+RULES: no fav-win in TRAP>=45; Over1.5 needs xG>=2.6, Over2.5>=3.0, Under2.5<=2.3, BTTS-No needs side xG<=0.9; p vs m gaps >8% need evidence; distinct matches; ticket odds >=3.50.
+ok=true keeps a leg. ok=false needs a swap from ALT or POOL.
+OUTPUT: ONLY valid JSON.
+{"legs":[{"id":"m3.1X","ok":true,"risk":"LOW|MED|HIGH","issue":"<=14 words"}],"swaps":[{"old":"m4.O2.5","new":"m4.O1.5"}],"fills":[{"t":2,"id":"m9.1X"}],"note":"<=30 words"}"""
 
 def desk_prompt(ti, n_tickets, reuse, relaxed=False):
     return (DESK_PROMPT.replace("@WHAT@", f"ticket {ti + 1} of {n_tickets}: one 5-leg accumulator")
@@ -2096,9 +2099,9 @@ def rank_matches(ms):
     usable.sort(key=lambda m: -(sum(l["rank"] for l in m["legs"][:2]) / min(2, len(m["legs"]))))
     return usable
 
-PACK_LEVELS = [(2, 4), (2, 3), (1, 3), (1, 2)]
+PACK_LEVELS = [(2, 3), (2, 2), (1, 2), (1, 1)]
 
-def build_ai_pack(matches, tz, cpt, sys_prompt, floor, reserve, ceiling, labels, extra="", start_level=0, max_n=6):
+def build_ai_pack(matches, tz, cpt, sys_prompt, floor, reserve, ceiling, labels, extra="", start_level=0, max_n=5):
     top = [m for m in matches if m["legs"]][:max_n]
     prompt_cap = ceiling - reserve - TOKEN_SAFETY
     sys_tok = est_tokens(sys_prompt + extra, cpt)
@@ -2613,7 +2616,6 @@ def complete_tickets(tickets, match_legs, per=LEGS_PER_TICKET, distinct=True):
             t["repaired"] = bool(t.get("repaired") or up)
         
         finish_ticket(t, per)
-        # STRICT ENFORCEMENT: Only keep tickets that genuinely meet the 3.5 odds requirement.
         if t["valid"] and t["odds"] >= MIN_TICKET_ODDS:
             valid_tickets.append(t)
     return valid_tickets
@@ -2652,9 +2654,9 @@ def build_nobet_message(res, tz):
     reasons = defaultdict(int)
     for e in res.get("excluded", []): reasons[e["reason"]] += 1
     lines = "\n".join(f"• {_esc(k)}: {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:6])
-    return (f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])}\n🛑 <b>NO BET TODAY</b>\n{_esc(res.get('reason'))}"
+    return (f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])}\n🛑 <b>NO BET TODAY</b>\n{_esc(res.get('reason', 'No valid AI tickets found meeting the 3.50 odds requirement.'))}"
             + (f"\n<b>Why matches were excluded</b>\n{lines}" if lines else "")
-            + f"\nAPI calls used: {res.get('api_calls', 0)}. No tickets are better than tickets built on guesses.")
+            + f"\nAPI calls used: {res.get('api_calls', 0)}. AI analysis requires strict adherence to value and odds thresholds. No Python fallback is used to ensure quality.")
 
 def _flag_txt(l):
     show = [f for f in (l.get("flags") or []) if f in HARD_FLAGS or f in ("gap-unexplained", "thin-data", "inj-unknown", "corners-lowdq")]
@@ -2864,6 +2866,13 @@ def run_full_analysis(cfg, log, progress):
     
     stage = run_ai_stage(elig, n_t, cfg, log, progress)
     data["warnings"] += stage["warnings"]
+    
+    # STRICT: If AI failed to produce valid tickets, we do NOT fall back to Python. We return NO BET.
+    if stage["ai_failed"] or not stage["tickets"]:
+        return result(no_bet=True, cfg=cfg, relaxed=relaxed,
+                      reason="AI analysis failed to find a valid 5-leg accumulator meeting the 3.50 odds requirement. No Python fallback is used to ensure quality.",
+                      ai_failed=True, ai_note=stage.get("ai_note", ""), passes=stage.get("passes", []), user_prompt=stage.get("user_prompt", ""))
+
     res = result(tickets=stage["tickets"], ai=stage["ai"], model=stage["model"], info=stage["info"], tokens=stage["tokens"], n_ai=len(stage["sel"]),
                  id_map=stage["id_map"], user_prompt=stage["user_prompt"], est_mode=stage["est_mode"], ai_note=stage["ai_note"],
                  ai_failed=stage["ai_failed"], python_draft=stage["python_draft"], cfg=cfg, relaxed=relaxed, passes=stage["passes"],
