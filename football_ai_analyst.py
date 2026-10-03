@@ -1,5 +1,5 @@
 # =============================================================================
-# Der-AI | Football Quant Desk — V2.4 (AI-first, quota-safe, free-source backed)
+# Der-AI | Football Quant Desk — V2.5 (AI-first, quota-safe, free-source backed)
 # =============================================================================
 import os, re, json, math, time, html, hashlib, threading, random, traceback, csv, io, unicodedata, difflib
 from collections import defaultdict
@@ -42,7 +42,6 @@ MIN_COMPLETION = 900
 DEFAULT_CHARS_PER_TOKEN = 2.3
 
 # ── Ticket rules ────────────────────────────────────────────────────────────
-# Lowered to 3.0 to match mathematical reality of 5 safe legs (1.25^5 = 3.05)
 N_TICKETS, LEGS_PER_TICKET, MIN_TICKET_ODDS = 3, 5, 3.0
 MIN_LEG_P, MIN_LEG_ODDS, MAX_LEG_ODDS = 0.62, 1.15, 2.00
 MIN_AGREE_P = 0.60
@@ -440,7 +439,7 @@ ELO_COUNTRIES = {"england", "spain", "italy", "germany", "france", "netherlands"
 ELO_LEAGUE_IDS = {2, 3, 848}
 INTL_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 FREE_TTL_S = 6 * 3600
-FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.4)"}
+FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/2.5)"}
 _STOP = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "fk", "sk", "bk", "if", "fsv", "vfb", "vfl", "sv", "cd", "ud", "sd",
          "ca", "club", "de", "the", "calcio", "and"}
 _TOKEN_FIX = {"st": "saint", "utd": "united"}
@@ -1980,19 +1979,19 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # Evidence packs for the AI
 # ═════════════════════════════════════════════════════════════════════════════
-DESK_PROMPT = """You are a sharp sportsbook quant. Build ONE accumulator ticket from the CANDIDATES below.
+DESK_PROMPT = """You are a sharp sportsbook trader. Build ONE accumulator ticket from the CANDIDATES below.
 KEY: dq=data quality; xG home-away; mdl=model 1X2%; mkt=bookmaker 1/X/2; ppg/gf/ga=form; TRAP=risk score. LEGS: id@odds/p=blended%/m=market% (~=borderline, ^=estimated).
 RULES: 
-1) Use ONLY leg ids shown (e.g., "m1.12", "m2.X"). 
-2) Select 5 legs from 5 DIFFERENT matches. 
-3) Diversify: MAX ONE '12' (Either team to win) leg per ticket. Prefer 1X, X2, BTTS, or Over/Under.
-4) Aim for product of odds >= 3.0 (3.50 is ideal, but 3.0 is acceptable). 
+1) Use ONLY leg ids shown. 
+2) Select 3 to 5 legs from DIFFERENT matches. (If you can only find 3-4 strong legs, output them, Python will fill the rest).
+3) DIVERSITY IS MANDATORY: MAX ONE '12' (Either team to win) leg per ticket. MAX TWO legs of ANY single market type (e.g., max two Over/Under legs).
+4) Aim for product of odds >= 3.0. 
 5) Maximise joint probability: prefer p>=70%. 
 6) For each leg, state the losing scenario in <=6 words.
-OUTPUT: ONE valid JSON object only, no markdown, no other text:
-{"tickets":[{"legs":[{"id":"m1.12","why":"Home form strong","fail":"Away scores early"}],"logic":"<=20 words","risk":"LOW|MED"}]}"""
+OUTPUT: ONE valid JSON object only, no markdown, no other text. Start with { and end with }.
+{"tickets":[{"legs":[{"id":"m1.1X","why":"<=8 words","fail":"<=6 words"}],"logic":"<=20 words","risk":"LOW|MED"}]}"""
 
-BRIEF_ADDENDUM = "\nIMPORTANT: Output ONLY the JSON object. No markdown, no explanations. Ensure 'id' matches exactly the leg ids provided (e.g., 'm1.12')."
+BRIEF_ADDENDUM = "\nIMPORTANT: Output ONLY the JSON object. No markdown, no explanations. Ensure 'id' matches exactly the leg ids provided."
 
 DESK_ROLES = ["This is Ticket 1: the SAFEST possible ticket.",
               "This is Ticket 2: BALANCED - strong probability plus some positive edge.",
@@ -2011,7 +2010,7 @@ OUTPUT: ONE valid JSON object only.
 
 def desk_prompt(ti, n_tickets, reuse, relaxed=False):
     return (DESK_PROMPT.replace("@WHAT@", f"ticket {ti + 1} of {n_tickets}: one 5-leg accumulator")
-            .replace("@STRUCT@", "Exactly 1 ticket of 5 legs from 5 different matches." + (" Earlier tickets are listed below; avoid their legs and matches wherever possible." if reuse and ti > 0 else ""))
+            .replace("@STRUCT@", "Exactly 1 ticket of 3 to 5 legs from different matches." + (" Earlier tickets are listed below; avoid their legs and matches wherever possible." if reuse and ti > 0 else ""))
             .replace("@ROLE@", DESK_ROLES[min(ti, 2)])
             .replace("@RELAXED@", "\n- The slate is thin so some safety thresholds were relaxed: be stricter yourself, prefer the best available legs, mark risk MED where honest." if relaxed else ""))
 
@@ -2279,9 +2278,10 @@ def call_groq_budgeted(system_prompt, user_prompt, budget, cpt, effort=None, gov
     
     def is_valid_tickets(p):
         if not isinstance(p, dict): return False
-        if "ticket" in p and isinstance(p["ticket"], dict) and isinstance(p["ticket"].get("legs"), list) and len(p["ticket"]["legs"]) >= 4:
+        # ACCEPT 3 to 5 legs. If AI finds only 3-4 strong legs, we accept it and let Python fill the rest.
+        if "ticket" in p and isinstance(p["ticket"], dict) and isinstance(p["ticket"].get("legs"), list) and 3 <= len(p["ticket"]["legs"]) <= 5:
             return True
-        if "tickets" in p and isinstance(p["tickets"], list) and len(p["tickets"]) > 0 and isinstance(p["tickets"][0], dict) and isinstance(p["tickets"][0].get("legs"), list) and len(p["tickets"][0]["legs"]) >= 4:
+        if "tickets" in p and isinstance(p["tickets"], list) and len(p["tickets"]) > 0 and isinstance(p["tickets"][0], dict) and isinstance(p["tickets"][0].get("legs"), list) and 3 <= len(p["tickets"][0]["legs"]) <= 5:
             return True
         return False
 
@@ -2440,16 +2440,19 @@ def optimize_tickets(match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, min_o
         fam = defaultdict(int)
         for l in legs: fam[l["fam"]] += 1
         
-        # HEAVY penalty for lack of diversification (e.g., five "12" legs)
-        div = -0.06 * sum(max(0, c - 1) * 2.0 for c in fam.values()) 
-        div -= 0.05 * sum(1 for l in legs if l.get("tier") == "B")
+        # MASSIVE penalty for lack of diversification to prevent "12" spam
+        div = 0.0
+        for c in fam.values():
+            if c > 2:
+                div -= (c - 2) * 10.0
         
-        # Specific heavy penalty for multiple "12" (Either team to win) legs
         count_12 = sum(1 for l in legs if l["key"] == "12")
         if count_12 > 1:
-            div -= (count_12 - 1) * 2.0
+            div -= (count_12 - 1) * 20.0  # Extreme penalty for multiple 12s
             
-        return lp - 40 * max(0.0, math.log(min_odds) - lo) + div
+        div -= 0.05 * sum(1 for l in legs if l.get("tier") == "B")
+        
+        return lp - 50 * max(0.0, math.log(min_odds) - lo) + div
     def total(): return sum(tscore(t) for t in tickets)
     best = total()
     for _ in range(iters):
@@ -2541,7 +2544,6 @@ def finish_ticket(t, per=LEGS_PER_TICKET):
     return t
 
 def parse_ai_tickets(ai, leg_index, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, distinct=True):
-    # Handle both "tickets" (list) and "ticket" (single dict)
     raw = (ai or {}).get("tickets")
     if not raw:
         single = (ai or {}).get("ticket")
@@ -2558,10 +2560,7 @@ def parse_ai_tickets(ai, leg_index, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, di
             d = it if isinstance(it, dict) else {"id": str(it)}
             raw_id = str(d.get("id") or "").strip().lower()
             
-            # Exact match first
             lg = leg_index.get(raw_id)
-            
-            # Fuzzy match fallback if exact ID fails (e.g., AI outputs "m1.1x" instead of "m1.1X")
             if not lg:
                 parts = raw_id.split(".")
                 if len(parts) == 2:
@@ -2662,17 +2661,43 @@ def complete_tickets(tickets, match_legs, per=LEGS_PER_TICKET, distinct=True):
                 cur_m = {x["mid"] for x in legs}
                 avail = [c for c in pool_ if c["mid"] not in taken_other and c["mid"] not in cur_m]
                 if not avail: break
+                
+                # STRICT DIVERSITY CHECK before adding a leg
+                fam = defaultdict(int)
+                for l in legs: fam[l["fam"]] += 1
+                count_12 = sum(1 for l in legs if l["key"] == "12")
+                
+                safe_avail = []
+                for c in avail:
+                    test_fam = defaultdict(int, fam)
+                    test_fam[c["fam"]] += 1
+                    test_count_12 = count_12 + (1 if c["key"] == "12" else 0)
+                    
+                    if test_count_12 <= 1 and max(test_fam.values()) <= 2:
+                        safe_avail.append(c)
+                
+                if not safe_avail:
+                    break # No safe diverse legs available
+                    
                 cur, need = max(_tprod(legs), 1.0), per - len(legs)
                 target = (MIN_TICKET_ODDS * 1.03 / cur) ** (1 / need) if cur < MIN_TICKET_ODDS * 1.03 else 1.15
-                c = max(avail, key=lambda x: x["rank"] - 0.4 * max(0.0, math.log(x["odds"] / (target * 1.15))))
+                c = max(safe_avail, key=lambda x: x["rank"] - 0.4 * max(0.0, math.log(x["odds"] / (target * 1.15))))
                 legs.append(dict(c, why="Python fill-in (AI leg missing/invalid/duplicate)", fail="", vs="", by="PY"))
+            
             legs, up = enforce_min_odds(legs, match_legs, taken_other)
             t["legs"] = legs
             t["repaired"] = bool(t.get("repaired") or up)
         
         finish_ticket(t, per)
-        if t["valid"] and t["odds"] >= MIN_TICKET_ODDS:
+        
+        # FINAL DIVERSITY CHECK: If the ticket still has >1 "12" legs or >2 of any market type, REJECT IT.
+        fam = defaultdict(int)
+        for l in t["legs"]: fam[l["fam"]] += 1
+        count_12 = sum(1 for l in t["legs"] if l["key"] == "12")
+        
+        if count_12 <= 1 and max(fam.values()) <= 2 and t["valid"] and t["odds"] >= MIN_TICKET_ODDS:
             valid_tickets.append(t)
+            
     return valid_tickets
 
 def finalize_tickets(ai, leg_index, match_legs, n_tickets=N_TICKETS, per=LEGS_PER_TICKET, distinct=True):
@@ -2709,7 +2734,7 @@ def build_nobet_message(res, tz):
     reasons = defaultdict(int)
     for e in res.get("excluded", []): reasons[e["reason"]] += 1
     lines = "\n".join(f"• {_esc(k)}: {v}" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])[:6])
-    return (f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])}\n🛑 <b>NO BET TODAY</b>\n{_esc(res.get('reason', 'No valid AI tickets found meeting the 3.0 odds requirement.'))}"
+    return (f"⚽ <b>Der-AI Football Quant Desk</b>\n📅 {_esc(res['date'])}\n🛑 <b>NO BET TODAY</b>\n{_esc(res.get('reason', 'No valid diverse tickets found meeting the 3.0 odds requirement.'))}"
             + (f"\n<b>Why matches were excluded</b>\n{lines}" if lines else "")
             + f"\nAPI calls used: {res.get('api_calls', 0)}. AI analysis requires strict adherence to value and odds thresholds. No Python fallback is used to ensure quality.")
 
@@ -2924,7 +2949,7 @@ def run_full_analysis(cfg, log, progress):
     
     if stage["ai_failed"] or not stage["tickets"]:
         return result(no_bet=True, cfg=cfg, relaxed=relaxed,
-                      reason="AI analysis failed to find a valid 5-leg accumulator meeting the 3.0 odds requirement. No Python fallback is used to ensure quality.",
+                      reason="AI analysis failed to find a valid diverse 3-5 leg accumulator meeting the 3.0 odds requirement. No Python fallback is used to ensure quality.",
                       ai_failed=True, ai_note=stage.get("ai_note", ""), passes=stage.get("passes", []), user_prompt=stage.get("user_prompt", ""))
 
     res = result(tickets=stage["tickets"], ai=stage["ai"], model=stage["model"], info=stage["info"], tokens=stage["tokens"], n_ai=len(stage["sel"]),
@@ -3037,8 +3062,8 @@ def run_ai_stage(elig, n_t, cfg, log, progress=lambda x: None):
             if stop_ai: ai_tickets.append({}); continue
             avail = ([m for m in ordered if labels[id(m)] not in used_labels] if distinct
                      else sorted(ordered, key=lambda m: labels[id(m)] in used_labels))
-            if len(avail) < LEGS_PER_TICKET:
-                warnings.append(f"Ticket {ti + 1}: fewer than {LEGS_PER_TICKET} unused matches were left, so the AI could not build it; it was completed/verified by Python.")
+            if len(avail) < 3:
+                warnings.append(f"Ticket {ti + 1}: fewer than 3 unused matches were left, so the AI could not build it.")
                 ai_tickets.append({}); continue
             
             extra = ""
