@@ -6,9 +6,11 @@
 #      (disk cache, call-time budget guard, no probing when the answer is already known).
 #   2. FREE SOURCES (zero API-Football calls) are used FIRST for what they cover and as a FALLBACK
 #      for whatever API-Football cannot provide:
-#        - football-data.co.uk : results, corners, shots, bookmaker 1X2 + O/U2.5 prices, H2H, table
-#        - ClubElo            : team strength (independent 1X2 opinion for European clubs)
-#        - ESPN public JSON   : fixtures + bookmaker prices (best effort)
+#        - football-data.co.uk : results, corners, shots, bookmaker prices, H2H, table
+#        - TheSportsDB         : broad daily fixtures + recent team results (best effort)
+#        - ESPN public JSON    : fixtures + bookmaker prices (best effort)
+#        - ClubElo             : team strength (independent 1X2 opinion for European clubs)
+#        - The Odds API        : optional live bookmaker prices when ODDS_API_KEY is configured
 #      If API-Football is unreachable / out of quota the app still analyses from free sources only.
 #   3. PYTHON runs a Monte Carlo per match and blends it with de-vigged bookmaker prices.
 #   4. PYTHON builds a WIDE leg menu (safe legs + clearly-labelled borderline legs) - the AI decides.
@@ -475,9 +477,11 @@ def parse_standings(resp):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# FREE data sources (football-data.co.uk, ClubElo, ESPN)
+# FREE data sources (football-data.co.uk, TheSportsDB, ClubElo, ESPN; optional odds API)
 # ═════════════════════════════════════════════════════════════════════════════
 FD_BASE = "https://www.football-data.co.uk"
+TSDB_BASE = "https://www.thesportsdb.com/api/v1/json"
+ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 FD_MAIN = {39: "E0", 40: "E1", 41: "E2", 42: "E3", 140: "SP1", 141: "SP2", 135: "I1", 136: "I2", 78: "D1", 79: "D2",
            61: "F1", 62: "F2", 88: "N1", 94: "P1", 144: "B1", 203: "T1", 197: "G1", 179: "SC0", 180: "SC1"}
 FD_NEW = {128: "ARG", 71: "BRA", 262: "MEX", 253: "USA", 98: "JPN", 169: "CHN", 357: "IRL", 103: "NOR", 113: "SWE",
@@ -488,8 +492,18 @@ ESPN_SLUG = {39: "eng.1", 40: "eng.2", 41: "eng.3", 42: "eng.4", 140: "esp.1", 1
              78: "ger.1", 79: "ger.2", 61: "fra.1", 62: "fra.2", 88: "ned.1", 94: "por.1", 144: "bel.1", 203: "tur.1",
              179: "sco.1", 2: "uefa.champions", 3: "uefa.europa", 848: "uefa.europa.conf", 253: "usa.1", 262: "mex.1",
              71: "bra.1", 5: "uefa.nations", 10: "fifa.friendly", 128: "arg.1", 98: "jpn.1", 218: "aut.1", 207: "sui.1", 119: "den.1", 103: "nor.1",
-             113: "swe.1", 197: "gre.1", 235: "rus.1", 169: "chn.1"}
+             113: "swe.1", 197: "gre.1", 235: "rus.1", 169: "chn.1", 45: "eng.fa", 143: "esp.copa_del_rey",
+             137: "ita.coppa_italia", 81: "ger.dfb_pokal", 13: "conmebol.libertadores"}
 ESPN_SLUG_TO_LID = {v: k for k, v in ESPN_SLUG.items()}
+ODDS_API_SPORT_BY_LID = {
+    39: "soccer_epl", 40: "soccer_efl_champ", 140: "soccer_spain_la_liga",
+    141: "soccer_spain_segunda_division", 135: "soccer_italy_serie_a", 136: "soccer_italy_serie_b",
+    78: "soccer_germany_bundesliga", 79: "soccer_germany_bundesliga2", 61: "soccer_france_ligue_one",
+    62: "soccer_france_ligue_two", 88: "soccer_netherlands_eredivisie", 94: "soccer_portugal_primeira_liga",
+    2: "soccer_uefa_champs_league", 3: "soccer_uefa_europa_league", 253: "soccer_usa_mls",
+    45: "soccer_fa_cup", 143: "soccer_spain_copa_del_rey", 137: "soccer_italy_coppa_italia",
+    81: "soccer_germany_dfb_pokal", 13: "soccer_conmebol_copa_libertadores",
+}
 LEAGUE_INFO = {5: ("UEFA Nations League", "World"), 10: ("Friendlies", "World"), 39: ("Premier League", "England"), 40: ("Championship", "England"), 41: ("League One", "England"),
                42: ("League Two", "England"), 140: ("La Liga", "Spain"), 141: ("Segunda Division", "Spain"),
                135: ("Serie A", "Italy"), 136: ("Serie B", "Italy"), 78: ("Bundesliga", "Germany"),
@@ -502,6 +516,8 @@ LEAGUE_INFO = {5: ("UEFA Nations League", "World"), 10: ("Friendlies", "World"),
                218: ("Bundesliga", "Austria"), 207: ("Super League", "Switzerland"), 119: ("Superliga", "Denmark"),
                103: ("Eliteserien", "Norway"), 113: ("Allsvenskan", "Sweden"),
                235: ("Premier League", "Russia"), 169: ("Super League", "China"), 357: ("Premier Division", "Ireland"),
+               45: ("FA Cup", "England"), 143: ("Copa del Rey", "Spain"), 137: ("Coppa Italia", "Italy"),
+               81: ("DFB Pokal", "Germany"), 13: ("Copa Libertadores", "South America"),
                244: ("Veikkausliiga", "Finland"), 106: ("Ekstraklasa", "Poland"), 283: ("Liga I", "Romania")}
 ELO_COUNTRIES = {"england", "spain", "italy", "germany", "france", "netherlands", "portugal", "belgium", "turkey", "scotland",
                  "greece", "switzerland", "austria", "denmark", "norway", "sweden", "poland", "czech-republic", "croatia",
@@ -510,6 +526,7 @@ ELO_COUNTRIES = {"england", "spain", "italy", "germany", "france", "netherlands"
 ELO_LEAGUE_IDS = {2, 3, 848}
 INTL_URL = "https://raw.githubusercontent.com/martj42/international_results/master/results.csv"
 FREE_TTL_S = 6 * 3600
+TSDB_HISTORY_DAYS = 28
 FREE_UA = {"User-Agent": "Mozilla/5.0 (compatible; DerAI-FootballDesk/3.0)"}
 _STOP = {"fc", "cf", "afc", "sc", "ac", "as", "ss", "ssc", "fk", "sk", "bk", "if", "fsv", "vfb", "vfl", "sv", "cd", "ud", "sd",
          "ca", "club", "de", "the", "calcio", "and"}
@@ -710,12 +727,18 @@ class FreeData:
         self.session.headers.update(FREE_UA)
         self.lock = threading.RLock()
         self.mem: Dict[str, Optional[str]] = {}
+        self.force_refresh = False
+        self.refreshed = set()
         self.used = defaultdict(int)
         self.saved_calls = 0
         self.fails: List[str] = []
+        self.odds_fails: List[str] = []
+        self.odds_requests = 0
+        self.odds_remaining = None
         self._rows: Dict[Any, list] = {}
         self._fix_main: Optional[list] = None
         self._espn: Dict[Any, list] = {}
+        self._tsdb_history: Optional[list] = None
         self._elo: Optional[list] = None
         self._intl: Optional[list] = None
         self._intl_names_c: Optional[list] = None
@@ -731,12 +754,12 @@ class FreeData:
         if not self.enabled:
             return None
         with self.lock:
-            if url in self.mem:
+            if url in self.mem and (not self.force_refresh or url in self.refreshed):
                 return self.mem[url]
         path = os.path.join(self.cache_dir, "free_" + hashlib.md5(url.encode()).hexdigest() + ".txt")
         txt = None
         try:
-            if os.path.exists(path) and time.time() - os.path.getmtime(path) < ttl:
+            if not self.force_refresh and os.path.exists(path) and time.time() - os.path.getmtime(path) < ttl:
                 with open(path, "r", encoding="utf-8") as fh:
                     txt = fh.read()
         except Exception:
@@ -765,6 +788,8 @@ class FreeData:
                 self.fails.append(f"{url.split('//')[-1][:60]}: {err or 'empty'}")
         with self.lock:
             self.mem[url] = txt
+            if self.force_refresh and txt:
+                self.refreshed.add(url)
         return txt
 
     def _main_rows(self, code, season):
@@ -1081,6 +1106,164 @@ class FreeData:
             self._espn[key] = out
         return out
 
+    def tsdb_events(self, date_str):
+        try:
+            age = (datetime.now(timezone.utc).date() - datetime.strptime(date_str, "%Y-%m-%d").date()).days
+        except ValueError:
+            age = 0
+        ttl = 12 * 3600 if age > 1 else 900
+        txt = self._get(f"{TSDB_BASE}/123/eventsday.php?d={date_str}&s=Soccer", ttl=ttl, timeout=20)
+        try:
+            data = json.loads(txt) if txt else {}
+            events = data.get("events") if isinstance(data, dict) else None
+            return [event for event in events or [] if isinstance(event, dict)]
+        except (json.JSONDecodeError, TypeError) as e:
+            self.fails.append(f"TheSportsDB parse {date_str}: {str(e)[:50]}")
+            return []
+
+    @staticmethod
+    def _tsdb_timestamp(event):
+        if not isinstance(event, dict):
+            return None
+        value = event.get("strTimestamp")
+        if not value:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            return None
+
+    def tsdb_history(self, date_str, days=TSDB_HISTORY_DAYS):
+        with self.lock:
+            if self._tsdb_history is not None:
+                return self._tsdb_history
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+        dates = [(target - timedelta(days=n)).isoformat() for n in range(1, days + 1)]
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            batches = list(ex.map(self.tsdb_events, dates))
+        rows = []
+        for events in batches:
+            for event in events:
+                ts = self._tsdb_timestamp(event)
+                hg, ag = _int_or_none(event.get("intHomeScore")), _int_or_none(event.get("intAwayScore"))
+                status = str(event.get("strStatus") or "").strip().lower()
+                if (not ts or ts >= int(datetime.combine(target, datetime.min.time(), timezone.utc).timestamp())
+                        or hg is None or ag is None or status not in {"ft", "aet", "pen", "finished", "match finished"}):
+                    continue
+                rows.append({"ts": ts, "home": str(event.get("strHomeTeam") or "").strip(),
+                             "away": str(event.get("strAwayTeam") or "").strip(), "hg": hg, "ag": ag,
+                             "home_id": str(event.get("idHomeTeam") or ""),
+                             "away_id": str(event.get("idAwayTeam") or ""),
+                             "league": str(event.get("strLeague") or "")})
+        rows.sort(key=lambda row: row["ts"], reverse=True)
+        with self.lock:
+            self._tsdb_history = rows
+        return rows
+
+    def tsdb_team_form(self, name, team_id, date_str, n=10):
+        rows = self.tsdb_history(date_str)
+        if team_id:
+            games = [r for r in rows if team_id in (r["home_id"], r["away_id"])]
+        else:
+            names = sorted({r["home"] for r in rows} | {r["away"] for r in rows})
+            matched = best_match(name, names)
+            if not matched:
+                return None
+            games = [r for r in rows if matched in (r["home"], r["away"])]
+        games = games[:n]
+        if len(games) < 3:
+            return None
+        results = []
+        for i, row in enumerate(games):
+            is_home = team_id == row["home_id"] if team_id else row["home"] == matched
+            gf, ga = (row["hg"], row["ag"]) if is_home else (row["ag"], row["hg"])
+            played = datetime.fromtimestamp(row["ts"], timezone.utc).date()
+            results.append({"id": f"tsdb:{row['ts']}:{i}", "ts": row["ts"], "home": is_home, "gf": gf, "ga": ga,
+                            "res": "W" if gf > ga else "D" if gf == ga else "L",
+                            "opp": row["away"] if is_home else row["home"], "league_id": -1})
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+        latest = datetime.fromtimestamp(games[0]["ts"], timezone.utc).date()
+        hs = {"cor_for": None, "cor_against": None, "cor_n": 0, "sot": None,
+              "xg_for": None, "xg_against": None, "players": {}}
+        return {"results": results, "hs": hs, "name": name, "stale_days": (target - latest).days, "tsdb": True}
+
+    def fetch_odds_api(self, fixtures):
+        key = get_secret("ODDS_API_KEY", "").strip()
+        if not key or not fixtures:
+            return {}
+        leagues = defaultdict(list)
+        for fixture in fixtures:
+            sport = ODDS_API_SPORT_BY_LID.get(fixture["league_id"])
+            if sport:
+                leagues[sport].append(fixture)
+        if not leagues:
+            return {}
+        output = {}
+        for sport, candidates in leagues.items():
+            try:
+                response = self.session.get(
+                    f"{ODDS_API_BASE}/sports/{sport}/odds/",
+                    params={"apiKey": key, "regions": "uk,eu", "markets": "h2h,totals",
+                            "oddsFormat": "decimal", "dateFormat": "iso"},
+                    timeout=20)
+                self.odds_requests += 1
+                remaining = response.headers.get("x-requests-remaining")
+                if remaining and remaining.isdigit():
+                    self.odds_remaining = int(remaining)
+                if response.status_code != 200:
+                    self.odds_fails.append(f"{sport}: HTTP {response.status_code}")
+                    continue
+                events = response.json()
+            except (requests.RequestException, ValueError) as e:
+                self.odds_fails.append(f"{sport}: {type(e).__name__}")
+                continue
+            for event in events if isinstance(events, list) else []:
+                if not isinstance(event, dict):
+                    continue
+                home_names = [c["home"] for c in candidates]
+                away_names = [c["away"] for c in candidates]
+                home = best_match(event.get("home_team"), home_names, 0.82)
+                away = best_match(event.get("away_team"), away_names, 0.82)
+                fixture = next((c for c in candidates if c["home"] == home and c["away"] == away), None)
+                if not fixture:
+                    continue
+                collected = defaultdict(list)
+                for bookmaker in event.get("bookmakers") or []:
+                    if not isinstance(bookmaker, dict):
+                        continue
+                    for market in bookmaker.get("markets") or []:
+                        if not isinstance(market, dict):
+                            continue
+                        for outcome in market.get("outcomes") or []:
+                            if not isinstance(outcome, dict):
+                                continue
+                            price = _f(outcome.get("price"))
+                            if not price or price <= 1.0:
+                                continue
+                            label = str(outcome.get("name") or "").strip().lower()
+                            if market.get("key") == "h2h":
+                                key_by_name = {"draw": "X", str(event.get("home_team", "")).lower(): "1",
+                                               str(event.get("away_team", "")).lower(): "2"}
+                                key = key_by_name.get(label)
+                            elif market.get("key") == "totals":
+                                line = _f(outcome.get("point"))
+                                key = (("O" if label == "over" else "U") + f"{line:g}"
+                                       if label in ("over", "under") and line in GOAL_LINES else None)
+                            else:
+                                key = None
+                            if key:
+                                collected[key].append(price)
+                if collected:
+                    output[(fixture["league_id"], norm_team(fixture["home"]), norm_team(fixture["away"]))] = {
+                        market: {"odds": float(np.median(prices)), "median": float(np.median(prices)),
+                                 "best": max(prices), "low": min(prices), "n": len(prices)}
+                        for market, prices in collected.items()
+                    }
+        return output
+
     def odds_for(self, home, away, league_id, date_str):
         if not self.enabled:
             return {}, None
@@ -1199,10 +1382,54 @@ class FreeData:
                         dup["odds"] = dict(r["odds"])
                     continue
                 out.append({"league_id": lid, "home": r["home"], "away": r["away"], "ts": ts, "odds": dict(r["odds"]), "src": "football-data"})
+        now = int(time.time())
+        for ds in (date_str, prev):
+            for event in self.tsdb_events(ds):
+                ts = self._tsdb_timestamp(event)
+                home, away = str(event.get("strHomeTeam") or "").strip(), str(event.get("strAwayTeam") or "").strip()
+                if (not ts or ts <= now or not home or not away
+                        or datetime.fromtimestamp(ts, zi).date() != tgt):
+                    continue
+                duplicate = next((item for item in out
+                                 if abs(item["ts"] - ts) <= 3 * 3600
+                                 and _sim(norm_team(item["home"]), norm_team(home)) >= 0.9
+                                 and _sim(norm_team(item["away"]), norm_team(away)) >= 0.9), None)
+                if duplicate:
+                    duplicate["tsdb_home_id"] = str(event.get("idHomeTeam") or "")
+                    duplicate["tsdb_away_id"] = str(event.get("idAwayTeam") or "")
+                    if "thesportsdb" not in duplicate["src"]:
+                        duplicate["src"] += "+thesportsdb"
+                    continue
+                league = str(event.get("strLeague") or "Unknown competition").strip()
+                country = str(event.get("strCountry") or "").strip()
+                if re.search(r"\b(uefa|fifa|international|nations league|world cup|friendly)\b", league, re.I):
+                    country = "World"
+                league_id = next((lid for lid, (known_name, known_country) in LEAGUE_INFO.items()
+                                  if norm_team(known_name) == norm_team(league)
+                                  and (not known_country or known_country.lower() == country.lower())), None)
+                league_key = " ".join(re.sub(r"[^a-z0-9]+", " ", league.lower()).split())
+                league_aliases = {
+                    "english premier league": 39, "spanish la liga": 140, "spanish segunda division": 141,
+                    "italian serie a": 135, "italian serie b": 136, "german bundesliga": 78,
+                    "german 2 bundesliga": 79, "french ligue 1": 61, "french ligue 2": 62,
+                    "dutch eredivisie": 88, "portuguese primeira liga": 94,
+                    "uefa champions league": 2, "uefa europa league": 3,
+                    "english fa cup": 45, "spanish copa del rey": 143, "coppa italia": 137,
+                    "german cup": 81, "conmebol libertadores": 13,
+                    "american major league soccer": 253, "major league soccer": 253,
+                }
+                league_id = league_id or league_aliases.get(league_key)
+                out.append({"league_id": league_id or -abs(_int_or_none(event.get("idLeague")) or _syn_id(league)),
+                            "league": league, "country": country,
+                            "home": home, "away": away, "ts": ts, "odds": {}, "src": "thesportsdb",
+                            "tsdb_home_id": str(event.get("idHomeTeam") or ""),
+                            "tsdb_away_id": str(event.get("idAwayTeam") or "")})
         return out
 
     def summary(self):
-        return {"used": dict(self.used), "saved_calls": self.saved_calls, "fails": self.fails[:6]}
+        return {"used": dict(self.used), "saved_calls": self.saved_calls,
+                "fails": self.fails[:6] + self.odds_fails[:6], "odds_requests": self.odds_requests,
+                "odds_remaining": self.odds_remaining}
 
 
 def derive_dc_odds(odds):
@@ -1846,46 +2073,86 @@ def make_record(m, c, hs_h, hs_a, inj_h, inj_a, lu_h, lu_a, odds, odds_src, st_h
 def collect_free_only(api, free, cfg, log, progress, out):
     date_str, tz = cfg["date"], cfg["tz"]
     free.target_date = date_str
-    log("🆓 Free-only mode: collecting fixtures from ESPN + football-data.co.uk (no API-Football calls)...")
+    free.force_refresh = bool(cfg.get("force"))
+    log("🆓 Free-only mode: collecting fixtures and history from ESPN, football-data.co.uk, and TheSportsDB...")
     fx = free.free_fixtures(date_str, tz)
     out["raw_count"] = len(fx)
     fixtures = []
     for e in fx:
         lid = e["league_id"]
-        name, country = LEAGUE_INFO.get(lid, (f"League {lid}", ""))
+        name, country = (e.get("league"), e.get("country")) if e.get("league") else LEAGUE_INFO.get(lid, (f"League {lid}", ""))
         if cfg["exclude_minor"] and (TEAM_EXCLUDE_RE.search(e["home"]) or TEAM_EXCLUDE_RE.search(e["away"])):
             continue
         fixtures.append({"id": -_syn_id(f"F:{date_str}:{e['home']}:{e['away']}"), "ts": e["ts"], "status": "NS", "league_id": lid,
                          "league": name, "country": country, "season": None, "round": None,
                          "home_id": _syn_id("T:" + e["home"]), "home": e["home"], "away_id": _syn_id("T:" + e["away"]), "away": e["away"],
-                         "cat": league_category(lid, country), "free_odds": e["odds"], "free_src": e["src"]})
+                         "cat": league_category(lid, country), "free_odds": e["odds"], "free_src": e["src"],
+                         "tsdb_home_id": e.get("tsdb_home_id"), "tsdb_away_id": e.get("tsdb_away_id")})
     out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
+    source_counts = defaultdict(int)
+    for fixture in fx:
+        source_counts[fixture["src"]] += 1
+    out["fixture_sources"] = dict(source_counts)
     log(f"   {len(fx)} fixtures found by free sources, {len(fixtures)} eligible {out['cat_counts']}")
     if not fixtures:
         out["reason"] = "No fixtures were found by API-Football or by the free sources for this date. " + ("; ".join(free.fails[:2]) if free.fails else "")
         return out
     cand = shortlist_matches(fixtures, min(len(fixtures), cfg["max_matches"]), cfg["force_leagues"], BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
+    out["eligible_fixtures"], out["shortlisted_fixtures"] = len(fixtures), len(cand)
+    if len(cand) < len(fixtures):
+        out["warnings"].append(f"Only {len(cand)} of {len(fixtures)} discovered eligible fixtures were shortlisted; "
+                               "increase 'Max matches to collect deep data for' to evaluate more.")
     out["warnings"].append("API-Football returned nothing usable, so this analysis used whatever free-source data was available "
-                           "(football-data.co.uk, ESPN, and ClubElo when reachable). "
+                           "(football-data.co.uk, ESPN, TheSportsDB, and ClubElo when reachable). "
                            "Injuries, lineups and API predictions are unavailable - those matches show 'inj n/a' and the AI is told to demand extra margin.")
+    odds_api = free.fetch_odds_api(cand)
+    if get_secret("ODDS_API_KEY", "").strip():
+        log(f"   📊 The Odds API: queried {free.odds_requests} league feeds"
+            + (f"; {free.odds_remaining} requests remaining" if free.odds_remaining is not None else ""))
+    else:
+        log("   ℹ️ Optional live odds enrichment is off (set ODDS_API_KEY to enable The Odds API).")
     with ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(lambda lid: free.rows_for(lid, date_str), {c["league_id"] for c in cand}))
     free.elo_table(date_str)
+    tsdb_history_loaded = False
     for i, m in enumerate(cand):
-        fh, fa = free.team_form(m["home"], m["league_id"], date_str), free.team_form(m["away"], m["league_id"], date_str)
+        fh = free.team_form(m["home"], m["league_id"], date_str)
+        fa = free.team_form(m["away"], m["league_id"], date_str)
+        needs_tsdb = ((not fh or len(fh["results"]) < 4) or (not fa or len(fa["results"]) < 4))
+        if needs_tsdb and not tsdb_history_loaded:
+            free.tsdb_history(date_str)
+            tsdb_history_loaded = True
+        if not fh or len(fh["results"]) < 4:
+            tsdb_form = free.tsdb_team_form(m["home"], m.get("tsdb_home_id"), date_str)
+            if tsdb_form:
+                fh = tsdb_form
+        if not fa or len(fa["results"]) < 4:
+            tsdb_form = free.tsdb_team_form(m["away"], m.get("tsdb_away_id"), date_str)
+            if tsdb_form:
+                fa = tsdb_form
         if not fh or not fa or len(fh["results"]) < 4 or len(fa["results"]) < 4:
             out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no free-source team history"})
             continue
-        odds, osrc = dict(m.get("free_odds") or {}), m.get("free_src")
+        odds = dict(m.get("free_odds") or {})
+        odds_sources = [m["free_src"]] if odds and m.get("free_src") else []
+        api_odds = odds_api.get((m["league_id"], norm_team(m["home"]), norm_team(m["away"])), {})
+        for market, quote in api_odds.items():
+            odds.setdefault(market, quote)
+        if api_odds:
+            odds_sources.append("the-odds-api")
         if not odds.get("O2.5"):
             o2, s2 = free.odds_for(m["home"], m["away"], m["league_id"], date_str)
             if o2 and (not odds or o2.get("O2.5")):
-                odds, osrc = o2, s2
+                for market, quote in o2.items():
+                    odds.setdefault(market, quote)
+                odds_sources.append(s2)
         if not odds:
             out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no bookmaker odds from any source"})
             continue
+        osrc = "+".join(dict.fromkeys(source for source in odds_sources if source)) or "unknown"
         c = {"pred": None, "rh": fh["results"], "ra": fa["results"], "h2h": free.h2h(m["home"], m["away"], m["league_id"], date_str),
-             "elo": free.elo_for(m["home"], m["away"], m["league_id"], m["country"], date_str), "free_tags": ["form"], "fh": fh, "fa": fa}
+             "elo": free.elo_for(m["home"], m["away"], m["league_id"], m["country"], date_str),
+             "free_tags": ["form"] + (["tsdb-form"] if fh.get("tsdb") or fa.get("tsdb") else []), "fh": fh, "fa": fa}
         if c["h2h"]:
             c["free_tags"].append("h2h")
         if c["elo"]:
@@ -1907,6 +2174,7 @@ def collect_free_only(api, free, cfg, log, progress, out):
 
 def collect_day(api, cfg, log, progress, free=None):
     free = free or FreeData(enabled=False)
+    free.force_refresh = bool(cfg.get("force"))
     out = {"warnings": [], "matches": [], "excluded": [], "raw_count": 0, "cat_counts": {}, "plan": None, "reason": None}
     date_str, tz, force = cfg["date"], cfg["tz"], cfg["force"]
     free.target_date = date_str
@@ -2072,6 +2340,21 @@ def collect_day(api, cfg, log, progress, free=None):
                     n_free += 1
         if n_free:
             log(f"   🆓 {n_free} matches got bookmaker prices from free sources")
+    odds_api = free.fetch_odds_api(cand)
+    for c in cand:
+        extra = odds_api.get((c["league_id"], norm_team(c["home"]), norm_team(c["away"])), {})
+        if not extra:
+            continue
+        odds_by.setdefault(c["id"], {})
+        for market, quote in extra.items():
+            odds_by[c["id"]].setdefault(market, quote)
+        prior_source = odds_src.get(c["id"])
+        odds_src[c["id"]] = (prior_source + "+the-odds-api") if prior_source else "the-odds-api"
+    if free.odds_requests:
+        log(f"   📊 The Odds API: queried {free.odds_requests} league feeds"
+            + (f"; {free.odds_remaining} requests remaining" if free.odds_remaining is not None else ""))
+    elif get_secret("ODDS_API_KEY", "").strip():
+        log("   📊 The Odds API key is set, but no candidate league has supported live-odds coverage.")
     if caps["league_odds"] is not False:
         if not odds_by and caps["league_odds"] is None and can_spend(20):
             for c in cand[1:4]:
@@ -2919,6 +3202,9 @@ def run_full_analysis(cfg, log, progress):
         base = {"date": cfg["date"], "picks": [], "ai_note": "", "model": None, "tokens": 0,
                 "n_analysed": len(matches), "n_ai": 0, "matches": matches, "id_map": {},
                 "api_calls": api.calls, "cache_hits": api.cache_hits, "warnings": data["warnings"],
+                "fixtures_found": data.get("raw_count", 0), "fixture_sources": data.get("fixture_sources", {}),
+                "eligible_fixtures": data.get("eligible_fixtures", data.get("raw_count", 0)),
+                "shortlisted_fixtures": data.get("shortlisted_fixtures", data.get("raw_count", 0)),
                 "cat_counts": data["cat_counts"], "plan": data["plan"], "deep": data.get("deep"),
                 "api_errors": api.error_summary(), "seconds": round(time.time() - t0, 1),
                 "excluded": data["excluded"], "no_bet": False, "reason": "", "caps": data.get("caps"),
@@ -3037,9 +3323,19 @@ def render_results(res, tz):
     if res.get("quota") and res["quota"][0] is not None:
         st.caption(f"📶 API quota left: **{res['quota'][0]}** of {res['quota'][1]} (resets 00:00 UTC)")
     fr = res.get("free") or {}
+    if res.get("fixture_sources"):
+        sources = res.get("fixture_sources") or {}
+        source_text = ", ".join(f"{name}: {count}" for name, count in sorted(sources.items())) or "provider mix unavailable"
+        st.caption(f"📅 Fixture coverage: {res['fixtures_found']} found ({source_text}); "
+                   f"{res.get('eligible_fixtures', res['fixtures_found'])} eligible; "
+                   f"{res.get('shortlisted_fixtures', res['fixtures_found'])} shortlisted; "
+                   f"{res['n_analysed']} had enough data to analyse.")
     if fr.get("used") or fr.get("saved_calls"):
         st.caption("🆓 Free sources: " + " · ".join(f"{k} ×{v}" for k, v in fr.get("used", {}).items())
                    + (f" · ≈{fr['saved_calls']} API calls avoided" if fr.get("saved_calls") else ""))
+    if fr.get("odds_requests"):
+        odds_status = f" · {fr['odds_remaining']} requests remaining" if fr.get("odds_remaining") is not None else ""
+        st.caption(f"📈 The Odds API: {fr['odds_requests']} league requests{odds_status}")
     if res.get("relaxed"):
         st.info("🪜 Thin slate - thresholds relaxed: " + "; ".join(res["relaxed"]))
     if res.get("no_bet"):
@@ -3074,7 +3370,8 @@ def render_results(res, tz):
             p = m["p"]
             rows.append({"Cat": m["cat"], "League": m["league"], "Match": f"{m['home']} v {m['away']}",
                          "KO": datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M"),
-                         "Data": BASIS_TAG.get(m["basis"]), "xG": f"{m['lam_h']:.2f}-{m['lam_a']:.2f}",
+                         "Data": BASIS_TAG.get(m["basis"]), "Odds source": m.get("odds_src", ""),
+                         "xG": f"{m['lam_h']:.2f}-{m['lam_a']:.2f}",
                          "1": _pct(p["1"]), "X": _pct(p["X"]), "2": _pct(p["2"]),
                          "1X": _pct(p["1X"]), "X2": _pct(p["X2"]),
                          "BTTS": _pct(p["BTTS_Y"]), "O1.5": _pct(p["O1.5"]), "O2.5": _pct(p["O2.5"]),
@@ -3107,7 +3404,7 @@ def main():
 
     with tab4:
         st.header("⚙️ Settings")
-        st.info("Secrets needed: `API_FOOTBALL_KEY`, `GROQ_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.")
+        st.info("Secrets: `GROQ_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`; optional `ODDS_API_KEY` adds live odds for supported leagues and uses that provider's quota. `API_FOOTBALL_KEY` is optional.")
         s1, s2 = st.columns(2)
         tz = s1.text_input("Time zone", DEFAULT_TZ)
         max_matches = s1.slider("Max matches to collect deep data for", 10, 60, 30)
