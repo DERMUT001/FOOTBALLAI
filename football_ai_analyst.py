@@ -1108,7 +1108,7 @@ class FreeData:
         with self.lock:
             if self._elo is not None:
                 return self._elo
-        txt = self._get(f"http://api.clubelo.com/{date_str}", ttl=12 * 3600, timeout=20) or self._get(f"https://api.clubelo.com/{date_str}", ttl=12 * 3600, timeout=20)
+        txt = self._get(f"https://api.clubelo.com/{date_str}", ttl=12 * 3600, timeout=20)
         tab = []
         try:
             for r in csv.DictReader(io.StringIO(txt or "")):
@@ -1865,7 +1865,8 @@ def collect_free_only(api, free, cfg, log, progress, out):
         out["reason"] = "No fixtures were found by API-Football or by the free sources for this date. " + ("; ".join(free.fails[:2]) if free.fails else "")
         return out
     cand = shortlist_matches(fixtures, min(len(fixtures), cfg["max_matches"]), cfg["force_leagues"], BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
-    out["warnings"].append("API-Football returned nothing usable, so this analysis was built ONLY from free sources (football-data.co.uk, ESPN, ClubElo). "
+    out["warnings"].append("API-Football returned nothing usable, so this analysis used whatever free-source data was available "
+                           "(football-data.co.uk, ESPN, and ClubElo when reachable). "
                            "Injuries, lineups and API predictions are unavailable - those matches show 'inj n/a' and the AI is told to demand extra margin.")
     with ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(lambda lid: free.rows_for(lid, date_str), {c["league_id"] for c in cand}))
@@ -1913,7 +1914,9 @@ def collect_day(api, cfg, log, progress, free=None):
     stt = api.status()
     out["plan"] = stt
     if api.offline:
-        log("ℹ️ No API-Football key configured - using free sources only.")
+        if stt.get("errors"):
+            out["warnings"].append(f"API-Football unavailable: {stt['errors']}")
+        log("ℹ️ API-Football unavailable - using free sources only.")
         return collect_free_only(api, free, cfg, log, progress, out)
     if stt.get("errors") and not stt.get("plan"):
         out["warnings"].append(f"API status problem: {stt.get('errors')}")
@@ -2504,6 +2507,72 @@ def _extract_picks(parsed):
     return []
 
 
+def _match_parts(value):
+    parts = re.split(r"\s+(?:v|vs\.?|versus)\s+", str(value or "").strip(), maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        return None
+    return norm_team(parts[0]), norm_team(parts[1])
+
+
+def _resolve_match(value, matches):
+    parts = _match_parts(value)
+    if not parts or not all(parts):
+        return None
+    found = [m for m in matches if parts == (norm_team(m.get("home")), norm_team(m.get("away")))]
+    return found[0] if len(found) == 1 else None
+
+
+def _normalize_pick_text(value):
+    text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode().lower()
+    text = text.replace("&", " and ")
+    return " ".join(re.sub(r"[^a-z0-9.]+", " ", text).split())
+
+
+def _resolve_leg(value, match):
+    """Resolve only unambiguous labels/aliases to options already supplied to the AI."""
+    supplied = _normalize_pick_text(value)
+    if not supplied:
+        return None
+    supplied_without_code = re.sub(r"\s+(?:1x|x2|12|(?:o|u)\s*\d+(?:\.\d+)?)$", "", supplied)
+    supplied_forms = {supplied, supplied_without_code}
+    candidates = []
+    for leg in match.get("legs", []):
+        label = leg["label"]
+        aliases = {_normalize_pick_text(label)}
+        for side, team in (("home", match["home"]), ("away", match["away"])):
+            aliases.add(_normalize_pick_text(re.sub(re.escape(team), side, label, flags=re.I)))
+        key = leg["key"]
+        if key == "1":
+            aliases.update(("home win", "home to win", "home team win"))
+        elif key == "2":
+            aliases.update(("away win", "away to win", "away team win"))
+        elif key == "X":
+            aliases.add("draw")
+        elif key == "1X":
+            aliases.update(("home or draw", "home draw", "1x"))
+        elif key == "X2":
+            aliases.update(("draw or away", "draw away", "x2"))
+        elif key == "12":
+            aliases.update(("either team to win", "12"))
+        elif key in ("BTTS_Y", "BTTS_N"):
+            aliases.update(("btts yes" if key == "BTTS_Y" else "btts no",
+                            "both teams to score yes" if key == "BTTS_Y" else "both teams to score no"))
+        else:
+            total = re.fullmatch(r"(H_|A_|HT_|C_)?(O|U)([\d.]+)", key)
+            if total:
+                prefix, direction, line = total.groups()
+                word = "over" if direction == "O" else "under"
+                if prefix is None:
+                    aliases.update((f"{word} {line}", f"{word} {line} goals", f"{direction.lower()}{line}"))
+                elif prefix == "HT_":
+                    aliases.add(f"first half {word} {line} goals")
+                elif prefix == "C_":
+                    aliases.update((f"{word} {line} corners", f"{direction.lower()}{line} corners"))
+        if supplied_forms & aliases:
+            candidates.append(leg)
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _dead_models():
     try:
         d = load_state().get("dead_models") or {}
@@ -2658,26 +2727,30 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     picks, info = call_groq_for_picks(sys_msg, user_msg, budget, cpt, eff, gov, ceiling, log)
     progress(1.0)
     def validate_picks(items):
-        valid, groups = [], defaultdict(int)
-        matches_by_name = {f"{m['home']} v {m['away']}".casefold(): m for m in ai_pool}
+        valid, groups, rejected = [], defaultdict(int), defaultdict(int)
         seen_matches = set()
         for item in items:
             if not isinstance(item, dict):
+                rejected["invalid item"] += 1
                 continue
             mt_ = item.get("match") or item.get("fixture") or item.get("game")
             pk_ = item.get("pick") or item.get("selection") or item.get("bet") or item.get("market")
             if not mt_ or not pk_:
+                rejected["missing match or pick"] += 1
                 continue
-            match = matches_by_name.get(re.sub(r"\s+", " ", str(mt_).strip()).casefold())
+            if isinstance(mt_, dict):
+                mt_ = mt_.get("name") or mt_.get("fixture") or f"{mt_.get('home', '')} v {mt_.get('away', '')}"
+            match = _resolve_match(mt_, ai_pool)
             if not match:
+                rejected["unmatched or ambiguous match"] += 1
                 continue
-            leg = next((option for option in match["legs"]
-                        if re.sub(r"\s+", " ", option["label"].strip()).casefold()
-                        == re.sub(r"\s+", " ", str(pk_).strip()).casefold()), None)
+            leg = _resolve_leg(pk_, match)
             if not leg or (leg["key"] == "12" and min(leg["p"], leg["p_model"], leg["p_mkt"]) < 0.80):
+                rejected["unmatched or unsafe market"] += 1
                 continue
             match_name = f"{match['home']} v {match['away']}"
             if match_name in seen_matches:
+                rejected["duplicate match"] += 1
                 continue
             seen_matches.add(match_name)
             group = _pick_market_group(leg["key"])
@@ -2692,10 +2765,11 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                 "reason": str(item.get("reason", "")),
                 "risk_if_fails": str(item.get("risk_if_fails", "")),
             })
-        return valid, groups
+        return valid, groups, rejected
 
+    failure_note = None
     if picks and isinstance(picks, list):
-        valid_picks, groups = validate_picks(picks)
+        valid_picks, groups, rejected = validate_picks(picks)
         if valid_picks and (len(groups) < min_categories or any(n > max_per_market for n in groups.values())):
             log(f"   ⚖️ AI market mix needs adjustment ({dict(groups)}); requesting a balanced re-selection...")
             correction_system = (sys_msg + f" Select exactly {target} picks across at least {min_categories} market categories, "
@@ -2706,9 +2780,9 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
             revised, revised_info = call_groq_for_picks(correction_system, correction_user, budget, cpt, eff, gov, ceiling, log)
             revised_info["attempts"] = info.get("attempts", []) + revised_info.get("attempts", [])
             if revised and isinstance(revised, list):
-                revised_valid, revised_groups = validate_picks(revised)
+                revised_valid, revised_groups, revised_rejected = validate_picks(revised)
                 if revised_valid:
-                    valid_picks, groups, info = revised_valid, revised_groups, revised_info
+                    valid_picks, groups, rejected, info = revised_valid, revised_groups, revised_rejected, revised_info
             if len(groups) < min_categories or any(n > max_per_market for n in groups.values()):
                 warnings.append("AI did not fully meet the requested market mix after re-selection.")
                 balanced, used = [], defaultdict(int)
@@ -2725,11 +2799,15 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
             return {"picks": valid_picks, "ai_note": f"AI selected {len(valid_picks)} picks ({budget.used} tokens used)",
                     "warnings": warnings, "model": info.get("model"), "passes": info.get("attempts", []), "tokens": budget.used,
                     "n_ai": len(ai_pool)}
-        warnings.append("AI returned data but no valid picks could be extracted.")
+        rejection_detail = "; ".join(f"{reason}: {count}" for reason, count in rejected.items()) or "no rejection detail"
+        warnings.append(f"AI returned {len(picks)} selections, but none mapped to a safe supplied option "
+                        f"({rejection_detail}).")
+        failure_note = f"Could not verify any of the AI's {len(picks)} selections ({rejection_detail})."
     else:
         warnings.append(f"AI analysis failed: {info.get('status', 'unknown error')}. Check AI passes for details.")
     last_ = ((info.get("attempts") or [{}])[-1]).get("status", "")
-    return {"picks": [], "ai_note": f"AI failed: {info.get('status', 'unknown')} - last attempt: {last_}",
+    failure_note = failure_note or f"AI analysis failed: {info.get('status', 'unknown')} - last attempt: {last_}"
+    return {"picks": [], "ai_note": failure_note,
             "warnings": warnings, "model": info.get("model"), "passes": info.get("attempts", []), "tokens": budget.used,
             "n_ai": len(ai_pool)}
 
