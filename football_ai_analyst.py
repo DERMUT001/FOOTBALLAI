@@ -3265,17 +3265,19 @@ def run_full_analysis(cfg, log, progress):
     cur = dict(cfg)
     elig = run_gate(cur)
     relaxed = []
-    if cfg.get("auto_relax", True) and len(elig) < MIN_PICKS:
+    ai_pool_target = min(len(matches), 14, max(MIN_PICKS, int(cfg.get("target_picks", TARGET_PICKS))))
+    if cfg.get("auto_relax", True) and len(elig) < ai_pool_target:
         for label, upd in (("minimum data quality lowered to 0.40", {"min_dq": min(cfg["min_dq"], 0.40)}),
                            ("matches with only borderline legs allowed", {"allow_b_only": True}),
                            ("model-estimated odds allowed", {"allow_est": True})):
-            if len(elig) >= MIN_PICKS:
+            if len(elig) >= ai_pool_target:
                 break
             trial = dict(cur, **upd)
+            if trial == cur:
+                continue
             new = run_gate(trial)
-            if len(new) > len(elig):
-                cur, elig = trial, new
-                relaxed.append(label)
+            cur, elig = trial, new
+            relaxed.append(label)
         elig = run_gate(cur)
     cur["relaxed_notes"] = bool(relaxed)
     cfg = dict(cur, relaxed=relaxed)
@@ -3468,7 +3470,7 @@ def main():
         a1, a2 = st.columns(2)
         tpm = a1.number_input("Groq tokens/minute limit", 4000, 30000, GROQ_TPM_DEFAULT, step=500)
         run_tokens = a2.number_input("Max AI tokens per analysis", 10000, 120000, RUN_TOKEN_CAP_DEFAULT, step=2000)
-        auto_relax = st.checkbox("Auto-relax thresholds when few matches qualify", True)
+        auto_relax = st.checkbox("Auto-relax thresholds when fewer than the target AI pool qualify", True)
         wide_menu = st.checkbox("Include borderline legs for AI to consider", True)
         st.markdown("##### 🆓 Free data sources")
         use_free = st.checkbox("Use free sources first (0 API calls)", True)
