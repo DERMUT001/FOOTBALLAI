@@ -58,11 +58,8 @@ GROQ_PICK_RESPONSE_FORMAT = {
                         "properties": {
                             "match": {"type": "string"},
                             "pick": {"type": "string"},
-                            "confidence": {"type": "string", "enum": ["HIGH", "MED"]},
-                            "reason": {"type": "string"},
-                            "risk_if_fails": {"type": "string"},
                         },
-                        "required": ["match", "pick", "confidence", "reason", "risk_if_fails"],
+                        "required": ["match", "pick"],
                         "additionalProperties": False,
                     },
                 },
@@ -2646,20 +2643,11 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # AI MATCH SELECTION — THE AI IS THE SOLE DECISION-MAKER
 # ═════════════════════════════════════════════════════════════════════════════
-AI_MATCH_PROMPT = """Select exactly {target} distinct matches from the supplied qualified matches, safest first. The Python evidence gate already qualified every match; do not add another gate or return an empty/short list. Compare all listed options and use their exact labels. Never invent matches, options, odds, or evidence.
+AI_MATCH_PROMPT = """Choose {target} picks from the qualified match data below, safest first. Choose a different match for every pick. The Python evidence gate already qualified these matches; do not apply another eligibility filter.
 
-Use recent form, xG, Monte Carlo probabilities (mdl), bookmaker prices (mkt), H2H, trap risk (TRAP), and data quality (dq). Missing bookmaker odds, injuries, or lineups are not reasons by themselves to reject a match. Estimated (est) odds are display estimates, not market evidence; base those picks on team data/model probabilities and require stronger agreement. Prefer TRAP below 45; higher values need clear support. Either-team-win (12) is allowed only at 80%+ with model and genuine bookmaker support.
+For each match, compare all supplied options using the listed probabilities, model results, form, H2H, data quality, and trap score. Prefer stronger evidence and lower trap scores. Missing bookmaker odds, injuries, or lineups alone do not disqualify a match. Treat estimated odds as estimates, not bookmaker evidence. Never invent a match or option. Copy the match name and option label exactly as shown.
 
-Portfolio: at least {min_categories} market categories; at most {max_per_market} picks per category; at most {max_double_chance} double-chance picks when qualified alternatives exist. Categories: double chance, result, goals, team totals, BTTS, first half, corners. Prefer safer evidence over forced variety.
-
-Return only a JSON object with a "picks" array. Each item must contain:
-- "match": exact "Home v Away"
-- "pick": exact supplied option label
-- "confidence": "HIGH" or "MED"
-- "reason": at most 8 words, using supplied evidence only
-- "risk_if_fails": at most 6 words
-
-Do not include odds, probability, or league; Python fills these from the verified option. Do not include markdown or commentary. Example: {"picks":[{"match":"Home v Away","pick":"Home Win","confidence":"MED","reason":"Model and recent form agree","risk_if_fails":"Away scores first"}]}"""
+Return only the required JSON object. Include exactly {target} items in "picks"; each item must contain only "match" and "pick". Do not add explanations, odds, probabilities, league names, markdown, or other keys."""
 
 
 def format_matches_for_ai(matches, tz, max_n=15):
@@ -3037,7 +3025,7 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                 if handle:
                     gov.settle(handle, 0)
                 if "failed_generation" in r.text.lower() or "failed to validate json" in r.text.lower():
-                    log.append({"model": model, "status": f"HTTP_400 strict JSON generation failed; not retrying: {r.text[:100]}"})
+                    log.append({"model": model, "status": f"HTTP_400 strict JSON generation failed; not retrying: {r.text[:500]}"})
                     info["status"] = "JSON_GENERATION_FAILED"
                     return None, info
                 log.append({"model": model, "status": f"HTTP_400 retrying plain: {r.text[:100]}"})
@@ -3158,8 +3146,8 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                 "odds_source": leg["src"],
                 "probability": _pct(leg["p"]),
                 "confidence": "HIGH" if str(item.get("confidence", "MED")).upper() == "HIGH" else "MED",
-                "reason": str(item.get("reason", "")),
-                "risk_if_fails": str(item.get("risk_if_fails", "")),
+                "reason": str(item.get("reason") or "Selected from supplied match evidence"),
+                "risk_if_fails": str(item.get("risk_if_fails") or "Match outcome differs from prediction"),
             })
         return valid, groups, rejected, double_chance
 
