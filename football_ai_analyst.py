@@ -43,7 +43,6 @@ GROQ_MODEL_CONFIG = {
     "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
-GROQ_PICK_RESPONSE_FORMAT = {"type": "json_object"}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
 
 # ── Token policy ────────────────────────────────────────────────────────────
@@ -2618,13 +2617,11 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # AI MATCH SELECTION — THE AI IS THE SOLE DECISION-MAKER
 # ═════════════════════════════════════════════════════════════════════════════
-AI_MATCH_PROMPT = """Choose {target} picks from the qualified match data below, safest first. Choose a different match for every pick. The Python evidence gate already qualified these matches; do not apply another eligibility filter.
+AI_MATCH_PROMPT = """You are selecting football bets using the supplied evidence. Choose exactly {target} options, safest first, with no more than one option per match. The Python evidence gate already qualified these matches; do not apply another eligibility filter.
 
 For each match, compare all supplied options using the listed probabilities, model results, form, H2H, data quality, and trap score. Prefer stronger evidence and lower trap scores. Missing bookmaker odds, injuries, or lineups alone do not disqualify a match. Treat estimated odds as estimates, not bookmaker evidence. Never invent a match or option. Copy the match name and option label exactly as shown.
 
-Return one valid JSON object and nothing else. Use this exact shape:
-{"picks":[{"match":"exact supplied Home v Away","pick":"exact supplied option label"}]}
-Include exactly {target} items. Each item must contain only "match" and "pick". Do not add explanations, odds, probabilities, league names, markdown, or other keys."""
+For each selection output only its match number and option number as MATCH|OPTION. Output exactly {target} lines, one per different match. Example: 2|4 means option 4 from match 2. No JSON, words, bullets, headings, or explanations."""
 
 
 def format_matches_for_ai(matches, tz, max_n=15):
@@ -2636,9 +2633,9 @@ def format_matches_for_ai(matches, tz, max_n=15):
         p = m["p"]
         t = m["trap"]
         opts = []
-        for l in m.get("legs", []):
+        for option_i, l in enumerate(m.get("legs", []), 1):
             group = _pick_market_group(l["key"])
-            opts.append(f"{l['label']}@{l['odds']:.2f}(src:{l['src']},p:{_pct(l['p'])},mdl:{_pct(l['p_model'])},mkt:{_pct(l['p_mkt'])},{group},{l['tier']})")
+            opts.append(f"{option_i}:{l['label']}@{l['odds']:.2f}(src:{l['src']},p:{_pct(l['p'])},mdl:{_pct(l['p_model'])},mkt:{_pct(l['p_mkt'])},{group},{l['tier']})")
         opts_str = " | ".join(opts) if opts else "no clear options"
         o = m["odds"]
         if all(k in o for k in ("1", "X", "2")):
@@ -2657,7 +2654,7 @@ def format_matches_for_ai(matches, tz, max_n=15):
 
         home_recent = ",".join(ph.get("last", [])[:5]) or "n/a"
         away_recent = ",".join(pa.get("last", [])[:5]) or "n/a"
-        block = (f"{i + 1}. {m['league']} | {m['home']} v {m['away']} ({ko}) | dq:{m['dq']}{trap_str}\n"
+        block = (f"MATCH {i + 1}: {m['league']} | {m['home']} v {m['away']} ({ko}) | dq:{m['dq']}{trap_str}\n"
                  f"   xG:{m['lam_h']:.2f}-{m['lam_a']:.2f} | mdl 1:{_pct(m['model_p']['1'])}% X:{_pct(m['model_p']['X'])}% 2:{_pct(m['model_p']['2'])}% | {mkt_str}\n"
                  f"   Home form:{ph.get('form5', '?')} last:{home_recent} PPG5:{ph.get('ppg5', 0):.1f} PPG10:{ph.get('ppg10', 0):.1f} GF:{ph.get('gf_w', 0):.1f} GA:{ph.get('ga_w', 0):.1f}\n"
                  f"   Home rates CS:{rate(ph, 'cs')} FTS:{rate(ph, 'fts')} O1.5:{rate(ph, 'o15')} O2.5:{rate(ph, 'o25')} BTTS:{rate(ph, 'btts')} | "
@@ -2731,64 +2728,14 @@ def _completion_token_reserve(effort, max_completion_tokens):
     return min(int(max_completion_tokens), max(OUTPUT_RESERVE, effort_reserve))
 
 
-def _salvage_json(text):
-    t = text[text.find("["):] if "[" in text else ""
-    if not t:
-        return None
-    stack, in_str, esc, cuts = [], False, False, []
-    for i, ch in enumerate(t):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch in "{[":
-            stack.append("}" if ch == "{" else "]")
-        elif ch in "}]":
-            if stack:
-                stack.pop()
-            cuts.append((i, "".join(reversed(stack))))
-    for i, closers in reversed(cuts[-400:]):
-        cand = re.sub(r",\s*$", "", t[: i + 1]) + closers
-        try:
-            return json.loads(re.sub(r",\s*([}\]])", r"\1", cand))
-        except Exception:
-            continue
-    return None
-
-
-def _parse_json_ex(content):
-    c = re.sub(r"^```(?:json)?\s*", "", content.strip(), flags=re.I)
-    c = re.sub(r"\s*```$", "", c).strip()
-    for cand in (c, c[c.find("["): c.rfind("]") + 1] if "[" in c else ""):
-        if cand:
-            try:
-                return json.loads(re.sub(r",\s*([}\]])", r"\1", cand)), False
-            except Exception:
-                pass
-    return _salvage_json(c), True
-
-
-def _extract_picks(parsed):
-    """Find the list of pick dicts in whatever shape the model returned."""
-    if isinstance(parsed, list):
-        return [x for x in parsed if isinstance(x, dict)]
-    if isinstance(parsed, dict):
-        for k in ("picks", "selections", "top_picks", "predictions", "recommendations", "results", "bets"):
-            v = parsed.get(k)
-            if isinstance(v, list):
-                return [x for x in v if isinstance(x, dict)]
-        for v in parsed.values():
-            if isinstance(v, list) and v and all(isinstance(x, dict) for x in v):
-                return v
-        if ("match" in parsed or "fixture" in parsed) and ("pick" in parsed or "selection" in parsed or "bet" in parsed):
-            return [parsed]
-    return []
+def _parse_pick_indices(content):
+    """Parse model selections in the compact MATCH|OPTION line format."""
+    picks = []
+    for line in content.splitlines():
+        match = re.fullmatch(r"\s*(?:[-*]\s*)?(?:\d+[.)]\s*)?(\d+)\s*\|\s*(\d+)\s*", line)
+        if match:
+            picks.append({"match_index": int(match.group(1)), "option_index": int(match.group(2))})
+    return picks
 
 
 def _match_parts(value):
@@ -2915,7 +2862,6 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
         upper = cfg["max_completion_tokens"]
         completion_reserve = _completion_token_reserve(eff, upper)
         p_est = est_tokens(system_prompt + user_prompt, cpt) + 40
-        response_format = True
         rate_limit_retries = 0
         for attempt in range(5):
             limit = min(ceiling, gov.limit) if gov else ceiling
@@ -2932,8 +2878,6 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
             payload = {"model": model, "temperature": 0.6,
                        "max_completion_tokens": int(cap),
                        "messages": [{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}]}
-            if response_format:
-                payload["response_format"] = GROQ_PICK_RESPONSE_FORMAT
             if cfg.get("supports_reasoning_effort") and eff:
                 payload["reasoning_effort"] = eff if model.startswith("openai/") or eff == "none" else "none"
                 if model.startswith("openai/"):
@@ -2962,14 +2906,12 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                 info["completion_tokens"] += ct
                 ch = (d.get("choices") or [{}])[0]
                 content = (ch.get("message") or {}).get("content") or ""
-                parsed, salvaged = _parse_json_ex(content) if content else (None, False)
-                found = _extract_picks(parsed) if parsed is not None else []
+                found = _parse_pick_indices(content)
                 if found:
                     log.append({"model": model, "status": f"SUCCESS ({len(found)} picks)"})
                     info.update({"model": model, "status": "SUCCESS"})
                     return found, info
-                why_ = ("EMPTY_CONTENT" if not content.strip() else
-                        "EMPTY_PICKS_LIST" if parsed is not None else "UNPARSEABLE_JSON")
+                why_ = "EMPTY_CONTENT" if not content.strip() else "NO_MATCH_OPTION_LINES"
                 log.append({"model": model, "status": (f"{why_} finish={ch.get('finish_reason')} "
                                                        f"({ct}/{cap} completion tokens; prompt~{p_est}) "
                                                        f"raw={content.strip()[:220]!r}")})
@@ -2997,16 +2939,6 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                 if rate_limit_retries >= 4 or attempt == 4:
                     break
                 time.sleep(wait)
-            elif r.status_code == 400 and "response_format" in payload:
-                if handle:
-                    gov.settle(handle, 0)
-                if "failed_generation" in r.text.lower() or "failed to validate json" in r.text.lower():
-                    log.append({"model": model, "status": f"HTTP_400 JSON-mode generation failed; not retrying: {r.text[:500]}"})
-                    info["status"] = "JSON_GENERATION_FAILED"
-                    return None, info
-                log.append({"model": model, "status": f"HTTP_400 retrying plain: {r.text[:100]}"})
-                response_format = False
-                continue
             elif r.status_code in NON_RETRYABLE or r.status_code == 413:
                 if handle:
                     gov.settle(handle, 0)
@@ -3048,7 +2980,7 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
         return {"picks": [], "ai_note": "AI disabled in settings.", "warnings": ["AI is disabled."], "model": None, "passes": [], "tokens": 0, "n_ai": 0}
     if not elig:
         return {"picks": [], "ai_note": "No matches passed the evidence gate.", "warnings": [], "model": None, "passes": [], "tokens": 0, "n_ai": 0}
-    sys_msg = "You are a concise football quant analyst. Return only the requested JSON object."
+    sys_msg = "You are a concise football quant analyst. Follow the requested MATCH|OPTION output format exactly."
     max_completion = max(cfg_.get("max_completion_tokens", GROQ_DEFAULT_CFG["max_completion_tokens"])
                          for cfg_ in GROQ_MODEL_CONFIG.values())
     completion_reserve = _completion_token_reserve(eff, max_completion)
@@ -3090,18 +3022,31 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
             if not isinstance(item, dict):
                 rejected["invalid item"] += 1
                 continue
-            mt_ = item.get("match") or item.get("fixture") or item.get("game")
-            pk_ = item.get("pick") or item.get("selection") or item.get("bet") or item.get("market")
-            if not mt_ or not pk_:
-                rejected["missing match or pick"] += 1
-                continue
-            if isinstance(mt_, dict):
-                mt_ = mt_.get("name") or mt_.get("fixture") or f"{mt_.get('home', '')} v {mt_.get('away', '')}"
-            match = _resolve_match(mt_, ai_pool)
-            if not match:
-                rejected["unmatched or ambiguous match"] += 1
-                continue
-            leg = _resolve_leg(pk_, match)
+            if "match_index" in item and "option_index" in item:
+                match_i, option_i = item["match_index"], item["option_index"]
+                if (type(match_i) is not int or type(option_i) is not int
+                        or not 1 <= match_i <= len(ai_pool)):
+                    rejected["invalid match or option index"] += 1
+                    continue
+                match = ai_pool[match_i - 1]
+                match_legs = match.get("legs", [])
+                if not 1 <= option_i <= len(match_legs):
+                    rejected["invalid match or option index"] += 1
+                    continue
+                leg = match_legs[option_i - 1]
+            else:
+                mt_ = item.get("match") or item.get("fixture") or item.get("game")
+                pk_ = item.get("pick") or item.get("selection") or item.get("bet") or item.get("market")
+                if not mt_ or not pk_:
+                    rejected["missing match or pick"] += 1
+                    continue
+                if isinstance(mt_, dict):
+                    mt_ = mt_.get("name") or mt_.get("fixture") or f"{mt_.get('home', '')} v {mt_.get('away', '')}"
+                match = _resolve_match(mt_, ai_pool)
+                if not match:
+                    rejected["unmatched or ambiguous match"] += 1
+                    continue
+                leg = _resolve_leg(pk_, match)
             if not leg or (leg["key"] == "12" and min(leg["p"], leg["p_model"], leg["p_mkt"]) < 0.80):
                 rejected["unmatched or unsafe market"] += 1
                 continue
@@ -3139,7 +3084,8 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
             correction_user = (user_msg + f"\n\nPORTFOLIO BALANCE CORRECTION: Your previous selection violated the portfolio rules. "
                               f"Return a fresh set of exactly {target} picks from at least {min_categories} different market categories, "
                               f"with at most {max_per_market} picks in each category and {max_double_chance} double-chance picks. "
-                              "Use qualified non-double-chance options where available. Preserve one pick per match and follow all evidence rules.")
+                              "Use qualified non-double-chance options where available. Preserve one pick per match and follow all evidence rules. "
+                              "Output only MATCH|OPTION lines, one per pick.")
             revised, revised_info = call_groq_for_picks(correction_system, correction_user, budget, cpt, eff, gov, ceiling, log)
             revised_info["attempts"] = info.get("attempts", []) + revised_info.get("attempts", [])
             if revised and isinstance(revised, list):
@@ -3382,8 +3328,7 @@ def test_groq_connection():
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
         payload = {"model": model, "max_completion_tokens": 512,
                  "temperature": 0.6 if model.startswith("openai/gpt-oss") else 0,
-                 "response_format": {"type": "json_object"},
-                   "messages": [{"role": "user", "content": 'Return one JSON object only: {"ok": true}'}]}
+                   "messages": [{"role": "user", "content": "Reply with exactly the word OK and nothing else."}]}
         if cfg.get("supports_reasoning_effort"):
             payload["reasoning_effort"] = "low" if model.startswith("openai/") else "none"
             if model.startswith("openai/"):
@@ -3391,7 +3336,12 @@ def test_groq_connection():
         try:
             r = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {key}"}, json=payload, timeout=30)
             if r.status_code == 200:
-                rows.append((model, f"✅ working ({(r.json().get('usage') or {}).get('total_tokens', '?')} tokens)"))
+                body = r.json()
+                content = ((body.get("choices") or [{}])[0].get("message") or {}).get("content", "")
+                if content.strip().upper() == "OK":
+                    rows.append((model, f"✅ working ({(body.get('usage') or {}).get('total_tokens', '?')} tokens)"))
+                else:
+                    rows.append((model, f"⚠️ reachable but returned unexpected content: {content[:100]!r}"))
             else:
                 rows.append((model, f"❌ HTTP {r.status_code}: {r.text[:170]}"))
         except Exception as e:
