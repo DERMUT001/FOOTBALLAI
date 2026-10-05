@@ -43,6 +43,35 @@ GROQ_MODEL_CONFIG = {
     "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
+GROQ_PICK_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "football_match_picks",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "picks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "match": {"type": "string"},
+                            "pick": {"type": "string"},
+                            "confidence": {"type": "string", "enum": ["HIGH", "MED"]},
+                            "reason": {"type": "string"},
+                            "risk_if_fails": {"type": "string"},
+                        },
+                        "required": ["match", "pick", "confidence", "reason", "risk_if_fails"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["picks"],
+            "additionalProperties": False,
+        },
+    },
+}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
 
 # ── Token policy ────────────────────────────────────────────────────────────
@@ -2617,41 +2646,20 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # AI MATCH SELECTION — THE AI IS THE SOLE DECISION-MAKER
 # ═════════════════════════════════════════════════════════════════════════════
-AI_MATCH_PROMPT = """You are an expert football quant analyst. Python has collected the available match data and run Monte Carlo simulations. Real bookmaker prices may be missing; any estimated odds and probabilities are explicitly labelled and are not bookmaker or market evidence.
+AI_MATCH_PROMPT = """Select exactly {target} distinct matches from the supplied qualified matches, safest first. The Python evidence gate already qualified every match; do not add another gate or return an empty/short list. Compare all listed options and use their exact labels. Never invent matches, options, odds, or evidence.
 
-YOUR TASK: Return exactly {target} picks, one from each of {target} distinct matches, ranked safest first. Python has already applied the safety and evidence gate: every supplied match has at least one qualifying option. Do not apply another eligibility filter and do not return an empty or shorter list. Choose the strongest available options from the supplied matches; mark weaker selections MED. Never invent a match, market, price, or evidence.
+Use recent form, xG, Monte Carlo probabilities (mdl), bookmaker prices (mkt), H2H, trap risk (TRAP), and data quality (dq). Missing bookmaker odds, injuries, or lineups are not reasons by themselves to reject a match. Estimated (est) odds are display estimates, not market evidence; base those picks on team data/model probabilities and require stronger agreement. Prefer TRAP below 45; higher values need clear support. Either-team-win (12) is allowed only at 80%+ with model and genuine bookmaker support.
 
-DATA KEY:
-- xG: expected goals home-away
-- mdl: Monte Carlo model 1X2 probabilities (%)
-- mkt: bookmaker 1/X/2 odds when available; otherwise an external API/Elo opinion or no market prices
-- Form: recent results and rates for goals, clean sheets, failed-to-score, overs and BTTS
-- TRAP: Python trap score (>=40 = dangerous, >=60 = very dangerous)
-- dq: data quality 0-1
-- H2H: head-to-head W-D-L and average total goals
-- Options: qualifying bets with price source (book = bookmaker, derived = inferred from bookmaker prices, est = model-estimated), probabilities, and tier
+Portfolio: at least {min_categories} market categories; at most {max_per_market} picks per category; at most {max_double_chance} double-chance picks when qualified alternatives exist. Categories: double chance, result, goals, team totals, BTTS, first half, corners. Prefer safer evidence over forced variety.
 
-SELECTION RULES:
-1. Analyze recent results, scoring rates, H2H, trap risk, data quality, and all listed option probabilities. If bookmaker odds are absent, still analyze and select from the available form, xG, Monte Carlo, standings, H2H, and external team-strength data; never reject a match solely for lacking odds.
-2. Treat est odds as display/settlement estimates only, never as bookmaker confirmation or independent market support. With est options, base the decision on team data and model probabilities, demand stronger agreement and margin, and state the evidence actually supplied.
-3. Compare every listed option, not just the first. Choose at least {min_categories} different market categories, no more than {max_per_market} picks from any one category, and no more than {max_double_chance} double-chance picks when other qualified non-double-chance options are available. Categories: double chance, match result, full-time goals totals, team totals, both teams score, first-half totals, corners. Prefer a balanced mix across categories when evidence is comparable; do not default to 1X or X2.
-4. Avoid "Either team to win (12)" unless its listed probability is at least 80% and the model plus genuine bookmaker market support it. Prefer suitable match-result, goals, team-total, or BTTS options over double chance when comparably safe.
-5. Prefer matches with TRAP below 45; a higher-trap match requires clear supporting evidence.
-6. Treat missing injury/lineup data as unknown, not as evidence for or against a pick. Do not invent external facts.
-7. For each pick, state which supplied form/model/market evidence supports it and the most likely failure scenario.
-8. Use only an exact match and option shown in the supplied data. Copy its label and odds; copy the listed blended probability (p:74% means "probability": 74).
-
-OUTPUT FORMAT: A compact JSON object with one key "picks" holding an array. Each array item has:
-- "match": "Home v Away"
-- "league": "League name"
-- "pick": "The specific selection (e.g. 'Home Win', 'Home or Draw (1X)', 'Over 1.5 Goals', 'BTTS - Yes')"
-- "odds": decimal odds (number)
-- "probability": the option's listed probability in percent (number)
+Return only a JSON object with a "picks" array. Each item must contain:
+- "match": exact "Home v Away"
+- "pick": exact supplied option label
 - "confidence": "HIGH" or "MED"
-- "reason": max 12 words explaining why this is safe
-- "risk_if_fails": max 8 words describing how it loses
+- "reason": at most 8 words, using supplied evidence only
+- "risk_if_fails": at most 6 words
 
-Output ONLY the JSON object, like {"picks": [ {...}, {...} ]}. No markdown. No explanation."""
+Do not include odds, probability, or league; Python fills these from the verified option. Do not include markdown or commentary. Example: {"picks":[{"match":"Home v Away","pick":"Home Win","confidence":"MED","reason":"Model and recent form agree","risk_if_fails":"Away scores first"}]}"""
 
 
 def format_matches_for_ai(matches, tz, max_n=15):
@@ -2751,6 +2759,11 @@ class TokenBudget:
     @property
     def remaining(self):
         return self.total - self.used
+
+
+def _completion_token_reserve(effort, max_completion_tokens):
+    effort_reserve = EFFORT_RESERVE.get(effort, EFFORT_RESERVE["low"])
+    return min(int(max_completion_tokens), max(OUTPUT_RESERVE, effort_reserve))
 
 
 def _salvage_json(text):
@@ -2935,14 +2948,16 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
         eff = effort or cfg.get("reasoning_effort")
         upper = cfg["max_completion_tokens"]
+        completion_reserve = _completion_token_reserve(eff, upper)
         p_est = est_tokens(system_prompt + user_prompt, cpt) + 40
         response_format = True
         rate_limit_retries = 0
         for attempt in range(5):
             limit = min(ceiling, gov.limit) if gov else ceiling
             cap = min(upper, budget.remaining - p_est - 60, limit - p_est - 60)
-            if cap < MIN_COMPLETION:
-                log.append({"model": model, "status": f"SKIPPED(prompt~{p_est}, room={cap}, tpm={limit})"})
+            if cap < completion_reserve:
+                log.append({"model": model, "status": (f"SKIPPED(prompt~{p_est}, room={cap}, "
+                                                       f"completion reserve={completion_reserve}, tpm={limit})")})
                 break
             reservation = p_est + cap
             handle = None
@@ -2954,7 +2969,7 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                        "messages": [{"role": "system", "content": system_prompt},
                                     {"role": "user", "content": user_prompt}]}
             if response_format:
-                payload["response_format"] = {"type": "json_object"}
+                payload["response_format"] = GROQ_PICK_RESPONSE_FORMAT
             if cfg.get("supports_reasoning_effort") and eff:
                 payload["reasoning_effort"] = eff if model.startswith("openai/") or eff == "none" else "none"
                 if model.startswith("openai/"):
@@ -2991,10 +3006,12 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                     return found, info
                 why_ = ("EMPTY_CONTENT" if not content.strip() else
                         "EMPTY_PICKS_LIST" if parsed is not None else "UNPARSEABLE_JSON")
-                log.append({"model": model, "status": f"{why_} finish={ch.get('finish_reason')} ({ct} tokens) raw={content.strip()[:220]!r}"})
+                log.append({"model": model, "status": (f"{why_} finish={ch.get('finish_reason')} "
+                                                       f"({ct}/{cap} completion tokens; prompt~{p_est}) "
+                                                       f"raw={content.strip()[:220]!r}")})
                 if ch.get("finish_reason") == "length":
                     info["status"] = "TRUNCATED"
-                    break
+                    return None, info
                 break
             elif r.status_code == 404:
                 if handle:
@@ -3019,6 +3036,10 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
             elif r.status_code == 400 and "response_format" in payload:
                 if handle:
                     gov.settle(handle, 0)
+                if "failed_generation" in r.text.lower() or "failed to validate json" in r.text.lower():
+                    log.append({"model": model, "status": f"HTTP_400 strict JSON generation failed; not retrying: {r.text[:100]}"})
+                    info["status"] = "JSON_GENERATION_FAILED"
+                    return None, info
                 log.append({"model": model, "status": f"HTTP_400 retrying plain: {r.text[:100]}"})
                 response_format = False
                 continue
@@ -3063,6 +3084,10 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
         return {"picks": [], "ai_note": "AI disabled in settings.", "warnings": ["AI is disabled."], "model": None, "passes": [], "tokens": 0, "n_ai": 0}
     if not elig:
         return {"picks": [], "ai_note": "No matches passed the evidence gate.", "warnings": [], "model": None, "passes": [], "tokens": 0, "n_ai": 0}
+    sys_msg = "You are a concise football quant analyst. Return only the requested JSON object."
+    max_completion = max(cfg_.get("max_completion_tokens", GROQ_DEFAULT_CFG["max_completion_tokens"])
+                         for cfg_ in GROQ_MODEL_CONFIG.values())
+    completion_reserve = _completion_token_reserve(eff, max_completion)
     ranked = sorted(elig, key=lambda m: -(sum(l["rank"] for l in m.get("legs", [])[:2]) / max(1, len(m.get("legs", [])[:2]))))
     n_pool = min(len(ranked), 14)
     while True:
@@ -3079,11 +3104,19 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                   .replace("{max_double_chance}", str(max_double_chance)))
         data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool))
         user_msg = f"{prompt}\n\nMATCH DATA:\n{data_str}"
-        if n_pool <= 3 or est_tokens(user_msg, cpt) + 1700 <= ceiling:
+        p_est = est_tokens(sys_msg + user_msg, cpt) + 40
+        available = min(ceiling, budget.remaining, gov.limit)
+        if p_est + completion_reserve + TOKEN_SAFETY <= available or n_pool == 1:
             break
         n_pool -= 1
+    if p_est + completion_reserve + TOKEN_SAFETY > available:
+        status = (f"SKIPPED(prompt~{p_est}, completion reserve={completion_reserve}, "
+                  f"available={available}); no request sent")
+        warnings.append("AI prompt plus a safe completion reserve exceeds the token budget; no AI tokens were spent.")
+        return {"picks": [], "ai_note": "AI token budget is too small for a complete response.",
+                "warnings": warnings, "model": None, "passes": [{"model": "-", "status": status}],
+                "tokens": budget.used, "n_ai": 0}
     log(f"🤖 AI Analyst: sending {len(ai_pool)} qualified matches for selection (target: {target} picks)...")
-    sys_msg = "You are an expert football quant analyst. Output ONLY a valid JSON object with a 'picks' array. No markdown. No explanation."
     picks, info = call_groq_for_picks(sys_msg, user_msg, budget, cpt, eff, gov, ceiling, log)
     progress(1.0)
     def validate_picks(items):
@@ -3385,7 +3418,11 @@ def test_groq_connection():
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
         payload = {"model": model, "max_completion_tokens": 120,
                  "temperature": 1.0 if model.startswith("openai/gpt-oss") else 0,
-                 "response_format": {"type": "json_object"},
+                 "response_format": {"type": "json_schema", "json_schema": {
+                     "name": "groq_connection_test", "strict": True,
+                     "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}},
+                                "required": ["ok"], "additionalProperties": False},
+                 }},
                    "messages": [{"role": "user", "content": 'Return exactly: {"ok": true}'}]}
         if cfg.get("supports_reasoning_effort"):
             payload["reasoning_effort"] = "low" if model.startswith("openai/") else "none"
