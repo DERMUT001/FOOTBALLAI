@@ -37,11 +37,10 @@ STATE_PATH = os.environ.get("DERAI_FB_STATE", "derai_football_state.json")
 CACHE_PURGE_DAYS = 8
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TIMEOUT = 90
-GROQ_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"]
+GROQ_MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 GROQ_MODEL_CONFIG = {
     "openai/gpt-oss-120b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
     "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
-    "llama-3.3-70b-versatile": {"max_completion_tokens": 2500, "reasoning_effort": None, "supports_reasoning_effort": False},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
@@ -2710,9 +2709,14 @@ class TpmGovernor:
     def _prune(self, now):
         self.events = [e for e in self.events if now - e[0] < 60.0]
 
+    def set_limit(self, tokens):
+        self.limit = max(1, min(self.limit, int(tokens)))
+
     def wait_for(self, tokens, log_fn=None):
         waited = 0.0
-        tokens = min(int(tokens), self.limit)
+        tokens = int(tokens)
+        if tokens > self.limit:
+            raise ValueError(f"Request reservation ({tokens}) exceeds the TPM limit ({self.limit}).")
         while True:
             now = self.clock()
             self._prune(now)
@@ -2727,7 +2731,7 @@ class TpmGovernor:
                     break
             wait = min(65.0, max(1.0, (release if release is not None else now + 60.0) - now + 0.5))
             if log_fn:
-                log_fn(f"   ⏳ Groq allows ~{self.limit + WINDOW_MARGIN} tokens/minute: waiting {wait:.0f}s...")
+                log_fn(f"   ⏳ Groq token budget is {self.limit}/minute: waiting {wait:.0f}s...")
             self.sleep(wait)
             waited += wait
 
@@ -2892,6 +2896,29 @@ def _mark_dead(model):
         pass
 
 
+def _groq_tpm_limit(headers):
+    try:
+        limit = int(headers.get("x-ratelimit-limit-tokens", 0))
+        return limit if limit > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _groq_retry_after(headers):
+    retry_after = headers.get("retry-after")
+    try:
+        if retry_after is not None:
+            return max(1.0, float(retry_after))
+    except (TypeError, ValueError):
+        pass
+    reset = str(headers.get("x-ratelimit-reset-tokens", "")).strip().lower()
+    parts = re.findall(r"(\d+(?:\.\d+)?)\s*([hms])", reset)
+    if parts:
+        scale = {"h": 3600, "m": 60, "s": 1}
+        return max(1.0, sum(float(value) * scale[unit] for value, unit in parts) + 1.0)
+    return 60.0
+
+
 def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, gov=None, ceiling=None, log_fn=None):
     """Single Groq call to get AI match picks."""
     api_key = get_secret("GROQ_API_KEY", "").strip()
@@ -2901,32 +2928,37 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
         log.append({"model": "-", "status": "GROQ_API_KEY not set"})
         info["status"] = "MISSING_KEY"
         return None, info
-    ceiling = ceiling or (GROQ_TPM_DEFAULT - TPM_MARGIN)
+    ceiling = int(ceiling or (GROQ_TPM_DEFAULT - TPM_MARGIN))
     dead = _dead_models()
-    models = [m for m in GROQ_MODELS if m not in dead] or GROQ_MODELS[:2]
+    models = [m for m in GROQ_MODELS if m not in dead] or GROQ_MODELS[:]
     for model in models:
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
         eff = effort or cfg.get("reasoning_effort")
         upper = cfg["max_completion_tokens"]
-        limit = ceiling
         p_est = est_tokens(system_prompt + user_prompt, cpt) + 40
-        cap = min(upper, budget.remaining - p_est - 60, limit - p_est - 60)
-        if cap < MIN_COMPLETION:
-            log.append({"model": model, "status": f"SKIPPED(prompt~{p_est}, room={cap})"})
-            continue
-        handle = None
-        if gov:
-            info["waited"] = info.get("waited", 0) + gov.wait_for(p_est + cap, log_fn)
-            handle = gov.charge(p_est + cap)
-        payload = {"model": model, "temperature": 1.0 if model.startswith("openai/gpt-oss") else 0.2,
-                 "max_completion_tokens": int(cap),
-                   "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]}
-        payload["response_format"] = {"type": "json_object"}
-        if cfg.get("supports_reasoning_effort") and eff:
-            payload["reasoning_effort"] = eff if model.startswith("openai/") or eff == "none" else "none"
-            if model.startswith("openai/"):
-                payload["include_reasoning"] = False
-        for attempt in range(2):
+        response_format = True
+        rate_limit_retries = 0
+        for attempt in range(5):
+            limit = min(ceiling, gov.limit) if gov else ceiling
+            cap = min(upper, budget.remaining - p_est - 60, limit - p_est - 60)
+            if cap < MIN_COMPLETION:
+                log.append({"model": model, "status": f"SKIPPED(prompt~{p_est}, room={cap}, tpm={limit})"})
+                break
+            reservation = p_est + cap
+            handle = None
+            if gov:
+                info["waited"] = info.get("waited", 0) + gov.wait_for(reservation, log_fn)
+                handle = gov.charge(reservation)
+            payload = {"model": model, "temperature": 1.0,
+                       "max_completion_tokens": int(cap),
+                       "messages": [{"role": "system", "content": system_prompt},
+                                    {"role": "user", "content": user_prompt}]}
+            if response_format:
+                payload["response_format"] = {"type": "json_object"}
+            if cfg.get("supports_reasoning_effort") and eff:
+                payload["reasoning_effort"] = eff if model.startswith("openai/") or eff == "none" else "none"
+                if model.startswith("openai/"):
+                    payload["include_reasoning"] = False
             try:
                 r = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=GROQ_TIMEOUT)
             except Exception as e:
@@ -2936,6 +2968,10 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                 time.sleep(2)
                 continue
             if r.status_code == 200:
+                observed_limit = _groq_tpm_limit(r.headers)
+                if observed_limit:
+                    if gov:
+                        gov.set_limit(observed_limit)
                 d = r.json()
                 u = d.get("usage") or {}
                 pt, ct = u.get("prompt_tokens", p_est), u.get("completion_tokens", 0)
@@ -2961,23 +2997,42 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                     break
                 break
             elif r.status_code == 404:
+                if handle:
+                    gov.settle(handle, 0)
                 _mark_dead(model)
                 log.append({"model": model, "status": "HTTP_404 model unavailable"})
                 break
             elif r.status_code == 429:
-                log.append({"model": model, "status": f"RATE_LIMIT: {r.text[:100]}"})
-                time.sleep(15)
+                if handle:
+                    gov.settle(handle, 0)
+                observed_limit = _groq_tpm_limit(r.headers)
+                if observed_limit:
+                    if gov:
+                        gov.set_limit(observed_limit)
+                rate_limit_retries += 1
+                wait = _groq_retry_after(r.headers)
+                log.append({"model": model,
+                            "status": f"RATE_LIMIT: waiting {wait:.1f}s (retry {rate_limit_retries}/4); {r.text[:100]}"})
+                if rate_limit_retries >= 4 or attempt == 4:
+                    break
+                time.sleep(wait)
             elif r.status_code == 400 and "response_format" in payload:
+                if handle:
+                    gov.settle(handle, 0)
                 log.append({"model": model, "status": f"HTTP_400 retrying plain: {r.text[:100]}"})
-                for k_ in ("response_format", "include_reasoning", "reasoning_effort"):
-                    payload.pop(k_, None)
+                response_format = False
                 continue
             elif r.status_code in NON_RETRYABLE or r.status_code == 413:
+                if handle:
+                    gov.settle(handle, 0)
                 log.append({"model": model, "status": f"HTTP_{r.status_code}: {r.text[:140]}"})
                 break
             else:
+                if handle:
+                    gov.settle(handle, 0)
                 log.append({"model": model, "status": f"HTTP_{r.status_code}"})
-                time.sleep(3)
+                if attempt < 4:
+                    time.sleep(min(30, 2 ** attempt))
     info["status"] = info.get("status", "FAILED")
     return None, info
 
@@ -2996,9 +3051,9 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     """AI reads ALL qualified matches and picks the top N safest. Python NEVER picks."""
     warnings = []
     state = load_state()
-    tpm = int(min(int(cfg.get("tpm", GROQ_TPM_DEFAULT)), int(state.get("tpm_limit", 10 ** 9))))
-    ceiling = max(3500, tpm - TPM_MARGIN)
-    gov = TpmGovernor(max(ceiling + 50, tpm - WINDOW_MARGIN))
+    tpm = int(cfg.get("tpm", GROQ_TPM_DEFAULT))
+    ceiling = max(MIN_COMPLETION + 1, tpm - TPM_MARGIN)
+    gov = TpmGovernor(tpm)
     budget = TokenBudget(int(cfg.get("run_tokens", RUN_TOKEN_CAP_DEFAULT)))
     cpt = float(state.get("cpt", DEFAULT_CHARS_PER_TOKEN))
     eff = cfg.get("effort") if cfg.get("effort") in EFFORT_RESERVE else "low"
@@ -3468,7 +3523,8 @@ def main():
         allow_est = st.checkbox("Allow model-estimated odds when no bookmaker prices", True)
         st.markdown("##### 🤖 AI settings")
         a1, a2 = st.columns(2)
-        tpm = a1.number_input("Groq tokens/minute limit", 4000, 30000, GROQ_TPM_DEFAULT, step=500)
+        tpm = a1.number_input("Local Groq tokens/minute safety cap", 4000, 30000, GROQ_TPM_DEFAULT, step=500)
+        a1.caption("Groq's reported account limit automatically takes precedence when response headers are available.")
         run_tokens = a2.number_input("Max AI tokens per analysis", 10000, 120000, RUN_TOKEN_CAP_DEFAULT, step=2000)
         auto_relax = st.checkbox("Auto-relax thresholds when fewer than the target AI pool qualify", True)
         wide_menu = st.checkbox("Include borderline legs for AI to consider", True)
