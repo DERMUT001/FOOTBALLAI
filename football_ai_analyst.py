@@ -1881,7 +1881,7 @@ def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
             else:
                 lo, hi = o.get("low", odds), o.get("best", odds)
             p_mkt = market_fair_prob(key, m["odds"])
-        elif allow_est and not m["odds"]:
+        elif allow_est:
             odds, src = round(max(1.05, 0.93 / max(p, 0.05)), 2), "est"
             p_mkt = ext.get(key, p) if ext else p
         else:
@@ -2146,10 +2146,12 @@ def collect_free_only(api, free, cfg, log, progress, out):
                 for market, quote in o2.items():
                     odds.setdefault(market, quote)
                 odds_sources.append(s2)
-        if not odds:
-            out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no bookmaker odds from any source"})
+        if not odds and not cfg.get("allow_est"):
+            out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}",
+                                    "reason": "no bookmaker odds from any source; model estimates are disabled"})
             continue
-        osrc = "+".join(dict.fromkeys(source for source in odds_sources if source)) or "unknown"
+        osrc = "+".join(dict.fromkeys(source for source in odds_sources if source)) or (
+            "model-estimated (no bookmaker odds)" if cfg.get("allow_est") else "unknown")
         c = {"pred": None, "rh": fh["results"], "ra": fa["results"], "h2h": free.h2h(m["home"], m["away"], m["league_id"], date_str),
              "elo": free.elo_for(m["home"], m["away"], m["league_id"], m["country"], date_str),
              "free_tags": ["form"] + (["tsdb-form"] if fh.get("tsdb") or fa.get("tsdb") else []), "fh": fh, "fa": fa}
@@ -2157,7 +2159,8 @@ def collect_free_only(api, free, cfg, log, progress, out):
             c["free_tags"].append("h2h")
         if c["elo"]:
             c["free_tags"].append("elo")
-        c["free_tags"].append("odds:" + str(osrc))
+        if odds:
+            c["free_tags"].append("odds:" + str(osrc))
         rec = make_record(m, c, fh["hs"], fa["hs"], None, None, None, None, odds, "free:" + str(osrc),
                           free.standing(m["home"], m["league_id"], date_str), free.standing(m["away"], m["league_id"], date_str), False, cfg)
         out["matches"].append(rec)
@@ -2168,7 +2171,15 @@ def collect_free_only(api, free, cfg, log, progress, out):
     out["deep"], out["budget"] = False, 0
     out["plan"] = out.get("plan") or {"plan": "free sources only"}
     if not out["matches"]:
-        out["reason"] = "Free sources found fixtures but none had both team history and bookmaker odds."
+        out["reason"] = ("Free sources found fixtures but none had enough team history to analyse."
+                         if cfg.get("allow_est") else
+                         "Free sources found fixtures but none had both team history and bookmaker odds.")
+    elif cfg.get("allow_est"):
+        estimated = sum(not m.get("odds") for m in out["matches"])
+        if estimated:
+            out["warnings"].append(
+                f"{estimated} analysed matches had no bookmaker odds; their qualifying options use model-estimated prices, "
+                "not market confirmation.")
     return out
 
 
@@ -2363,14 +2374,15 @@ def collect_day(api, cfg, log, progress, free=None):
                     store_odds(its, c["id"])
                     caps["fixture_odds"] = True
     with_odds = [c for c in cand if c["id"] in odds_by]
-    if caps["fixture_odds"] or (cfg["allow_est"] and not (caps["league_odds"] and len(with_odds) >= 10)):
+    if caps["fixture_odds"] or cfg["allow_est"]:
         keep = list(cand)
     else:
         keep = with_odds
     keep_ids = {c["id"] for c in keep}
     for c in cand:
         if c["id"] not in keep_ids:
-            out["excluded"].append({"league": c["league"], "match": f"{c['home']} v {c['away']}", "reason": "no bookmaker odds"})
+            out["excluded"].append({"league": c["league"], "match": f"{c['home']} v {c['away']}",
+                                    "reason": "no bookmaker odds; model estimates are disabled"})
     log(f"   {len(odds_by)} candidates have bookmaker prices so far -> {len(keep)} continue")
     progress(0.14)
     if not keep:
@@ -2589,6 +2601,12 @@ def collect_day(api, cfg, log, progress, free=None):
     thin = sum(1 for r in out["matches"] if r["basis"] == "prior")
     if thin:
         out["warnings"].append(f"{thin}/{len(out['matches'])} matches have NO team-specific data and are excluded.")
+    if cfg.get("allow_est"):
+        estimated = sum(not r.get("odds") for r in out["matches"])
+        if estimated:
+            out["warnings"].append(
+                f"{estimated} analysed matches had no bookmaker odds; their qualifying options use model-estimated prices, "
+                "not market confirmation.")
     if free.intl_extra:
         free.used["espn-recent-results"] = free.intl_extra
     if free.enabled and free.used:
@@ -2600,28 +2618,29 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # AI MATCH SELECTION — THE AI IS THE SOLE DECISION-MAKER
 # ═════════════════════════════════════════════════════════════════════════════
-AI_MATCH_PROMPT = """You are an expert football quant analyst at a sharp sportsbook. Python has collected data, run Monte Carlo simulations, and blended model probabilities with de-vigged bookmaker prices for every match below.
+AI_MATCH_PROMPT = """You are an expert football quant analyst. Python has collected the available match data and run Monte Carlo simulations. Real bookmaker prices may be missing; any estimated odds and probabilities are explicitly labelled and are not bookmaker or market evidence.
 
 YOUR TASK: Return exactly {target} picks, one from each of {target} distinct matches, ranked safest first. Python has already applied the safety and evidence gate: every supplied match has at least one qualifying option. Do not apply another eligibility filter and do not return an empty or shorter list. Choose the strongest available options from the supplied matches; mark weaker selections MED. Never invent a match, market, price, or evidence.
 
 DATA KEY:
 - xG: expected goals home-away
 - mdl: Monte Carlo model 1X2 probabilities (%)
-- mkt: bookmaker 1/X/2 odds (fd = free source prices)
+- mkt: bookmaker 1/X/2 odds when available; otherwise an external API/Elo opinion or no market prices
 - Form: recent results and rates for goals, clean sheets, failed-to-score, overs and BTTS
 - TRAP: Python trap score (>=40 = dangerous, >=60 = very dangerous)
 - dq: data quality 0-1
 - H2H: head-to-head W-D-L and average total goals
-- Options: qualifying bets with odds, blended/model/market probabilities, and tier
+- Options: qualifying bets with price source (book = bookmaker, derived = inferred from bookmaker prices, est = model-estimated), probabilities, and tier
 
 SELECTION RULES:
-1. Analyze the recent results, scoring rates, H2H, trap risk, data quality, and each option's blended/model/market probabilities before choosing. Do not base the decision on Monte Carlo probability alone.
-2. Compare every listed option, not just the first. Choose at least {min_categories} different market categories and no more than {max_per_market} picks from any one category. Categories: double chance, match result, full-time goals totals, team totals, both teams score, first-half totals, corners. Prefer balance across categories when the evidence is comparable.
-3. Avoid "Either team to win (12)" unless its listed probability is at least 80% and both the model and market support it. Prefer double chance or suitable goals/BTTS options when comparably safe.
-4. Prefer matches with TRAP below 45; a higher-trap match requires clear supporting evidence.
-5. Treat missing injury/lineup data as unknown, not as evidence for or against a pick. Do not invent external facts.
-6. For each pick, state which supplied form or market evidence supports it and the most likely failure scenario.
-7. Use only an exact match and option shown in the supplied data. Copy its label and odds; copy the listed blended probability (p:74% means "probability": 74).
+1. Analyze recent results, scoring rates, H2H, trap risk, data quality, and all listed option probabilities. If bookmaker odds are absent, still analyze and select from the available form, xG, Monte Carlo, standings, H2H, and external team-strength data; never reject a match solely for lacking odds.
+2. Treat est odds as display/settlement estimates only, never as bookmaker confirmation or independent market support. With est options, base the decision on team data and model probabilities, demand stronger agreement and margin, and state the evidence actually supplied.
+3. Compare every listed option, not just the first. Choose at least {min_categories} different market categories, no more than {max_per_market} picks from any one category, and no more than {max_double_chance} double-chance picks when other qualified non-double-chance options are available. Categories: double chance, match result, full-time goals totals, team totals, both teams score, first-half totals, corners. Prefer a balanced mix across categories when evidence is comparable; do not default to 1X or X2.
+4. Avoid "Either team to win (12)" unless its listed probability is at least 80% and the model plus genuine bookmaker market support it. Prefer suitable match-result, goals, team-total, or BTTS options over double chance when comparably safe.
+5. Prefer matches with TRAP below 45; a higher-trap match requires clear supporting evidence.
+6. Treat missing injury/lineup data as unknown, not as evidence for or against a pick. Do not invent external facts.
+7. For each pick, state which supplied form/model/market evidence supports it and the most likely failure scenario.
+8. Use only an exact match and option shown in the supplied data. Copy its label and odds; copy the listed blended probability (p:74% means "probability": 74).
 
 OUTPUT FORMAT: A compact JSON object with one key "picks" holding an array. Each array item has:
 - "match": "Home v Away"
@@ -2647,7 +2666,7 @@ def format_matches_for_ai(matches, tz, max_n=15):
         opts = []
         for l in m.get("legs", []):
             group = _pick_market_group(l["key"])
-            opts.append(f"{l['label']}@{l['odds']:.2f}(p:{_pct(l['p'])},mdl:{_pct(l['p_model'])},mkt:{_pct(l['p_mkt'])},{group},{l['tier']})")
+            opts.append(f"{l['label']}@{l['odds']:.2f}(src:{l['src']},p:{_pct(l['p'])},mdl:{_pct(l['p_model'])},mkt:{_pct(l['p_mkt'])},{group},{l['tier']})")
         opts_str = " | ".join(opts) if opts else "no clear options"
         o = m["odds"]
         if all(k in o for k in ("1", "X", "2")):
@@ -2997,9 +3016,12 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
         available_categories = {_pick_market_group(leg["key"]) for match in ai_pool for leg in match.get("legs", [])}
         min_categories = min(target, 3, len(available_categories))
         max_per_market = max(1, math.ceil(target * 0.4), math.ceil(target / max(1, len(available_categories))))
+        non_dc_matches = sum(any(leg["key"] not in ("1X", "X2") for leg in match.get("legs", [])) for match in ai_pool)
+        max_double_chance = min(target, max(math.ceil(target * 0.4), target - non_dc_matches))
         prompt = (AI_MATCH_PROMPT.replace("{target}", str(target))
                   .replace("{min_categories}", str(min_categories))
-                  .replace("{max_per_market}", str(max_per_market)))
+                  .replace("{max_per_market}", str(max_per_market))
+                  .replace("{max_double_chance}", str(max_double_chance)))
         data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool))
         user_msg = f"{prompt}\n\nMATCH DATA:\n{data_str}"
         if n_pool <= 3 or est_tokens(user_msg, cpt) + 1700 <= ceiling:
@@ -3010,7 +3032,7 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     picks, info = call_groq_for_picks(sys_msg, user_msg, budget, cpt, eff, gov, ceiling, log)
     progress(1.0)
     def validate_picks(items):
-        valid, groups, rejected = [], defaultdict(int), defaultdict(int)
+        valid, groups, rejected, double_chance = [], defaultdict(int), defaultdict(int), 0
         seen_matches = set()
         for item in items:
             if not isinstance(item, dict):
@@ -3038,44 +3060,55 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
             seen_matches.add(match_name)
             group = _pick_market_group(leg["key"])
             groups[group] += 1
+            if leg["key"] in ("1X", "X2"):
+                double_chance += 1
             valid.append({
                 "match": match_name,
                 "league": str(match["league"]),
                 "pick": leg["label"],
                 "odds": leg["odds"],
+                "odds_source": leg["src"],
                 "probability": _pct(leg["p"]),
                 "confidence": "HIGH" if str(item.get("confidence", "MED")).upper() == "HIGH" else "MED",
                 "reason": str(item.get("reason", "")),
                 "risk_if_fails": str(item.get("risk_if_fails", "")),
             })
-        return valid, groups, rejected
+        return valid, groups, rejected, double_chance
 
     failure_note = None
     if picks and isinstance(picks, list):
-        valid_picks, groups, rejected = validate_picks(picks)
-        if valid_picks and (len(groups) < min_categories or any(n > max_per_market for n in groups.values())):
+        valid_picks, groups, rejected, double_chance = validate_picks(picks)
+        if valid_picks and (len(groups) < min_categories
+                            or any(n > max_per_market for n in groups.values())
+                            or double_chance > max_double_chance):
             log(f"   ⚖️ AI market mix needs adjustment ({dict(groups)}); requesting a balanced re-selection...")
             correction_system = (sys_msg + f" Select exactly {target} picks across at least {min_categories} market categories, "
-                                f"with no more than {max_per_market} picks per category.")
+                                f"with no more than {max_per_market} picks per category and {max_double_chance} double-chance picks.")
             correction_user = (user_msg + f"\n\nPORTFOLIO BALANCE CORRECTION: Your previous selection violated the portfolio rules. "
                               f"Return a fresh set of exactly {target} picks from at least {min_categories} different market categories, "
-                              f"with at most {max_per_market} picks in each category. Preserve one pick per match and follow all evidence rules.")
+                              f"with at most {max_per_market} picks in each category and {max_double_chance} double-chance picks. "
+                              "Use qualified non-double-chance options where available. Preserve one pick per match and follow all evidence rules.")
             revised, revised_info = call_groq_for_picks(correction_system, correction_user, budget, cpt, eff, gov, ceiling, log)
             revised_info["attempts"] = info.get("attempts", []) + revised_info.get("attempts", [])
             if revised and isinstance(revised, list):
-                revised_valid, revised_groups, revised_rejected = validate_picks(revised)
+                revised_valid, revised_groups, revised_rejected, revised_double_chance = validate_picks(revised)
                 if revised_valid:
-                    valid_picks, groups, rejected, info = revised_valid, revised_groups, revised_rejected, revised_info
-            if len(groups) < min_categories or any(n > max_per_market for n in groups.values()):
+                    valid_picks, groups, rejected, double_chance, info = (
+                        revised_valid, revised_groups, revised_rejected, revised_double_chance, revised_info)
+            if (len(groups) < min_categories or any(n > max_per_market for n in groups.values())
+                    or double_chance > max_double_chance):
                 warnings.append("AI did not fully meet the requested market mix after re-selection.")
-                balanced, used = [], defaultdict(int)
+                balanced, used, balanced_dc = [], defaultdict(int), 0
                 for pick in valid_picks:
                     match = next(m for m in ai_pool if f"{m['home']} v {m['away']}" == pick["match"])
                     leg = next(l for l in match["legs"] if l["label"] == pick["pick"])
                     group = _pick_market_group(leg["key"])
-                    if used[group] < max_per_market:
+                    is_double_chance = leg["key"] in ("1X", "X2")
+                    if (used[group] < max_per_market
+                            and (not is_double_chance or balanced_dc < max_double_chance)):
                         balanced.append(pick)
                         used[group] += 1
+                        balanced_dc += int(is_double_chance)
                 valid_picks, groups = balanced, used
         if valid_picks:
             log(f"   ✅ AI returned {len(valid_picks)} picks using {info.get('model', 'unknown')}")
@@ -3133,8 +3166,11 @@ def build_telegram_message(res, tz):
         for i, p in enumerate(res["picks"][:10]):
             n = nums[i] if i < len(nums) else f"{i + 1}."
             conf_icon = "🟢" if p.get("confidence") == "HIGH" else "🟡"
+            odds_source = p.get("odds_source")
+            odds_note = "estimated; no bookmaker quote" if odds_source == "est" else (
+                "derived from bookmaker prices" if odds_source == "derived" else "bookmaker")
             L.append(f"{n} <b>{_esc(p.get('match', ''))}</b> [{_esc(p.get('league', ''))}]\n"
-                     f"   ➜ <b>{_esc(p.get('pick', ''))}</b> @{_num(p.get('odds')):.2f} ({p.get('probability', 0)}%)\n"
+                     f"   ➜ <b>{_esc(p.get('pick', ''))}</b> @{_num(p.get('odds')):.2f} ({p.get('probability', 0)}%; {_esc(odds_note)})\n"
                      f"   {conf_icon} {_esc(p.get('reason', ''))}\n"
                      f"   ⚠️ Loses if: {_esc(p.get('risk_if_fails', ''))}")
     foot = (f"\n🤖 {_esc(res.get('model') or 'AI')} | AI tokens {res.get('tokens', 0)} | "
@@ -3355,6 +3391,7 @@ def render_results(res, tz):
                 "League": p.get("league", ""),
                 "Pick": p.get("pick", ""),
                 "Odds": p.get("odds", ""),
+                "Odds source": p.get("odds_source", ""),
                 "Prob%": p.get("probability", ""),
                 "Conf": p.get("confidence", ""),
                 "Reason": p.get("reason", ""),
