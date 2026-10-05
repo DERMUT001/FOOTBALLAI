@@ -39,8 +39,8 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TIMEOUT = 90
 GROQ_MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
 GROQ_MODEL_CONFIG = {
-    "openai/gpt-oss-120b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
-    "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
+    "openai/gpt-oss-120b": {"max_completion_tokens": 8192, "reasoning_effort": "medium", "supports_reasoning_effort": True},
+    "openai/gpt-oss-20b": {"max_completion_tokens": 8192, "reasoning_effort": "medium", "supports_reasoning_effort": True},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
@@ -50,8 +50,8 @@ GROQ_TPM_DEFAULT = 8000
 TPM_MARGIN = 350
 WINDOW_MARGIN = 150
 RUN_TOKEN_CAP_DEFAULT = 45000
-EFFORT_RESERVE = {"low": 2600, "medium": 3800, "high": 5000}
-OUTPUT_RESERVE = 3000
+EFFORT_RESERVE = {"low": 4500, "medium": 5500, "high": 6500}
+OUTPUT_RESERVE = 4500
 TOKEN_SAFETY = 100
 MIN_COMPLETION = 900
 DEFAULT_CHARS_PER_TOKEN = 2.3
@@ -2619,51 +2619,33 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 AI_MATCH_PROMPT = """You are selecting football bets using the supplied evidence. Choose exactly {target} options, safest first, with no more than one option per match. The Python evidence gate already qualified these matches; do not apply another eligibility filter.
 
-For each match, compare all supplied options using the listed probabilities, model results, form, H2H, data quality, and trap score. Prefer stronger evidence and lower trap scores. Missing bookmaker odds, injuries, or lineups alone do not disqualify a match. Treat estimated odds as estimates, not bookmaker evidence. Never invent a match or option. Copy the match name and option label exactly as shown.
+Evidence: dq=data quality; trap=trap risk; xG=expected goals; mdl=home/draw/away model probabilities; form=recent result form and PPG; h2h=historical W-D-L/average goals. Each option shows its exact option number and label, decimal odds, p=blended probability, m=model probability, k=market probability, and source B=bookmaker, D=derived, E=model-estimated, X=other. E and X are not bookmaker confirmation. Compare options using this evidence, preferring stronger support and lower trap scores. Missing odds, injuries, or lineups alone do not disqualify a match. Never invent a match or option.
 
 For each selection output only its match number and option number as MATCH|OPTION. Output exactly {target} lines, one per different match. Example: 2|4 means option 4 from match 2. No JSON, words, bullets, headings, or explanations."""
 
 
 def format_matches_for_ai(matches, tz, max_n=15):
-    """Format match data into a comprehensive evidence pack for the AI."""
+    """Format compact match evidence to reserve request tokens for model reasoning."""
     lines = []
     for i, m in enumerate(matches[:max_n]):
-        ko = datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M")
         ph, pa = m["ph"], m["pa"]
-        p = m["p"]
         t = m["trap"]
         opts = []
         for option_i, l in enumerate(m.get("legs", []), 1):
-            group = _pick_market_group(l["key"])
-            opts.append(f"{option_i}:{l['label']}@{l['odds']:.2f}(src:{l['src']},p:{_pct(l['p'])},mdl:{_pct(l['p_model'])},mkt:{_pct(l['p_mkt'])},{group},{l['tier']})")
-        opts_str = " | ".join(opts) if opts else "no clear options"
-        o = m["odds"]
-        if all(k in o for k in ("1", "X", "2")):
-            mkt_str = f"mkt {o['1']['odds']:.2f}/{o['X']['odds']:.2f}/{o['2']['odds']:.2f}"
-        elif m.get("ext_d"):
-            mkt_str = f"elo/api 1:{_pct(m['ext_d']['1'])}% X:{_pct(m['ext_d']['X'])}% 2:{_pct(m['ext_d']['2'])}%"
-        else:
-            mkt_str = "no market prices"
-        trap_str = f" | TRAP:{t['risk']}" if t["risk"] >= 25 else ""
-        h2h_str = (f" | H2H:{m['h2h']['w']}-{m['h2h']['d']}-{m['h2h']['l']} avgG:{m['h2h']['g']:.1f}"
-                   if m.get("h2h") else " | H2H:n/a")
-        inj_str = "inj:n/a" if not m.get("inj_known") else ""
-        def rate(profile, key):
-            value = profile.get(key)
-            return "-" if value is None else f"{_pct(value)}%"
-
-        home_recent = ",".join(ph.get("last", [])[:5]) or "n/a"
-        away_recent = ",".join(pa.get("last", [])[:5]) or "n/a"
-        block = (f"MATCH {i + 1}: {m['league']} | {m['home']} v {m['away']} ({ko}) | dq:{m['dq']}{trap_str}\n"
-                 f"   xG:{m['lam_h']:.2f}-{m['lam_a']:.2f} | mdl 1:{_pct(m['model_p']['1'])}% X:{_pct(m['model_p']['X'])}% 2:{_pct(m['model_p']['2'])}% | {mkt_str}\n"
-                 f"   Home form:{ph.get('form5', '?')} last:{home_recent} PPG5:{ph.get('ppg5', 0):.1f} PPG10:{ph.get('ppg10', 0):.1f} GF:{ph.get('gf_w', 0):.1f} GA:{ph.get('ga_w', 0):.1f}\n"
-                 f"   Home rates CS:{rate(ph, 'cs')} FTS:{rate(ph, 'fts')} O1.5:{rate(ph, 'o15')} O2.5:{rate(ph, 'o25')} BTTS:{rate(ph, 'btts')} | "
-                 f"Away form:{pa.get('form5', '?')} last:{away_recent} PPG5:{pa.get('ppg5', 0):.1f} PPG10:{pa.get('ppg10', 0):.1f} GF:{pa.get('gf_w', 0):.1f} GA:{pa.get('ga_w', 0):.1f}\n"
-                 f"   Away rates CS:{rate(pa, 'cs')} FTS:{rate(pa, 'fts')} O1.5:{rate(pa, 'o15')} O2.5:{rate(pa, 'o25')} BTTS:{rate(pa, 'btts')}\n"
-                 f"   Match probs BTTS:{_pct(p['BTTS_Y'])}% O1.5:{_pct(p['O1.5'])}% O2.5:{_pct(p['O2.5'])}% U2.5:{_pct(p['U2.5'])}%{h2h_str}{' | ' + inj_str if inj_str else ''}\n"
-                 f"   Options: {opts_str}")
-        lines.append(block)
-    return "\n\n".join(lines)
+            source = {"book": "B", "derived": "D", "est": "E"}.get(l["src"], "X")
+            opts.append(f"{option_i} {l['label']} {l['odds']:.2f} p{_pct(l['p'])}/m{_pct(l['p_model'])}/k{_pct(l['p_mkt'])}{source}")
+        h2h = m.get("h2h")
+        h2h_str = f" h2h{h2h['w']}-{h2h['d']}-{h2h['l']}/{h2h['g']:.1f}" if h2h else ""
+        home_form = f"{ph.get('form5', '?')}({ph.get('ppg5', 0):.1f})"
+        away_form = f"{pa.get('form5', '?')}({pa.get('ppg5', 0):.1f})"
+        model = m["model_p"]
+        lines.append(
+            f"MATCH {i + 1} {m['home']} v {m['away']} dq{m['dq']:.2f} trap{t['risk']} "
+            f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f} mdl{_pct(model['1'])}/{_pct(model['X'])}/{_pct(model['2'])} "
+            f"form{home_form}/{away_form}{h2h_str}\n"
+            f"OPTIONS {'; '.join(opts)}"
+        )
+    return "\n".join(lines)
 
 
 def est_tokens(text, cpt):
