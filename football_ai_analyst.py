@@ -43,32 +43,7 @@ GROQ_MODEL_CONFIG = {
     "openai/gpt-oss-20b": {"max_completion_tokens": 4000, "reasoning_effort": "medium", "supports_reasoning_effort": True},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
-GROQ_PICK_RESPONSE_FORMAT = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "football_match_picks",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "picks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "match": {"type": "string"},
-                            "pick": {"type": "string"},
-                        },
-                        "required": ["match", "pick"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["picks"],
-            "additionalProperties": False,
-        },
-    },
-}
+GROQ_PICK_RESPONSE_FORMAT = {"type": "json_object"}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
 
 # ── Token policy ────────────────────────────────────────────────────────────
@@ -2647,7 +2622,9 @@ AI_MATCH_PROMPT = """Choose {target} picks from the qualified match data below, 
 
 For each match, compare all supplied options using the listed probabilities, model results, form, H2H, data quality, and trap score. Prefer stronger evidence and lower trap scores. Missing bookmaker odds, injuries, or lineups alone do not disqualify a match. Treat estimated odds as estimates, not bookmaker evidence. Never invent a match or option. Copy the match name and option label exactly as shown.
 
-Return only the required JSON object. Include exactly {target} items in "picks"; each item must contain only "match" and "pick". Do not add explanations, odds, probabilities, league names, markdown, or other keys."""
+Return one valid JSON object and nothing else. Use this exact shape:
+{"picks":[{"match":"exact supplied Home v Away","pick":"exact supplied option label"}]}
+Include exactly {target} items. Each item must contain only "match" and "pick". Do not add explanations, odds, probabilities, league names, markdown, or other keys."""
 
 
 def format_matches_for_ai(matches, tz, max_n=15):
@@ -2952,16 +2929,15 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
             if gov:
                 info["waited"] = info.get("waited", 0) + gov.wait_for(reservation, log_fn)
                 handle = gov.charge(reservation)
-            payload = {"model": model, "temperature": 1.0,
+            payload = {"model": model, "temperature": 0.6,
                        "max_completion_tokens": int(cap),
-                       "messages": [{"role": "system", "content": system_prompt},
-                                    {"role": "user", "content": user_prompt}]}
+                       "messages": [{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}]}
             if response_format:
                 payload["response_format"] = GROQ_PICK_RESPONSE_FORMAT
             if cfg.get("supports_reasoning_effort") and eff:
                 payload["reasoning_effort"] = eff if model.startswith("openai/") or eff == "none" else "none"
                 if model.startswith("openai/"):
-                    payload["include_reasoning"] = False
+                    payload["reasoning_format"] = "hidden"
             try:
                 r = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=GROQ_TIMEOUT)
             except Exception as e:
@@ -3025,7 +3001,7 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
                 if handle:
                     gov.settle(handle, 0)
                 if "failed_generation" in r.text.lower() or "failed to validate json" in r.text.lower():
-                    log.append({"model": model, "status": f"HTTP_400 strict JSON generation failed; not retrying: {r.text[:500]}"})
+                    log.append({"model": model, "status": f"HTTP_400 JSON-mode generation failed; not retrying: {r.text[:500]}"})
                     info["status"] = "JSON_GENERATION_FAILED"
                     return None, info
                 log.append({"model": model, "status": f"HTTP_400 retrying plain: {r.text[:100]}"})
@@ -3404,18 +3380,14 @@ def test_groq_connection():
     rows = []
     for model in GROQ_MODELS:
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
-        payload = {"model": model, "max_completion_tokens": 120,
-                 "temperature": 1.0 if model.startswith("openai/gpt-oss") else 0,
-                 "response_format": {"type": "json_schema", "json_schema": {
-                     "name": "groq_connection_test", "strict": True,
-                     "schema": {"type": "object", "properties": {"ok": {"type": "boolean"}},
-                                "required": ["ok"], "additionalProperties": False},
-                 }},
-                   "messages": [{"role": "user", "content": 'Return exactly: {"ok": true}'}]}
+        payload = {"model": model, "max_completion_tokens": 512,
+                 "temperature": 0.6 if model.startswith("openai/gpt-oss") else 0,
+                 "response_format": {"type": "json_object"},
+                   "messages": [{"role": "user", "content": 'Return one JSON object only: {"ok": true}'}]}
         if cfg.get("supports_reasoning_effort"):
             payload["reasoning_effort"] = "low" if model.startswith("openai/") else "none"
             if model.startswith("openai/"):
-                payload["include_reasoning"] = False
+                payload["reasoning_format"] = "hidden"
         try:
             r = requests.post(GROQ_API_URL, headers={"Authorization": f"Bearer {key}"}, json=payload, timeout=30)
             if r.status_code == 200:
