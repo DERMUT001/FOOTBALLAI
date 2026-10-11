@@ -37,10 +37,9 @@ STATE_PATH = os.environ.get("DERAI_FB_STATE", "derai_football_state.json")
 CACHE_PURGE_DAYS = 8
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_TIMEOUT = 90
-GROQ_MODELS = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+GROQ_MODELS = ["qwen/qwen3.8-27b"]
 GROQ_MODEL_CONFIG = {
-    "openai/gpt-oss-120b": {"max_completion_tokens": 8192, "reasoning_effort": "medium", "supports_reasoning_effort": True},
-    "openai/gpt-oss-20b": {"max_completion_tokens": 8192, "reasoning_effort": "medium", "supports_reasoning_effort": True},
+    "qwen/qwen3.8-27b": {"max_completion_tokens": 1024, "reasoning_effort": "none", "supports_reasoning_effort": True},
 }
 GROQ_DEFAULT_CFG = {"max_completion_tokens": 2000, "reasoning_effort": None, "supports_reasoning_effort": False}
 NON_RETRYABLE = {400, 401, 403, 404, 422}
@@ -50,7 +49,7 @@ GROQ_TPM_DEFAULT = 8000
 TPM_MARGIN = 350
 WINDOW_MARGIN = 150
 RUN_TOKEN_CAP_DEFAULT = 45000
-EFFORT_RESERVE = {"low": 2400, "medium": 3500, "high": 5000}
+EFFORT_RESERVE = {"none": 0, "low": 2400, "medium": 3500, "high": 5000}
 OUTPUT_RESERVE = 1500
 TOKEN_SAFETY = 100
 MIN_COMPLETION = 900
@@ -2857,7 +2856,7 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
     models = [m for m in GROQ_MODELS if m not in dead] or GROQ_MODELS[:]
     for model in models:
         cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_CFG)
-        eff = effort or cfg.get("reasoning_effort")
+        eff = cfg.get("reasoning_effort") if cfg.get("supports_reasoning_effort") else effort
         upper = cfg["max_completion_tokens"]
         completion_reserve = _completion_token_reserve(eff, upper)
         p_est = est_tokens(system_prompt + user_prompt, cpt) + 40
@@ -2874,7 +2873,7 @@ def call_groq_for_picks(system_prompt, user_prompt, budget, cpt, effort=None, go
             if gov:
                 info["waited"] = info.get("waited", 0) + gov.wait_for(reservation, log_fn)
                 handle = gov.charge(reservation)
-            payload = {"model": model, "temperature": 0.6,
+            payload = {"model": model, "temperature": 0.2,
                        "max_completion_tokens": int(cap),
                        "messages": [{"role": "user", "content": f"{system_prompt}\n\n{user_prompt}"}]}
             if cfg.get("supports_reasoning_effort") and eff:
@@ -3021,53 +3020,7 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     log(f"🤖 AI Analyst: sending {len(ai_pool)} qualified matches for selection (target: {target} picks)...")
     picks, info = call_groq_for_picks(sys_msg, user_msg, budget, cpt, eff, gov, ceiling, log)
     if not picks and info.get("status") == "TRUNCATED":
-        log("   ⚠️ AI response was truncated; retrying all qualified matches with a shorter option list...")
-        attempts_so_far = list(info.get("attempts", []))
-        retry_system = ("Select the safest supplied options using only the provided evidence. "
-                        f"Return exactly {target} distinct matches as MATCH|OPTION lines. No explanations.")
-        retry_reserve = _completion_token_reserve(eff, max_completion)
-        retry_available = min(ceiling, budget.remaining, gov.limit)
-        retry_sent = False
-        for max_options in (2, 1):
-            retry_selections = [_select_ai_legs(match, max_options) for match in ai_pool]
-            retry_categories = {_pick_market_group(leg["key"])
-                                for selected in retry_selections for _, leg in selected}
-            retry_min_categories = min(target, 3, len(retry_categories))
-            retry_max_per_market = max(1, math.ceil(target * 0.4),
-                                       math.ceil(target / max(1, len(retry_categories))))
-            retry_non_dc_matches = sum(any(leg["key"] not in ("1X", "X2")
-                                           for _, leg in selected) for selected in retry_selections)
-            retry_max_double_chance = min(
-                target, max(math.ceil(target * 0.4), target - retry_non_dc_matches))
-            retry_prompt = (AI_MATCH_PROMPT.replace("{target}", str(target))
-                            .replace("{min_categories}", str(retry_min_categories))
-                            .replace("{max_per_market}", str(retry_max_per_market))
-                            .replace("{max_double_chance}", str(retry_max_double_chance)))
-            retry_data = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool),
-                                               max_options=max_options, include_history=False)
-            retry_user = f"{retry_prompt}\n\nMATCH DATA:\n{retry_data}"
-            retry_estimate = est_tokens(retry_system + retry_user, cpt) + 40
-            if retry_estimate + retry_reserve + TOKEN_SAFETY > retry_available:
-                continue
-            retry_sent = True
-            active_min_categories = retry_min_categories
-            active_max_per_market = retry_max_per_market
-            active_max_double_chance = retry_max_double_chance
-            visible_options = {
-                i: {option_i for option_i, _ in selected}
-                for i, selected in enumerate(retry_selections, 1)
-            }
-            retry_picks, retry_info = call_groq_for_picks(
-                retry_system, retry_user, budget, cpt, eff, gov, ceiling, log)
-            attempts_so_far.extend(retry_info.get("attempts", []))
-            retry_info["attempts"] = attempts_so_far
-            picks, info, user_msg = retry_picks, retry_info, retry_user
-            if picks or info.get("status") != "TRUNCATED":
-                break
-        if not retry_sent:
-            info["attempts"] = attempts_so_far + [{
-                "model": "-", "status": "TRUNCATION_RETRY_SKIPPED (compact prompt exceeds remaining token budget)"
-            }]
+        warnings.append("Groq truncated the response; stopped after one request to avoid spending more tokens without picks.")
     progress(1.0)
     def validate_picks(items):
         valid, groups, rejected, double_chance = [], defaultdict(int), defaultdict(int), 0
@@ -3503,7 +3456,8 @@ def main():
         sims = s2.select_slider("Monte Carlo simulations per match", [10000, 20000, 40000, 80000], 40000)
         w_model = s2.slider("Weight of model vs bookmaker price", 0.2, 0.8, 0.5, 0.05)
         bookmaker = s2.number_input("Preferred bookmaker id", 1, 500, 8)
-        effort = s2.selectbox("AI reasoning effort", ["low", "medium", "high"], index=0)
+        effort = "none"
+        s2.caption("Reasoning is disabled for match selection so completion tokens are available for picks.")
         exclude_minor = s2.checkbox("Exclude youth / women / reserve teams", True)
         exclude_lower = s2.checkbox("Exclude amateur / lower divisions", True)
         force_leagues = {int(x) for x in re.findall(r"\d+", s2.text_input("Always include league ids", ""))}
