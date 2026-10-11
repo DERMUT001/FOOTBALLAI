@@ -14,8 +14,8 @@
 #      If API-Football is unreachable / out of quota the app still analyses from free sources only.
 #   3. PYTHON runs a Monte Carlo per match and blends it with de-vigged bookmaker prices.
 #   4. PYTHON builds a WIDE leg menu (safe legs + clearly-labelled borderline legs) - the AI decides.
-#   5. AI (Groq) reads ALL qualified matches with full evidence and selects the TOP 10 safest,
-#      most valuable individual match predictions. Python NEVER picks matches - only verifies.
+#   5. AI (Groq) reads ALL qualified matches with token-adaptive, market-diverse evidence and
+#      selects the TOP 10 safest, most valuable individual match predictions. Python only verifies.
 #   6. PYTHON only verifies (real data, valid odds). The AI is the sole decision-maker.
 # =============================================================================
 import os, re, json, math, time, html, hashlib, threading, random, traceback, csv, io, unicodedata, difflib
@@ -50,8 +50,8 @@ GROQ_TPM_DEFAULT = 8000
 TPM_MARGIN = 350
 WINDOW_MARGIN = 150
 RUN_TOKEN_CAP_DEFAULT = 45000
-EFFORT_RESERVE = {"low": 4500, "medium": 5500, "high": 6500}
-OUTPUT_RESERVE = 4500
+EFFORT_RESERVE = {"low": 2400, "medium": 3500, "high": 5000}
+OUTPUT_RESERVE = 1500
 TOKEN_SAFETY = 100
 MIN_COMPLETION = 900
 DEFAULT_CHARS_PER_TOKEN = 2.3
@@ -2619,30 +2619,43 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 AI_MATCH_PROMPT = """You are selecting football bets using the supplied evidence. Choose exactly {target} options, safest first, with no more than one option per match. The Python evidence gate already qualified these matches; do not apply another eligibility filter.
 
-Evidence: dq=data quality; trap=trap risk; xG=expected goals; mdl=home/draw/away model probabilities; form=recent result form and PPG; h2h=historical W-D-L/average goals. Each option shows its exact option number and label, decimal odds, p=blended probability, m=model probability, k=market probability, and source B=bookmaker, D=derived, E=model-estimated, X=other. E and X are not bookmaker confirmation. Compare options using this evidence, preferring stronger support and lower trap scores. Missing odds, injuries, or lineups alone do not disqualify a match. Never invent a match or option.
+Evidence: dq=data quality; trap=trap risk; xG=expected goals; mdl=home/draw/away model probabilities; form=recent result form and PPG; h2h=historical W-D-L/average goals. Each option shows its exact option number and label, decimal odds, p=blended probability, m=model probability, k=market probability, and source B=bookmaker, D=derived, E=model-estimated, X=other. E and X are not bookmaker confirmation. The listed options are a market-diverse shortlist of eligible choices, not necessarily every available market; use only supplied match and option numbers. Compare options using this evidence, preferring stronger support and lower trap scores. Missing odds, injuries, or lineups alone do not disqualify a match. Never invent a match or option.
 
 For each selection output only its match number and option number as MATCH|OPTION. Output exactly {target} lines, one per different match. Example: 2|4 means option 4 from match 2. No JSON, words, bullets, headings, or explanations."""
 
 
-def format_matches_for_ai(matches, tz, max_n=15):
-    """Format compact match evidence to reserve request tokens for model reasoning."""
+def format_matches_for_ai(matches, tz, max_n=15, max_options=5, include_history=True):
+    """Format all supplied match evidence compactly enough for the AI token budget."""
     lines = []
     for i, m in enumerate(matches[:max_n]):
         ph, pa = m["ph"], m["pa"]
         t = m["trap"]
         opts = []
-        for option_i, l in enumerate(m.get("legs", []), 1):
+        legs = m.get("legs", [])
+        representatives, seen_groups = [], set()
+        for option_i, leg in enumerate(legs, 1):
+            group = _pick_market_group(leg["key"])
+            if group not in seen_groups:
+                representatives.append((option_i, leg))
+                seen_groups.add(group)
+        selected = representatives[:max_options]
+        if len(selected) < max_options:
+            selected_indices = {option_i for option_i, _ in selected}
+            selected.extend((option_i, leg) for option_i, leg in enumerate(legs, 1)
+                            if option_i not in selected_indices and len(selected) < max_options)
+        selected.sort(key=lambda item: item[0])
+        for option_i, l in selected:
             source = {"book": "B", "derived": "D", "est": "E"}.get(l["src"], "X")
             opts.append(f"{option_i} {l['label']} {l['odds']:.2f} p{_pct(l['p'])}/m{_pct(l['p_model'])}/k{_pct(l['p_mkt'])}{source}")
         h2h = m.get("h2h")
-        h2h_str = f" h2h{h2h['w']}-{h2h['d']}-{h2h['l']}/{h2h['g']:.1f}" if h2h else ""
-        home_form = f"{ph.get('form5', '?')}({ph.get('ppg5', 0):.1f})"
-        away_form = f"{pa.get('form5', '?')}({pa.get('ppg5', 0):.1f})"
+        h2h_str = f" h2h{h2h['w']}-{h2h['d']}-{h2h['l']}/{h2h['g']:.1f}" if include_history and h2h else ""
+        form_str = (f" form{ph.get('form5', '?')}({ph.get('ppg5', 0):.1f})/"
+                    f"{pa.get('form5', '?')}({pa.get('ppg5', 0):.1f})") if include_history else ""
         model = m["model_p"]
         lines.append(
             f"MATCH {i + 1} {m['home']} v {m['away']} dq{m['dq']:.2f} trap{t['risk']} "
             f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f} mdl{_pct(model['1'])}/{_pct(model['X'])}/{_pct(model['2'])} "
-            f"form{home_form}/{away_form}{h2h_str}\n"
+            f"{form_str}{h2h_str}\n"
             f"OPTIONS {'; '.join(opts)}"
         )
     return "\n".join(lines)
@@ -2967,30 +2980,30 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                          for cfg_ in GROQ_MODEL_CONFIG.values())
     completion_reserve = _completion_token_reserve(eff, max_completion)
     ranked = sorted(elig, key=lambda m: -(sum(l["rank"] for l in m.get("legs", [])[:2]) / max(1, len(m.get("legs", [])[:2]))))
-    n_pool = min(len(ranked), 14)
-    while True:
-        ai_pool = ranked[:n_pool]
-        target = min(requested_target, len(ai_pool))
-        available_categories = {_pick_market_group(leg["key"]) for match in ai_pool for leg in match.get("legs", [])}
-        min_categories = min(target, 3, len(available_categories))
-        max_per_market = max(1, math.ceil(target * 0.4), math.ceil(target / max(1, len(available_categories))))
-        non_dc_matches = sum(any(leg["key"] not in ("1X", "X2") for leg in match.get("legs", [])) for match in ai_pool)
-        max_double_chance = min(target, max(math.ceil(target * 0.4), target - non_dc_matches))
-        prompt = (AI_MATCH_PROMPT.replace("{target}", str(target))
-                  .replace("{min_categories}", str(min_categories))
-                  .replace("{max_per_market}", str(max_per_market))
-                  .replace("{max_double_chance}", str(max_double_chance)))
-        data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool))
+    ai_pool = ranked
+    target = min(requested_target, len(ai_pool))
+    available_categories = {_pick_market_group(leg["key"]) for match in ai_pool for leg in match.get("legs", [])}
+    min_categories = min(target, 3, len(available_categories))
+    max_per_market = max(1, math.ceil(target * 0.4), math.ceil(target / max(1, len(available_categories))))
+    non_dc_matches = sum(any(leg["key"] not in ("1X", "X2") for leg in match.get("legs", [])) for match in ai_pool)
+    max_double_chance = min(target, max(math.ceil(target * 0.4), target - non_dc_matches))
+    prompt = (AI_MATCH_PROMPT.replace("{target}", str(target))
+              .replace("{min_categories}", str(min_categories))
+              .replace("{max_per_market}", str(max_per_market))
+              .replace("{max_double_chance}", str(max_double_chance)))
+    available = min(ceiling, budget.remaining, gov.limit)
+    format_options = [(5, True), (4, True), (4, False), (3, False), (2, False), (1, False)]
+    for max_options, include_history in format_options:
+        data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool),
+                                         max_options=max_options, include_history=include_history)
         user_msg = f"{prompt}\n\nMATCH DATA:\n{data_str}"
         p_est = est_tokens(sys_msg + user_msg, cpt) + 40
-        available = min(ceiling, budget.remaining, gov.limit)
-        if p_est + completion_reserve + TOKEN_SAFETY <= available or n_pool == 1:
+        if p_est + completion_reserve + TOKEN_SAFETY <= available:
             break
-        n_pool -= 1
     if p_est + completion_reserve + TOKEN_SAFETY > available:
         status = (f"SKIPPED(prompt~{p_est}, completion reserve={completion_reserve}, "
                   f"available={available}); no request sent")
-        warnings.append("AI prompt plus a safe completion reserve exceeds the token budget; no AI tokens were spent.")
+        warnings.append("All qualified matches exceed the AI token budget, even with compact evidence; no AI tokens were spent.")
         return {"picks": [], "ai_note": "AI token budget is too small for a complete response.",
                 "warnings": warnings, "model": None, "passes": [{"model": "-", "status": status}],
                 "tokens": budget.used, "n_ai": 0}
@@ -3057,10 +3070,12 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     failure_note = None
     if picks and isinstance(picks, list):
         valid_picks, groups, rejected, double_chance = validate_picks(picks)
-        if valid_picks and (len(groups) < min_categories
+        mix_violation = (len(groups) < min_categories
                             or any(n > max_per_market for n in groups.values())
-                            or double_chance > max_double_chance):
-            log(f"   ⚖️ AI market mix needs adjustment ({dict(groups)}); requesting a balanced re-selection...")
+                            or double_chance > max_double_chance)
+        if valid_picks and (mix_violation or len(valid_picks) < target):
+            issue = f"market mix {dict(groups)}" if mix_violation else f"incomplete count {len(valid_picks)}/{target}"
+            log(f"   ⚖️ AI selection needs adjustment ({issue}); requesting a re-selection...")
             correction_system = (sys_msg + f" Select exactly {target} picks across at least {min_categories} market categories, "
                                 f"with no more than {max_per_market} picks per category and {max_double_chance} double-chance picks.")
             correction_user = (user_msg + f"\n\nPORTFOLIO BALANCE CORRECTION: Your previous selection violated the portfolio rules. "
@@ -3072,24 +3087,14 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
             revised_info["attempts"] = info.get("attempts", []) + revised_info.get("attempts", [])
             if revised and isinstance(revised, list):
                 revised_valid, revised_groups, revised_rejected, revised_double_chance = validate_picks(revised)
-                if revised_valid:
+                if len(revised_valid) >= len(valid_picks):
                     valid_picks, groups, rejected, double_chance, info = (
                         revised_valid, revised_groups, revised_rejected, revised_double_chance, revised_info)
             if (len(groups) < min_categories or any(n > max_per_market for n in groups.values())
                     or double_chance > max_double_chance):
                 warnings.append("AI did not fully meet the requested market mix after re-selection.")
-                balanced, used, balanced_dc = [], defaultdict(int), 0
-                for pick in valid_picks:
-                    match = next(m for m in ai_pool if f"{m['home']} v {m['away']}" == pick["match"])
-                    leg = next(l for l in match["legs"] if l["label"] == pick["pick"])
-                    group = _pick_market_group(leg["key"])
-                    is_double_chance = leg["key"] in ("1X", "X2")
-                    if (used[group] < max_per_market
-                            and (not is_double_chance or balanced_dc < max_double_chance)):
-                        balanced.append(pick)
-                        used[group] += 1
-                        balanced_dc += int(is_double_chance)
-                valid_picks, groups = balanced, used
+            if len(valid_picks) < target:
+                warnings.append(f"AI returned {len(valid_picks)} of {target} requested picks; keeping every verified pick.")
         if valid_picks:
             log(f"   ✅ AI returned {len(valid_picks)} picks using {info.get('model', 'unknown')}")
             return {"picks": valid_picks, "ai_note": f"AI selected {len(valid_picks)} picks ({budget.used} tokens used)",
@@ -3245,9 +3250,9 @@ def run_full_analysis(cfg, log, progress):
     cur = dict(cfg)
     elig = run_gate(cur)
     relaxed = []
-    ai_pool_target = min(len(matches), 14, max(MIN_PICKS, int(cfg.get("target_picks", TARGET_PICKS))))
+    ai_pool_target = min(len(matches), max(MIN_PICKS, int(cfg.get("target_picks", TARGET_PICKS))))
     if cfg.get("auto_relax", True) and len(elig) < ai_pool_target:
-        for label, upd in (("minimum data quality lowered to 0.40", {"min_dq": min(cfg["min_dq"], 0.40)}),
+        for label, upd in (("minimum data quality lowered to 0.25", {"min_dq": min(cfg["min_dq"], 0.25)}),
                            ("matches with only borderline legs allowed", {"allow_b_only": True}),
                            ("model-estimated odds allowed", {"allow_est": True})):
             if len(elig) >= ai_pool_target:
@@ -3448,7 +3453,8 @@ def main():
         if st.button("🧪 Test AI connection"):
             for mdl, status in test_groq_connection():
                 st.write(f"`{mdl}` → {status}")
-        min_dq = st.slider("Minimum data-quality score", 0.3, 0.9, 0.5, 0.05)
+        min_dq = st.slider("Minimum data-quality score", 0.25, 0.9, 0.5, 0.05)
+        st.caption("Scores range from 0 to 1; 0.25 allows matches with at least 25% of the tracked evidence.")
         allow_est = st.checkbox("Allow model-estimated odds when no bookmaker prices", True)
         st.markdown("##### 🤖 AI settings")
         a1, a2 = st.columns(2)
