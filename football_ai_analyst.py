@@ -2624,6 +2624,22 @@ Evidence: dq=data quality; trap=trap risk; xG=expected goals; mdl=home/draw/away
 For each selection output only its match number and option number as MATCH|OPTION. Output exactly {target} lines, one per different match. Example: 2|4 means option 4 from match 2. No JSON, words, bullets, headings, or explanations."""
 
 
+def _select_ai_legs(match, max_options):
+    legs = match.get("legs", [])
+    representatives, seen_groups = [], set()
+    for option_i, leg in enumerate(legs, 1):
+        group = _pick_market_group(leg["key"])
+        if group not in seen_groups:
+            representatives.append((option_i, leg))
+            seen_groups.add(group)
+    selected = representatives[:max_options]
+    if len(selected) < max_options:
+        selected_indices = {option_i for option_i, _ in selected}
+        selected.extend((option_i, leg) for option_i, leg in enumerate(legs, 1)
+                        if option_i not in selected_indices and len(selected) < max_options)
+    return sorted(selected, key=lambda item: item[0])
+
+
 def format_matches_for_ai(matches, tz, max_n=15, max_options=5, include_history=True):
     """Format all supplied match evidence compactly enough for the AI token budget."""
     lines = []
@@ -2631,19 +2647,7 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=5, include_history=
         ph, pa = m["ph"], m["pa"]
         t = m["trap"]
         opts = []
-        legs = m.get("legs", [])
-        representatives, seen_groups = [], set()
-        for option_i, leg in enumerate(legs, 1):
-            group = _pick_market_group(leg["key"])
-            if group not in seen_groups:
-                representatives.append((option_i, leg))
-                seen_groups.add(group)
-        selected = representatives[:max_options]
-        if len(selected) < max_options:
-            selected_indices = {option_i for option_i, _ in selected}
-            selected.extend((option_i, leg) for option_i, leg in enumerate(legs, 1)
-                            if option_i not in selected_indices and len(selected) < max_options)
-        selected.sort(key=lambda item: item[0])
+        selected = _select_ai_legs(m, max_options)
         for option_i, l in selected:
             source = {"book": "B", "derived": "D", "est": "E"}.get(l["src"], "X")
             opts.append(f"{option_i} {l['label']} {l['odds']:.2f} p{_pct(l['p'])}/m{_pct(l['p_model'])}/k{_pct(l['p_mkt'])}{source}")
@@ -2987,12 +2991,15 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     max_per_market = max(1, math.ceil(target * 0.4), math.ceil(target / max(1, len(available_categories))))
     non_dc_matches = sum(any(leg["key"] not in ("1X", "X2") for leg in match.get("legs", [])) for match in ai_pool)
     max_double_chance = min(target, max(math.ceil(target * 0.4), target - non_dc_matches))
+    active_min_categories = min_categories
+    active_max_per_market = max_per_market
+    active_max_double_chance = max_double_chance
     prompt = (AI_MATCH_PROMPT.replace("{target}", str(target))
               .replace("{min_categories}", str(min_categories))
               .replace("{max_per_market}", str(max_per_market))
               .replace("{max_double_chance}", str(max_double_chance)))
     available = min(ceiling, budget.remaining, gov.limit)
-    format_options = [(5, True), (4, True), (4, False), (3, False), (2, False), (1, False)]
+    format_options = [(3, False), (2, False), (1, False)]
     for max_options, include_history in format_options:
         data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool),
                                          max_options=max_options, include_history=include_history)
@@ -3007,8 +3014,60 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
         return {"picks": [], "ai_note": "AI token budget is too small for a complete response.",
                 "warnings": warnings, "model": None, "passes": [{"model": "-", "status": status}],
                 "tokens": budget.used, "n_ai": 0}
+    visible_options = {
+        i: {option_i for option_i, _ in _select_ai_legs(match, max_options)}
+        for i, match in enumerate(ai_pool, 1)
+    }
     log(f"🤖 AI Analyst: sending {len(ai_pool)} qualified matches for selection (target: {target} picks)...")
     picks, info = call_groq_for_picks(sys_msg, user_msg, budget, cpt, eff, gov, ceiling, log)
+    if not picks and info.get("status") == "TRUNCATED":
+        log("   ⚠️ AI response was truncated; retrying all qualified matches with a shorter option list...")
+        attempts_so_far = list(info.get("attempts", []))
+        retry_system = ("Select the safest supplied options using only the provided evidence. "
+                        f"Return exactly {target} distinct matches as MATCH|OPTION lines. No explanations.")
+        retry_reserve = _completion_token_reserve(eff, max_completion)
+        retry_available = min(ceiling, budget.remaining, gov.limit)
+        retry_sent = False
+        for max_options in (2, 1):
+            retry_selections = [_select_ai_legs(match, max_options) for match in ai_pool]
+            retry_categories = {_pick_market_group(leg["key"])
+                                for selected in retry_selections for _, leg in selected}
+            retry_min_categories = min(target, 3, len(retry_categories))
+            retry_max_per_market = max(1, math.ceil(target * 0.4),
+                                       math.ceil(target / max(1, len(retry_categories))))
+            retry_non_dc_matches = sum(any(leg["key"] not in ("1X", "X2")
+                                           for _, leg in selected) for selected in retry_selections)
+            retry_max_double_chance = min(
+                target, max(math.ceil(target * 0.4), target - retry_non_dc_matches))
+            retry_prompt = (AI_MATCH_PROMPT.replace("{target}", str(target))
+                            .replace("{min_categories}", str(retry_min_categories))
+                            .replace("{max_per_market}", str(retry_max_per_market))
+                            .replace("{max_double_chance}", str(retry_max_double_chance)))
+            retry_data = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool),
+                                               max_options=max_options, include_history=False)
+            retry_user = f"{retry_prompt}\n\nMATCH DATA:\n{retry_data}"
+            retry_estimate = est_tokens(retry_system + retry_user, cpt) + 40
+            if retry_estimate + retry_reserve + TOKEN_SAFETY > retry_available:
+                continue
+            retry_sent = True
+            active_min_categories = retry_min_categories
+            active_max_per_market = retry_max_per_market
+            active_max_double_chance = retry_max_double_chance
+            visible_options = {
+                i: {option_i for option_i, _ in selected}
+                for i, selected in enumerate(retry_selections, 1)
+            }
+            retry_picks, retry_info = call_groq_for_picks(
+                retry_system, retry_user, budget, cpt, eff, gov, ceiling, log)
+            attempts_so_far.extend(retry_info.get("attempts", []))
+            retry_info["attempts"] = attempts_so_far
+            picks, info, user_msg = retry_picks, retry_info, retry_user
+            if picks or info.get("status") != "TRUNCATED":
+                break
+        if not retry_sent:
+            info["attempts"] = attempts_so_far + [{
+                "model": "-", "status": "TRUNCATION_RETRY_SKIPPED (compact prompt exceeds remaining token budget)"
+            }]
     progress(1.0)
     def validate_picks(items):
         valid, groups, rejected, double_chance = [], defaultdict(int), defaultdict(int), 0
@@ -3020,7 +3079,8 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
             if "match_index" in item and "option_index" in item:
                 match_i, option_i = item["match_index"], item["option_index"]
                 if (type(match_i) is not int or type(option_i) is not int
-                        or not 1 <= match_i <= len(ai_pool)):
+                        or not 1 <= match_i <= len(ai_pool)
+                        or option_i not in visible_options.get(match_i, set())):
                     rejected["invalid match or option index"] += 1
                     continue
                 match = ai_pool[match_i - 1]
@@ -3070,17 +3130,17 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     failure_note = None
     if picks and isinstance(picks, list):
         valid_picks, groups, rejected, double_chance = validate_picks(picks)
-        mix_violation = (len(groups) < min_categories
-                            or any(n > max_per_market for n in groups.values())
-                            or double_chance > max_double_chance)
+        mix_violation = (len(groups) < active_min_categories
+                         or any(n > active_max_per_market for n in groups.values())
+                         or double_chance > active_max_double_chance)
         if valid_picks and (mix_violation or len(valid_picks) < target):
             issue = f"market mix {dict(groups)}" if mix_violation else f"incomplete count {len(valid_picks)}/{target}"
             log(f"   ⚖️ AI selection needs adjustment ({issue}); requesting a re-selection...")
-            correction_system = (sys_msg + f" Select exactly {target} picks across at least {min_categories} market categories, "
-                                f"with no more than {max_per_market} picks per category and {max_double_chance} double-chance picks.")
+            correction_system = (sys_msg + f" Select exactly {target} picks across at least {active_min_categories} market categories, "
+                                f"with no more than {active_max_per_market} picks per category and {active_max_double_chance} double-chance picks.")
             correction_user = (user_msg + f"\n\nPORTFOLIO BALANCE CORRECTION: Your previous selection violated the portfolio rules. "
-                              f"Return a fresh set of exactly {target} picks from at least {min_categories} different market categories, "
-                              f"with at most {max_per_market} picks in each category and {max_double_chance} double-chance picks. "
+                              f"Return a fresh set of exactly {target} picks from at least {active_min_categories} different market categories, "
+                              f"with at most {active_max_per_market} picks in each category and {active_max_double_chance} double-chance picks. "
                               "Use qualified non-double-chance options where available. Preserve one pick per match and follow all evidence rules. "
                               "Output only MATCH|OPTION lines, one per pick.")
             revised, revised_info = call_groq_for_picks(correction_system, correction_user, budget, cpt, eff, gov, ceiling, log)
@@ -3090,8 +3150,8 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                 if len(revised_valid) >= len(valid_picks):
                     valid_picks, groups, rejected, double_chance, info = (
                         revised_valid, revised_groups, revised_rejected, revised_double_chance, revised_info)
-            if (len(groups) < min_categories or any(n > max_per_market for n in groups.values())
-                    or double_chance > max_double_chance):
+            if (len(groups) < active_min_categories or any(n > active_max_per_market for n in groups.values())
+                    or double_chance > active_max_double_chance):
                 warnings.append("AI did not fully meet the requested market mix after re-selection.")
             if len(valid_picks) < target:
                 warnings.append(f"AI returned {len(valid_picks)} of {target} requested picks; keeping every verified pick.")
