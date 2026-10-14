@@ -739,6 +739,7 @@ class FreeData:
         self._espn: Dict[Any, list] = {}
         self._tsdb_history: Optional[list] = None
         self._elo: Optional[list] = None
+        self._elo_as_of: Optional[str] = None
         self._intl: Optional[list] = None
         self._intl_names_c: Optional[list] = None
         self._intl_elo_c: Optional[tuple] = None
@@ -1290,17 +1291,32 @@ class FreeData:
         with self.lock:
             if self._elo is not None:
                 return self._elo
-        txt = self._get(f"https://api.clubelo.com/{date_str}", ttl=12 * 3600, timeout=20)
-        tab = []
-        try:
-            for r in csv.DictReader(io.StringIO(txt or "")):
-                e = _f(r.get("Elo"))
-                if r.get("Club") and e:
-                    tab.append((r["Club"], e))
-        except Exception:
-            tab = []
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+        first_date = min(target, datetime.now(timezone.utc).date())
+        tab, as_of = [], None
+        for days_back in range(8):
+            snapshot_date = (first_date - timedelta(days=days_back)).isoformat()
+            txt = self._get(f"https://api.clubelo.com/{snapshot_date}", ttl=12 * 3600, timeout=10)
+            if not txt:
+                error = self.fails[-1].lower() if self.fails else ""
+                if any(marker in error for marker in ("timed out", "timeout", "connection", "network", "ssl")):
+                    break
+                continue
+            try:
+                snapshot = []
+                for row in csv.DictReader(io.StringIO(txt)):
+                    rating = _f(row.get("Elo"))
+                    club = (row.get("Club") or "").strip()
+                    if club and rating:
+                        snapshot.append((club, rating))
+            except (csv.Error, TypeError, ValueError):
+                continue
+            if snapshot:
+                tab, as_of = snapshot, snapshot_date
+                break
         with self.lock:
             self._elo = tab
+            self._elo_as_of = as_of
         return tab
 
     def elo_for(self, home, away, league_id, country, date_str):
@@ -1316,7 +1332,11 @@ class FreeData:
         if not nh or not na or nh == na:
             return None
         e = dict(tab)
-        return {"h": e[nh], "a": e[na], "p": elo_probs(e[nh], e[na])}
+        as_of = self._elo_as_of
+        stale_days = max(0, (datetime.strptime(date_str, "%Y-%m-%d").date()
+                             - datetime.strptime(as_of, "%Y-%m-%d").date()).days) if as_of else None
+        return {"h": e[nh], "a": e[na], "p": elo_probs(e[nh], e[na]),
+                "as_of": as_of, "stale_days": stale_days}
 
     def result_for(self, home, away, league_id, date_str):
         if league_id not in FD_ALL:
@@ -2166,7 +2186,16 @@ def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exc
         log("   ℹ️ Optional live odds enrichment is off (set ODDS_API_KEY to enable The Odds API).")
     with ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(lambda lid: free.rows_for(lid, date_str), {c["league_id"] for c in cand}))
-    free.elo_table(date_str)
+    elo_supported = any(
+        m["league_id"] in ELO_LEAGUE_IDS or (m.get("country") or "").lower() in ELO_COUNTRIES
+        or m["league_id"] in FD_MAIN
+        for m in cand
+    )
+    elo_available = bool(free.elo_table(date_str)) if elo_supported else False
+    if elo_supported and not elo_available:
+        out["warnings"].append(
+            "ClubElo returned no usable rating snapshot for the fixture date or the preceding seven days. "
+            "Fixtures without recent team history cannot use the ClubElo fallback until that source is reachable.")
     tsdb_history_loaded = False
     for i, m in enumerate(cand):
         fh = free.team_form(m["home"], m["league_id"], date_str)
@@ -2202,7 +2231,15 @@ def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exc
         has_market_prices = any(key in odds for key in ("1", "X", "2", "O2.5"))
         if not has_team_form and not (elo and has_market_prices):
             if not has_team_form and not elo:
-                reason = "no free-source team history or ClubElo rating"
+                supported = (m["league_id"] in ELO_LEAGUE_IDS
+                             or (m.get("country") or "").lower() in ELO_COUNTRIES
+                             or m["league_id"] in FD_MAIN)
+                if not supported:
+                    reason = "no free-source team history or supported club-rating source"
+                elif not elo_available:
+                    reason = "no free-source team history; ClubElo rating data was unavailable"
+                else:
+                    reason = "no free-source team history; one or both clubs were not matched in ClubElo"
             elif not has_team_form:
                 reason = "ClubElo fallback requires bookmaker prices, which were unavailable"
             else:
@@ -2216,6 +2253,10 @@ def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exc
             out["warnings"].append(
                 f"{m['league']}: {m['home']} v {m['away']} is using ClubElo plus bookmaker prices because "
                 "free-source club history is unavailable.")
+            if elo and elo.get("stale_days"):
+                out["warnings"].append(
+                    f"ClubElo ratings for {m['home']} v {m['away']} are as of {elo['as_of']}, "
+                    f"{elo['stale_days']} days before the fixture.")
         if not odds and not cfg.get("allow_est"):
             out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}",
                                     "reason": "no bookmaker odds from any source; model estimates are disabled"})
@@ -2821,6 +2862,9 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=6, include_history=
                   if xg_n >= 3 and ph.get("xg_for") is not None and pa.get("xg_for") is not None else "")
         scoring_str = (f" gf/ga{ph.get('gf_w', 0):.1f}/{ph.get('ga_w', 0):.1f}-"
                        f"{pa.get('gf_w', 0):.1f}/{pa.get('ga_w', 0):.1f}") if include_history else ""
+        elo = m.get("elo")
+        elo_age_str = (f" Elo-asof{elo['as_of']}({elo['stale_days']}d)"
+                       if elo and elo.get("as_of") and elo.get("stale_days") else "")
         table_str = ""
         if m.get("st_h") and m.get("st_a"):
             table_str = f" table{m['st_h'].get('rank', '?')}/{m['st_a'].get('rank', '?')}"
@@ -2839,7 +2883,7 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=6, include_history=
             f"dq{m['dq']:.2f} risk{t['risk']}[{trap_str}] "
             f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f}(total{m['exp_goals']:.1f}) "
             f"mdl{_pct(model['1'])}/{_pct(model['X'])}/{_pct(model['2'])} "
-            f"{goals}{xg_str}{scoring_str}{table_str}{availability_str}{form_str}{h2h_str} "
+            f"{goals}{xg_str}{scoring_str}{elo_age_str}{table_str}{availability_str}{form_str}{h2h_str} "
             f"blend1X/X2={_pct(market['1X'])}/{_pct(market['X2'])}\n"
             f"OPTIONS {'; '.join(opts)}"
         )
