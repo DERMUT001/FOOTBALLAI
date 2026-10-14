@@ -7,8 +7,8 @@
 #   2. FREE SOURCES (zero API-Football calls) are used FIRST for what they cover and as a FALLBACK
 #      for whatever API-Football cannot provide:
 #        - football-data.co.uk : results, corners, shots, bookmaker prices, H2H, table
-#        - TheSportsDB         : broad daily fixtures + recent team results (best effort)
-#        - ESPN public JSON    : fixtures + bookmaker prices (best effort)
+#        - TheSportsDB         : broad fixtures + recent team results (best effort)
+#        - ESPN public JSON    : fixtures, bookmaker prices + club schedules (best effort)
 #        - ClubElo             : team strength (independent 1X2 opinion for European clubs)
 #        - The Odds API        : optional live bookmaker prices when ODDS_API_KEY is configured
 #      ESPN also supplements missing UEFA club fixtures when API-Football is available.
@@ -24,6 +24,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone, date as date_cls
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
@@ -494,6 +495,11 @@ ESPN_SLUG = {39: "eng.1", 40: "eng.2", 41: "eng.3", 42: "eng.4", 140: "esp.1", 1
              113: "swe.1", 197: "gre.1", 235: "rus.1", 169: "chn.1", 45: "eng.fa", 143: "esp.copa_del_rey",
              137: "ita.coppa_italia", 81: "ger.dfb_pokal", 13: "conmebol.libertadores"}
 ESPN_SLUG_TO_LID = {v: k for k, v in ESPN_SLUG.items()}
+ESPN_DOMESTIC_SLUG = {"eng": "eng.1", "esp": "esp.1", "ita": "ita.1", "ger": "ger.1", "fra": "fra.1",
+                      "ned": "ned.1", "por": "por.1", "bel": "bel.1", "tur": "tur.1", "gre": "gre.1",
+                      "sco": "sco.1", "aut": "aut.1", "sui": "sui.1", "den": "den.1", "nor": "nor.1",
+                      "swe": "swe.1", "ukr": "ukr.1", "pol": "pol.1", "cro": "cro.1", "cze": "cze.1",
+                      "rou": "rou.1", "srb": "srb.1", "slo": "slo.1"}
 ODDS_API_SPORT_BY_LID = {
     39: "soccer_epl", 40: "soccer_efl_champ", 140: "soccer_spain_la_liga",
     141: "soccer_spain_segunda_division", 135: "soccer_italy_serie_a", 136: "soccer_italy_serie_b",
@@ -737,6 +743,10 @@ class FreeData:
         self._rows: Dict[Any, list] = {}
         self._fix_main: Optional[list] = None
         self._espn: Dict[Any, list] = {}
+        self._espn_team_slugs: Dict[str, Dict[str, str]] = {}
+        self._espn_team_forms: Dict[Any, Optional[dict]] = {}
+        self._tsdb_team_ids: Dict[str, Optional[str]] = {}
+        self._tsdb_team_forms: Dict[Any, Optional[dict]] = {}
         self._tsdb_history: Optional[list] = None
         self._elo: Optional[list] = None
         self._elo_as_of: Optional[str] = None
@@ -1098,6 +1108,8 @@ class FreeData:
                 if ts is None:
                     continue
                 out.append({"home": (hm.get("team") or {}).get("displayName") or "", "away": (aw.get("team") or {}).get("displayName") or "",
+                            "home_espn_id": str((hm.get("team") or {}).get("id") or ""),
+                            "away_espn_id": str((aw.get("team") or {}).get("id") or ""),
                             "ts": ts, "state": state, "odds": espn_parse_odds(comp.get("odds")),
                             "hg": _int_or_none(hm.get("score")), "ag": _int_or_none(aw.get("score"))})
         except Exception as e:
@@ -1105,6 +1117,177 @@ class FreeData:
         with self.lock:
             self._espn[key] = out
         return out
+
+    def espn_team_slug(self, league_slug, team_id):
+        with self.lock:
+            teams = self._espn_team_slugs.get(league_slug)
+        if teams is None:
+            txt = self._get(
+                f"https://site.api.espn.com/apis/site/v2/sports/soccer/{league_slug}/teams?limit=1000",
+                ttl=12 * 3600, timeout=12)
+            teams = {}
+            try:
+                data = json.loads(txt) if txt else {}
+                for sport in data.get("sports") or []:
+                    for league in sport.get("leagues") or []:
+                        for item in league.get("teams") or []:
+                            team = item.get("team") or {}
+                            if team.get("id") and team.get("slug"):
+                                teams[str(team["id"])] = str(team["slug"])
+            except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                self.fails.append(f"ESPN team list {league_slug}: {str(e)[:50]}")
+            with self.lock:
+                self._espn_team_slugs[league_slug] = teams
+        return teams.get(str(team_id))
+
+    def espn_team_form(self, name, team_id, league_id, date_str, n=10):
+        if not self.enabled or not team_id:
+            return None
+        key = (str(team_id), league_id, date_str, n)
+        with self.lock:
+            if key in self._espn_team_forms:
+                return self._espn_team_forms[key]
+        competition_slug = ESPN_SLUG.get(league_id)
+        slugs = [competition_slug] if competition_slug else []
+        if competition_slug in {"uefa.champions", "uefa.europa", "uefa.europa.conf"}:
+            team_slug = self.espn_team_slug(competition_slug, team_id)
+            country_code = team_slug.split(".", 1)[0] if team_slug and "." in team_slug else ""
+            domestic_slug = ESPN_DOMESTIC_SLUG.get(country_code)
+            if domestic_slug and domestic_slug not in slugs:
+                slugs.insert(0, domestic_slug)
+
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+        season_year = target.year if target.month >= 7 else target.year - 1
+        games_by_id = {}
+        for slug in slugs:
+            for requested_season in (season_year, season_year - 1):
+                url = (f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/teams/"
+                       f"{team_id}/schedule?season={requested_season}")
+                txt = self._get(url, ttl=12 * 3600, timeout=12)
+                try:
+                    events = (json.loads(txt) if txt else {}).get("events") or []
+                except (json.JSONDecodeError, TypeError) as e:
+                    self.fails.append(f"ESPN team schedule {slug}: {str(e)[:50]}")
+                    continue
+                for event in events:
+                    comp = (event.get("competitions") or [{}])[0]
+                    competitors = comp.get("competitors") or []
+                    home = next((item for item in competitors if item.get("homeAway") == "home"), None)
+                    away = next((item for item in competitors if item.get("homeAway") == "away"), None)
+                    if not home or not away:
+                        continue
+                    score_h = _int_or_none((home.get("score") or {}).get("value")
+                                           if isinstance(home.get("score"), dict) else home.get("score"))
+                    score_a = _int_or_none((away.get("score") or {}).get("value")
+                                           if isinstance(away.get("score"), dict) else away.get("score"))
+                    timestamp = self._tsdb_timestamp({"strTimestamp": event.get("date")})
+                    status = ((((comp.get("status") or event.get("status") or {}).get("type") or {}).get("state")
+                               or "").lower())
+                    if (not timestamp or timestamp >= int(datetime.combine(target, datetime.min.time(),
+                                                                              timezone.utc).timestamp())
+                            or score_h is None or score_a is None or status not in {"post", "completed"}):
+                        continue
+                    home_team = home.get("team") or {}
+                    away_team = away.get("team") or {}
+                    is_home = str((home.get("team") or {}).get("id") or "") == str(team_id)
+                    if not is_home and str((away.get("team") or {}).get("id") or "") != str(team_id):
+                        continue
+                    gf, ga = (score_h, score_a) if is_home else (score_a, score_h)
+                    event_id = str(event.get("id") or comp.get("id") or timestamp)
+                    games_by_id[event_id] = {
+                        "id": f"espn:{event_id}", "ts": timestamp, "home": is_home, "gf": gf, "ga": ga,
+                        "res": "W" if gf > ga else "D" if gf == ga else "L",
+                        "opp": (away_team if is_home else home_team).get("displayName") or "",
+                        "league_id": league_id,
+                    }
+                if len(games_by_id) >= 4:
+                    break
+            if len(games_by_id) >= 4:
+                break
+
+        games = sorted(games_by_id.values(), key=lambda game: game["ts"], reverse=True)[:n]
+        result = None
+        if len(games) >= 4:
+            latest = datetime.fromtimestamp(games[0]["ts"], timezone.utc).date()
+            hs = {"cor_for": None, "cor_against": None, "cor_n": 0, "sot": None,
+                  "xg_for": None, "xg_against": None, "players": {}}
+            result = {"results": games, "hs": hs, "name": name,
+                      "stale_days": (target - latest).days, "espn": True}
+        with self.lock:
+            self._espn_team_forms[key] = result
+        return result
+
+    def tsdb_last_team_form(self, name, team_id, date_str, n=10):
+        if not self.enabled:
+            return None
+        cache_key = (str(team_id or ""), norm_team(name), date_str, n)
+        with self.lock:
+            if cache_key in self._tsdb_team_forms:
+                return self._tsdb_team_forms[cache_key]
+        resolved_id = str(team_id or "")
+        if not resolved_id:
+            key = norm_team(name)
+            with self.lock:
+                found = key in self._tsdb_team_ids
+                resolved_id = self._tsdb_team_ids.get(key) or ""
+            if not found:
+                txt = self._get(f"{TSDB_BASE}/123/searchteams.php?t={quote(name)}", ttl=7 * 86400, timeout=12)
+                try:
+                    teams = (json.loads(txt) if txt else {}).get("teams") or []
+                    names = []
+                    team_by_name = {}
+                    for team in teams:
+                        variants = [team.get("strTeam"), team.get("strTeamAlternate")]
+                        for variant in variants:
+                            if variant:
+                                names.append(str(variant))
+                                team_by_name[str(variant)] = team
+                    matched = best_match(name, names)
+                    resolved_id = str((team_by_name.get(matched) or {}).get("idTeam") or "") if matched else ""
+                except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                    self.fails.append(f"TheSportsDB team search {name}: {str(e)[:50]}")
+                with self.lock:
+                    self._tsdb_team_ids[key] = resolved_id or None
+        result = None
+        if resolved_id:
+            txt = self._get(f"{TSDB_BASE}/123/eventslast.php?id={quote(resolved_id)}",
+                            ttl=3 * 3600, timeout=12)
+            try:
+                events = (json.loads(txt) if txt else {}).get("results") or []
+                target = datetime.strptime(date_str, "%Y-%m-%d").date()
+                target_ts = int(datetime.combine(target, datetime.min.time(), timezone.utc).timestamp())
+                games = []
+                for event in events:
+                    timestamp = self._tsdb_timestamp(event)
+                    hg = _int_or_none(event.get("intHomeScore"))
+                    ag = _int_or_none(event.get("intAwayScore"))
+                    status = str(event.get("strStatus") or "").strip().lower()
+                    home_id, away_id = str(event.get("idHomeTeam") or ""), str(event.get("idAwayTeam") or "")
+                    if (not timestamp or timestamp >= target_ts or hg is None or ag is None
+                            or status not in {"ft", "aet", "pen", "finished", "match finished"}
+                            or resolved_id not in (home_id, away_id)):
+                        continue
+                    is_home = resolved_id == home_id
+                    gf, ga = (hg, ag) if is_home else (ag, hg)
+                    games.append({
+                        "id": f"tsdb:{event.get('idEvent') or timestamp}", "ts": timestamp, "home": is_home,
+                        "gf": gf, "ga": ga, "res": "W" if gf > ga else "D" if gf == ga else "L",
+                        "opp": str((event.get("strAwayTeam") if is_home else event.get("strHomeTeam")) or ""),
+                        "league_id": -1,
+                    })
+                games.sort(key=lambda game: game["ts"], reverse=True)
+                games = games[:n]
+                if games:
+                    latest = datetime.fromtimestamp(games[0]["ts"], timezone.utc).date()
+                    hs = {"cor_for": None, "cor_against": None, "cor_n": 0, "sot": None,
+                          "xg_for": None, "xg_against": None, "players": {}}
+                    result = {"results": games, "hs": hs, "name": name,
+                              "stale_days": (target - latest).days, "tsdb_last": True}
+            except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                self.fails.append(f"TheSportsDB recent matches {name}: {str(e)[:50]}")
+        with self.lock:
+            self._tsdb_team_forms[cache_key] = result
+        return result
 
     def tsdb_events(self, date_str):
         try:
@@ -1384,7 +1567,9 @@ class FreeData:
                     if e["state"] not in ("pre", "") or datetime.fromtimestamp(e["ts"], zi).date() != tgt:
                         continue
                     if not any(o["league_id"] == lid and o["ts"] == e["ts"] and _sim(norm_team(o["home"]), norm_team(e["home"])) >= 0.9 for o in out):
-                        out.append({"league_id": lid, "home": e["home"], "away": e["away"], "ts": e["ts"], "odds": e["odds"], "src": "espn"})
+                        out.append({"league_id": lid, "home": e["home"], "away": e["away"], "ts": e["ts"],
+                                    "odds": e["odds"], "src": "espn",
+                                    "home_espn_id": e.get("home_espn_id"), "away_espn_id": e.get("away_espn_id")})
         london = ZoneInfo("Europe/London")
         for lid in list(FD_MAIN) + list(FD_NEW):
             for r in self.fd_fixtures(lid, date_str):
@@ -2160,7 +2345,8 @@ def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exc
                          "league": name, "country": country, "season": None, "round": None,
                          "home_id": _syn_id("T:" + e["home"]), "home": e["home"], "away_id": _syn_id("T:" + e["away"]), "away": e["away"],
                          "cat": league_category(lid, country), "free_odds": e["odds"], "free_src": e["src"],
-                         "tsdb_home_id": e.get("tsdb_home_id"), "tsdb_away_id": e.get("tsdb_away_id")})
+                         "tsdb_home_id": e.get("tsdb_home_id"), "tsdb_away_id": e.get("tsdb_away_id"),
+                         "home_espn_id": e.get("home_espn_id"), "away_espn_id": e.get("away_espn_id")})
     out["cat_counts"] = {k: int(v) for k, v in pd.Series([f["cat"] for f in fixtures]).value_counts().items()} if fixtures else {}
     source_counts = defaultdict(int)
     for fixture in fx:
@@ -2194,9 +2380,24 @@ def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exc
     elo_available = bool(free.elo_table(date_str)) if elo_supported else False
     if elo_supported and not elo_available:
         out["warnings"].append(
-            "ClubElo returned no usable rating snapshot for the fixture date or the preceding seven days. "
-            "Fixtures without recent team history cannot use the ClubElo fallback until that source is reachable.")
+            "ClubElo returned no usable rating snapshot for the fixture date or preceding seven days. "
+            "Fixtures without enough recent history from football-data.co.uk, ESPN, or TheSportsDB still need "
+            "a usable rating source and bookmaker prices.")
     tsdb_history_loaded = False
+
+    def add_tsdb_last(current, team_name, tsdb_id):
+        if current and len(current["results"]) >= 4:
+            return current
+        last_form = free.tsdb_last_team_form(team_name, tsdb_id, date_str)
+        if not last_form:
+            return current
+        combined = {game["ts"]: game for game in (current or {}).get("results", [])}
+        combined.update({game["ts"]: game for game in last_form["results"]})
+        results = sorted(combined.values(), key=lambda game: game["ts"], reverse=True)[:10]
+        last_played = datetime.fromtimestamp(results[0]["ts"], timezone.utc).date()
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+        return dict(last_form, results=results, stale_days=(target - last_played).days)
+
     for i, m in enumerate(cand):
         fh = free.team_form(m["home"], m["league_id"], date_str)
         fa = free.team_form(m["away"], m["league_id"], date_str)
@@ -2212,6 +2413,18 @@ def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exc
             tsdb_form = free.tsdb_team_form(m["away"], m.get("tsdb_away_id"), date_str)
             if tsdb_form:
                 fa = tsdb_form
+        if not fh or len(fh["results"]) < 4:
+            espn_form = free.espn_team_form(m["home"], m.get("home_espn_id"), m["league_id"], date_str)
+            if espn_form:
+                fh = espn_form
+        if not fa or len(fa["results"]) < 4:
+            espn_form = free.espn_team_form(m["away"], m.get("away_espn_id"), m["league_id"], date_str)
+            if espn_form:
+                fa = espn_form
+        if not fh or len(fh["results"]) < 4:
+            fh = add_tsdb_last(fh, m["home"], m.get("tsdb_home_id"))
+        if not fa or len(fa["results"]) < 4:
+            fa = add_tsdb_last(fa, m["away"], m.get("tsdb_away_id"))
 
         elo = free.elo_for(m["home"], m["away"], m["league_id"], m["country"], date_str)
         odds = dict(m.get("free_odds") or {})
@@ -2266,7 +2479,9 @@ def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exc
         c = {"pred": None, "rh": fh["results"] if fh else [], "ra": fa["results"] if fa else [],
              "h2h": free.h2h(m["home"], m["away"], m["league_id"], date_str), "elo": elo,
              "free_tags": (["form"] if has_team_form else ["elo-form-fallback"])
-             + (["tsdb-form"] if (fh and fh.get("tsdb")) or (fa and fa.get("tsdb")) else []),
+             + (["tsdb-form"] if (fh and fh.get("tsdb")) or (fa and fa.get("tsdb")) else [])
+             + (["espn-form"] if (fh and fh.get("espn")) or (fa and fa.get("espn")) else [])
+             + (["tsdb-last-form"] if (fh and fh.get("tsdb_last")) or (fa and fa.get("tsdb_last")) else []),
              "fh": fh, "fa": fa}
         if c["h2h"]:
             c["free_tags"].append("h2h")
@@ -2862,6 +3077,12 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=6, include_history=
                   if xg_n >= 3 and ph.get("xg_for") is not None and pa.get("xg_for") is not None else "")
         scoring_str = (f" gf/ga{ph.get('gf_w', 0):.1f}/{ph.get('ga_w', 0):.1f}-"
                        f"{pa.get('gf_w', 0):.1f}/{pa.get('ga_w', 0):.1f}") if include_history else ""
+        form_sources = []
+        if "espn-form" in m.get("free_tags", []):
+            form_sources.append("ESPN")
+        if "tsdb-form" in m.get("free_tags", []) or "tsdb-last-form" in m.get("free_tags", []):
+            form_sources.append("TheSportsDB")
+        form_source_str = f" formSrc={'+'.join(form_sources)}" if form_sources else ""
         elo = m.get("elo")
         elo_age_str = (f" Elo-asof{elo['as_of']}({elo['stale_days']}d)"
                        if elo and elo.get("as_of") and elo.get("stale_days") else "")
@@ -2883,7 +3104,7 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=6, include_history=
             f"dq{m['dq']:.2f} risk{t['risk']}[{trap_str}] "
             f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f}(total{m['exp_goals']:.1f}) "
             f"mdl{_pct(model['1'])}/{_pct(model['X'])}/{_pct(model['2'])} "
-            f"{goals}{xg_str}{scoring_str}{elo_age_str}{table_str}{availability_str}{form_str}{h2h_str} "
+            f"{goals}{xg_str}{scoring_str}{form_source_str}{elo_age_str}{table_str}{availability_str}{form_str}{h2h_str} "
             f"blend1X/X2={_pct(market['1X'])}/{_pct(market['X2'])}\n"
             f"OPTIONS {'; '.join(opts)}"
         )
