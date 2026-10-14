@@ -2183,9 +2183,8 @@ def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exc
             tsdb_form = free.tsdb_team_form(m["away"], m.get("tsdb_away_id"), date_str)
             if tsdb_form:
                 fa = tsdb_form
-        if not fh or not fa or len(fh["results"]) < 4 or len(fa["results"]) < 4:
-            out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no free-source team history"})
-            continue
+
+        elo = free.elo_for(m["home"], m["away"], m["league_id"], m["country"], date_str)
         odds = dict(m.get("free_odds") or {})
         odds_sources = [m["free_src"]] if odds and m.get("free_src") else []
         api_odds = odds_api.get((m["league_id"], norm_team(m["home"]), norm_team(m["away"])), {})
@@ -2199,22 +2198,42 @@ def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exc
                 for market, quote in o2.items():
                     odds.setdefault(market, quote)
                 odds_sources.append(s2)
+        has_team_form = bool(fh and fa and len(fh["results"]) >= 4 and len(fa["results"]) >= 4)
+        has_market_prices = any(key in odds for key in ("1", "X", "2", "O2.5"))
+        if not has_team_form and not (elo and has_market_prices):
+            if not has_team_form and not elo:
+                reason = "no free-source team history or ClubElo rating"
+            elif not has_team_form:
+                reason = "ClubElo fallback requires bookmaker prices, which were unavailable"
+            else:
+                reason = "no bookmaker odds from any source; model estimates are disabled"
+            out["excluded"].append({
+                "league": m["league"], "match": f"{m['home']} v {m['away']}",
+                "reason": reason,
+            })
+            continue
+        if not has_team_form:
+            out["warnings"].append(
+                f"{m['league']}: {m['home']} v {m['away']} is using ClubElo plus bookmaker prices because "
+                "free-source club history is unavailable.")
         if not odds and not cfg.get("allow_est"):
             out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}",
                                     "reason": "no bookmaker odds from any source; model estimates are disabled"})
             continue
         osrc = "+".join(dict.fromkeys(source for source in odds_sources if source)) or (
             "model-estimated (no bookmaker odds)" if cfg.get("allow_est") else "unknown")
-        c = {"pred": None, "rh": fh["results"], "ra": fa["results"], "h2h": free.h2h(m["home"], m["away"], m["league_id"], date_str),
-             "elo": free.elo_for(m["home"], m["away"], m["league_id"], m["country"], date_str),
-             "free_tags": ["form"] + (["tsdb-form"] if fh.get("tsdb") or fa.get("tsdb") else []), "fh": fh, "fa": fa}
+        c = {"pred": None, "rh": fh["results"] if fh else [], "ra": fa["results"] if fa else [],
+             "h2h": free.h2h(m["home"], m["away"], m["league_id"], date_str), "elo": elo,
+             "free_tags": (["form"] if has_team_form else ["elo-form-fallback"])
+             + (["tsdb-form"] if (fh and fh.get("tsdb")) or (fa and fa.get("tsdb")) else []),
+             "fh": fh, "fa": fa}
         if c["h2h"]:
             c["free_tags"].append("h2h")
         if c["elo"]:
             c["free_tags"].append("elo")
         if odds:
             c["free_tags"].append("odds:" + str(osrc))
-        rec = make_record(m, c, fh["hs"], fa["hs"], None, None, None, None, odds, "free:" + str(osrc),
+        rec = make_record(m, c, fh["hs"] if fh else {}, fa["hs"] if fa else {}, None, None, None, None, odds, "free:" + str(osrc),
                           free.standing(m["home"], m["league_id"], date_str), free.standing(m["away"], m["league_id"], date_str), False, cfg)
         out["matches"].append(rec)
         for t in c["free_tags"]:
@@ -2295,6 +2314,8 @@ def supplement_uefa_fixtures(api, free, cfg, out, log):
     by_id = {m["id"]: m for m in combined}
     selected = [by_id[m["id"]] for m in selected_rows]
     out["matches"] = selected
+    out["cat_counts"] = {cat: sum(1 for m in selected if m["cat"] == cat)
+                         for cat in ("TOP", "INTL", "MID", "LOW") if any(m["cat"] == cat for m in selected)}
     supplement_ids = {m["id"] for m in supplement["matches"]}
     added = sum(1 for m in selected if m["id"] in supplement_ids)
     out["shortlisted_fixtures"] = len(selected)
@@ -2814,7 +2835,8 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=6, include_history=
         availability_str = f" avail{','.join(availability)}" if availability else ""
         trap_str = ",".join(t.get("reasons", [])) or "none"
         lines.append(
-            f"MATCH {i + 1} {m['home']} v {m['away']} dq{m['dq']:.2f} risk{t['risk']}[{trap_str}] "
+            f"MATCH {i + 1} {m['home']} v {m['away']} basis{BASIS_TAG.get(m.get('basis'), '?')} "
+            f"dq{m['dq']:.2f} risk{t['risk']}[{trap_str}] "
             f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f}(total{m['exp_goals']:.1f}) "
             f"mdl{_pct(model['1'])}/{_pct(model['X'])}/{_pct(model['2'])} "
             f"{goals}{xg_str}{scoring_str}{table_str}{availability_str}{form_str}{h2h_str} "
