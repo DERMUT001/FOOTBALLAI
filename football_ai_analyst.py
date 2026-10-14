@@ -11,6 +11,7 @@
 #        - ESPN public JSON    : fixtures + bookmaker prices (best effort)
 #        - ClubElo             : team strength (independent 1X2 opinion for European clubs)
 #        - The Odds API        : optional live bookmaker prices when ODDS_API_KEY is configured
+#      ESPN also supplements missing UEFA club fixtures when API-Football is available.
 #      If API-Football is unreachable / out of quota the app still analyses from free sources only.
 #   3. PYTHON runs a Monte Carlo per match and blends it with de-vigged bookmaker prices.
 #   4. PYTHON builds a WIDE leg menu (safe legs + clearly-labelled borderline legs) - the AI decides.
@@ -1997,27 +1998,53 @@ def fetch_coverage(api, ttl_s=86400):
 
 def shortlist_matches(cands, max_n, force_leagues, quota=None):
     quota = quota or CAT_QUOTA
-    buckets = defaultdict(list)
-    forced = [c for c in cands if c["league_id"] in force_leagues]
+    if max_n <= 0:
+        return []
+
+    league_order = {lid: rank for rank, lid in enumerate(
+        [2, 3, 39, 140, 135, 78, 61, 848, *[lid for lid in TOP_LEAGUES if lid not in {2, 3, 39, 140, 135, 78, 61, 848}]])}
+    forced = [c for c in cands if c["league_id"] in force_leagues][:max_n]
+    forced_ids = {id(c) for c in forced}
+    grouped = defaultdict(lambda: defaultdict(list))
     for c in cands:
-        if c not in forced:
-            buckets[c["cat"]].append(c)
-    order = list(TOP_LEAGUES)
-    for cat, lst in buckets.items():
-        lst.sort(key=lambda c: (0 if c.get("cov_odds") else 1 if c.get("cov_odds") is None else 2,
-                                order.index(c["league_id"]) if c["league_id"] in order else 99, c["ts"]))
-    picked = list(forced)[:max_n]
+        if id(c) not in forced_ids:
+            grouped[c["cat"]][c["league_id"]].append(c)
+
+    def interleave_leagues(leagues):
+        for matches in leagues.values():
+            matches.sort(key=lambda c: (0 if c.get("cov_odds") else 1 if c.get("cov_odds") is None else 2,
+                                        c["ts"]))
+        ordered_leagues = sorted(
+            leagues,
+            key=lambda lid: (league_order.get(lid, len(league_order)), min(c["ts"] for c in leagues[lid]), lid))
+        return [leagues[lid][round_i] for round_i in range(max(map(len, leagues.values()), default=0))
+                for lid in ordered_leagues if round_i < len(leagues[lid])]
+
+    by_category = {cat: interleave_leagues(leagues) for cat, leagues in grouped.items()}
+    picked = list(forced)
+    used = defaultdict(int)
     for cat in ("TOP", "INTL", "MID", "LOW"):
-        take = math.ceil(quota[cat] * max_n)
-        for c in buckets[cat][:take]:
-            if len(picked) < max_n:
-                picked.append(c)
-    for cat in ("TOP", "MID", "INTL", "LOW"):
-        for c in buckets[cat]:
+        take = math.ceil(quota.get(cat, 0) * max_n)
+        for c in by_category.get(cat, [])[:take]:
             if len(picked) >= max_n:
                 break
-            if c not in picked:
-                picked.append(c)
+            picked.append(c)
+            used[cat] += 1
+
+    # Fill spare capacity across categories in rounds so a busy top league cannot
+    # crowd out all international or medium-league fixtures.
+    while len(picked) < max_n:
+        added = False
+        for cat in ("TOP", "INTL", "MID", "LOW"):
+            options = by_category.get(cat, [])
+            if used[cat] < len(options):
+                picked.append(options[used[cat]])
+                used[cat] += 1
+                added = True
+                if len(picked) >= max_n:
+                    break
+        if not added:
+            break
     return picked
 
 
@@ -2086,16 +2113,26 @@ def make_record(m, c, hs_h, hs_a, inj_h, inj_a, lu_h, lu_a, odds, odds_src, st_h
     return rec
 
 
-def collect_free_only(api, free, cfg, log, progress, out):
+def collect_free_only(api, free, cfg, log, progress, out, fixture_feed=None, exclude_matches=None,
+                      fetch_live_odds=True):
     date_str, tz = cfg["date"], cfg["tz"]
     free.target_date = date_str
     free.force_refresh = bool(cfg.get("force"))
     log("🆓 Free-only mode: collecting fixtures and history from ESPN, football-data.co.uk, and TheSportsDB...")
-    fx = free.free_fixtures(date_str, tz)
+    fx = fixture_feed if fixture_feed is not None else free.free_fixtures(date_str, tz)
+    exclude_matches = exclude_matches or []
     out["raw_count"] = len(fx)
     fixtures = []
     for e in fx:
         lid = e["league_id"]
+        if any(
+            known["league_id"] == lid
+            and abs(known["ts"] - e["ts"]) <= 3 * 3600
+            and _sim(norm_team(known["home"]), norm_team(e["home"])) >= 0.9
+            and _sim(norm_team(known["away"]), norm_team(e["away"])) >= 0.9
+            for known in exclude_matches
+        ):
+            continue
         name, country = (e.get("league"), e.get("country")) if e.get("league") else LEAGUE_INFO.get(lid, (f"League {lid}", ""))
         if cfg["exclude_minor"] and (TEAM_EXCLUDE_RE.search(e["home"]) or TEAM_EXCLUDE_RE.search(e["away"])):
             continue
@@ -2121,11 +2158,11 @@ def collect_free_only(api, free, cfg, log, progress, out):
     out["warnings"].append("API-Football returned nothing usable, so this analysis used whatever free-source data was available "
                            "(football-data.co.uk, ESPN, TheSportsDB, and ClubElo when reachable). "
                            "Injuries, lineups and API predictions are unavailable - those matches show 'inj n/a' and the AI is told to demand extra margin.")
-    odds_api = free.fetch_odds_api(cand)
-    if get_secret("ODDS_API_KEY", "").strip():
+    odds_api = free.fetch_odds_api(cand) if fetch_live_odds else {}
+    if fetch_live_odds and get_secret("ODDS_API_KEY", "").strip():
         log(f"   📊 The Odds API: queried {free.odds_requests} league feeds"
             + (f"; {free.odds_remaining} requests remaining" if free.odds_remaining is not None else ""))
-    else:
+    elif fetch_live_odds:
         log("   ℹ️ Optional live odds enrichment is off (set ODDS_API_KEY to enable The Odds API).")
     with ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(lambda lid: free.rows_for(lid, date_str), {c["league_id"] for c in cand}))
@@ -2199,6 +2236,74 @@ def collect_free_only(api, free, cfg, log, progress, out):
     return out
 
 
+def supplement_uefa_fixtures(api, free, cfg, out, log):
+    if not free.enabled:
+        return
+    tz = cfg["tz"]
+    target = datetime.strptime(cfg["date"], "%Y-%m-%d").date()
+    zi = ZoneInfo(tz)
+    feed, seen = [], set()
+    for league_id in (2, 3, 848):
+        slug = ESPN_SLUG.get(league_id)
+        if not slug:
+            continue
+        for day in (target, target - timedelta(days=1)):
+            for event in free.espn_events(slug, day.isoformat()):
+                if (not event.get("home") or not event.get("away") or not event.get("ts")
+                        or event.get("state") not in ("pre", "")
+                        or datetime.fromtimestamp(event["ts"], zi).date() != target):
+                    continue
+                key = (league_id, norm_team(event["home"]), norm_team(event["away"]))
+                if key in seen or any(
+                    known["league_id"] == league_id
+                    and abs(known["ts"] - event["ts"]) <= 3 * 3600
+                    and _sim(norm_team(known["home"]), key[1]) >= 0.9
+                    and _sim(norm_team(known["away"]), key[2]) >= 0.9
+                    for known in out["matches"]
+                ):
+                    continue
+                seen.add(key)
+                league, country = LEAGUE_INFO[league_id]
+                feed.append({**event, "league_id": league_id, "league": league, "country": country,
+                             "src": "espn"})
+
+    if not feed:
+        return
+    supplement_limit = max(1, min(6, math.ceil(cfg["max_matches"] * 0.2)))
+    api_fixture_count = out["raw_count"]
+    out["eligible_fixtures"] = out.get("eligible_fixtures", api_fixture_count) + len(feed)
+    out["raw_count"] = api_fixture_count + len(feed)
+    source_counts = out.setdefault("fixture_sources", {})
+    source_counts["api-football"] = api_fixture_count
+    source_counts["espn-supplement"] = len(feed)
+    supplement = {"warnings": [], "matches": [], "excluded": [], "raw_count": 0,
+                  "cat_counts": {}, "plan": None}
+    log(f"🌍 Checking ESPN for missing UEFA club fixtures: found {len(feed)} supplementary fixtures.")
+    collect_free_only(api, free, dict(cfg, max_matches=supplement_limit), log, lambda _: None, supplement,
+                      fixture_feed=feed, exclude_matches=out["matches"], fetch_live_odds=False)
+    out["excluded"].extend(supplement["excluded"])
+    if not supplement["matches"]:
+        out["warnings"].append(
+            f"ESPN found {len(feed)} UEFA fixtures missing from the API fixture list, but free-source team history "
+            "was insufficient to analyse them.")
+        return
+
+    combined = out["matches"] + supplement["matches"]
+    shortlist_input = [dict(m, cov_odds=bool(m.get("odds"))) for m in combined]
+    selected_rows = shortlist_matches(shortlist_input, cfg["max_matches"], cfg["force_leagues"],
+                                      BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
+    by_id = {m["id"]: m for m in combined}
+    selected = [by_id[m["id"]] for m in selected_rows]
+    out["matches"] = selected
+    supplement_ids = {m["id"] for m in supplement["matches"]}
+    added = sum(1 for m in selected if m["id"] in supplement_ids)
+    out["shortlisted_fixtures"] = len(selected)
+    if added:
+        log(f"🌍 Added {added} UEFA matches from ESPN and rebalanced the slate across competitions.")
+    elif supplement["matches"]:
+        log("🌍 Free UEFA fixtures were analysed, but the existing slate's league balance kept them outside the final limit.")
+
+
 def collect_day(api, cfg, log, progress, free=None):
     free = free or FreeData(enabled=False)
     free.force_refresh = bool(cfg.get("force"))
@@ -2270,6 +2375,8 @@ def collect_day(api, cfg, log, progress, free=None):
                 return out2
         out["reason"] = "No eligible upcoming fixtures were returned by the API. " + ("; ".join(api.error_summary()[:3]) if api.errors else "")
         return out
+    out["eligible_fixtures"] = len(fixtures)
+    out["fixture_sources"] = {"api-football": len(fx_raw)}
     progress(0.06)
     pool_n = min(len(fixtures), int(cfg["max_matches"] * 1.6) + 4)
     cand = shortlist_matches(fixtures, pool_n, cfg["force_leagues"], BREADTH_QUOTA.get(cfg.get("breadth", "Balanced")))
@@ -2406,6 +2513,9 @@ def collect_day(api, cfg, log, progress, free=None):
         out["reason"] = ("No bookmaker odds were returned for any candidate match. "
                          + ("API said: " + " | ".join(e[:170] for e in errs) + ". " if errs else "No error was reported. ")
                          + "Enable 'model-estimated odds' in Settings to continue with approximate prices.")
+        supplement_uefa_fixtures(api, free, cfg, out, log)
+        if out["matches"]:
+            out["reason"] = None
         return out
     free_first = free.enabled
     per = ((0.6 if (free_first and cfg.get("save_calls", True)) else 1.0) + (2.0 if caps["history"] else 0.0)
@@ -2432,6 +2542,7 @@ def collect_day(api, cfg, log, progress, free=None):
         if not caps["history"]:
             keep.sort(key=lambda c: 0 if c["id"] in free_cov else 1)
     sl = keep[:n]
+    out["shortlisted_fixtures"] = len(sl)
     why_cut = (f"beyond your 'max matches' setting ({cfg['max_matches']})" if n >= min(cfg["max_matches"], len(keep)) else "beyond API call budget")
     for c in keep[n:]:
         out["excluded"].append({"league": c["league"], "match": f"{c['home']} v {c['away']}", "reason": why_cut})
@@ -2524,6 +2635,9 @@ def collect_day(api, cfg, log, progress, free=None):
                          "Stopped early to protect your daily API quota.")
         for m in sl:
             out["excluded"].append({"league": m["league"], "match": f"{m['home']} v {m['away']}", "reason": "no team-specific data retrievable"})
+        supplement_uefa_fixtures(api, free, cfg, out, log)
+        if out["matches"]:
+            out["reason"] = None
         return out
     rest = [m for m in sl if m["id"] not in core]
     done = len(core)
@@ -2627,6 +2741,7 @@ def collect_day(api, cfg, log, progress, free=None):
         free.used["espn-recent-results"] = free.intl_extra
     if free.enabled and free.used:
         log(f"🆓 Free sources helped: {dict(free.used)} | ≈{free.saved_calls} API calls avoided")
+    supplement_uefa_fixtures(api, free, cfg, out, log)
     progress(0.90)
     return out
 
