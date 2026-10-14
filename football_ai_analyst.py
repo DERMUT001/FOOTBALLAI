@@ -1481,7 +1481,7 @@ def team_history_stats(team_id, ids, hist):
                 xg_a.append(x2)
     avg = lambda l: float(np.mean(l)) if l else None
     return {"cor_for": avg(cor_f), "cor_against": avg(cor_a), "cor_n": len(cor_f), "sot": avg(sot),
-            "xg_for": avg(xg_f), "xg_against": avg(xg_a), "players": dict(players)}
+            "xg_for": avg(xg_f), "xg_against": avg(xg_a), "xg_n": len(xg_f), "players": dict(players)}
 
 
 def build_profile(team_id, results, hs, injuries, lineup):
@@ -1501,7 +1501,7 @@ def build_profile(team_id, results, hs, injuries, lineup):
             "btts": float(((gf > 0) & (ga > 0)).mean()),
             "form_score": float(100 * (w * pts / 3).sum() / w.sum()),
         })
-    prof.update({k: hs.get(k) for k in ("cor_for", "cor_against", "cor_n", "sot", "xg_for", "xg_against")})
+    prof.update({k: hs.get(k) for k in ("cor_for", "cor_against", "cor_n", "sot", "xg_for", "xg_against", "xg_n")})
     pl = hs.get("players") or {}
     ngames = max([e["games"] for e in pl.values()] + [1])
     rows = []
@@ -1591,6 +1591,14 @@ def estimate_lambdas(pred, ph, pa, elo=None):
         lh, la, m, basis = tot * share, tot * (1 - share), 4, "elo"
     else:
         lh, la, m, basis = prior_h, prior_a, 0, "prior"
+    xg_n = min(ph.get("xg_n") or 0, pa.get("xg_n") or 0)
+    if xg_n >= 3 and all(v is not None for v in (ph.get("xg_for"), ph.get("xg_against"),
+                                                   pa.get("xg_for"), pa.get("xg_against"))):
+        xg_h = (ph["xg_for"] + pa["xg_against"]) / 2
+        xg_a = (pa["xg_for"] + ph["xg_against"]) / 2
+        xg_weight = min(0.35, 0.07 * xg_n)
+        lh = (1 - xg_weight) * lh + xg_weight * xg_h
+        la = (1 - xg_weight) * la + xg_weight * xg_a
     if elo and elo.get("intl") and basis != "elo" and lh + la > 0:
         e = elo["p"]
         es = 0.5 + 0.8 * ((e["1"] + e["X"] / 2) - 0.5)
@@ -1784,7 +1792,7 @@ def data_quality(m):
     dq += 0.20 if m.get("pred") else (0.10 if m.get("elo") else 0)
     dq += 0.20 if m["ph"].get("n", 0) >= 5 and m["pa"].get("n", 0) >= 5 else (0.10 if m["ph"].get("n", 0) >= 3 else 0)
     dq += 0.10 if m.get("h2h") else 0
-    dq += 0.10 if m.get("corner_n", 0) >= 3 else 0
+    dq += 0.10 if min(m["ph"].get("xg_n") or 0, m["pa"].get("xg_n") or 0) >= 3 else 0
     dq += 0.05 if m.get("inj_known") else 0
     dq += 0.05 if (m["ph"].get("lineup") and m["pa"].get("lineup")) else 0
     dq += 0.05 if m.get("st_h") else 0
@@ -1840,6 +1848,16 @@ def _pick_market_group(key):
     return "other"
 
 
+def _selection_market_allowed(key):
+    if key in {"1", "X", "2", "1X", "X2", "12", "BTTS_Y", "BTTS_N"}:
+        return True
+    match = re.fullmatch(r"(HT_)?[OU]([\d.]+)", key)
+    if not match:
+        return False
+    prefix, line = match.groups()
+    return float(line) in (HT_LINES if prefix else GOAL_LINES)
+
+
 def market_fair_prob(key, om):
     d = _devig(om, ["1", "X", "2"])
     if d:
@@ -1861,13 +1879,13 @@ def market_fair_prob(key, om):
     return min(0.97, 1 / (om[key]["odds"] * 1.06))
 
 
-def build_legs(m, allow_est=False, corners_ok_min=3, wide=True):
+def build_legs(m, allow_est=False, wide=True):
     fav, risk = m["trap"]["fav"], m["trap"]["risk"]
     dq = m["dq"]
     ext = m.get("ext_d") or m.get("api_1x2")
     legs = []
     for key, p in m["p"].items():
-        if key.startswith("C_") and m.get("corner_n", 0) < corners_ok_min:
+        if not _selection_market_allowed(key):
             continue
         o = m["odds"].get(key)
         src = "book"
@@ -2618,7 +2636,7 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 AI_MATCH_PROMPT = """You are selecting football bets using the supplied evidence. Choose exactly {target} options, safest first, with no more than one option per match. The Python evidence gate already qualified these matches; do not apply another eligibility filter.
 
-Evidence: dq=data quality; trap=trap risk; xG=expected goals; mdl=home/draw/away model probabilities; form=recent result form and PPG; h2h=historical W-D-L/average goals. Each option shows its exact option number and label, decimal odds, p=blended probability, m=model probability, k=market probability, and source B=bookmaker, D=derived, E=model-estimated, X=other. E and X are not bookmaker confirmation. The listed options are a market-diverse shortlist of eligible choices, not necessarily every available market; use only supplied match and option numbers. Compare options using this evidence, preferring stronger support and lower trap scores. Missing odds, injuries, or lineups alone do not disqualify a match. Never invent a match or option.
+Evidence includes data quality, model and market probabilities, expected goals, recent form/scoring, available xG, table position, injuries, lineup rotation, head-to-head, and risk signals. Treat trap risk as a warning about uncertainty or disagreement, never as proof of bookmaker intent. Each option shows its exact option number and label, decimal odds, p=blended probability, m=model probability, k=market probability, and source B=bookmaker, D=derived, E=model-estimated, X=other. E and X are not bookmaker confirmation. The listed options are a market-diverse shortlist of eligible choices, not necessarily every available market; use only supplied match and option numbers. Prioritize full-time and first-half goal totals, 1X/X2, and other supplied result/BTTS options; corners and team totals are intentionally excluded. Compare model and market support, data reliability, price value, and the stated risk signals rather than treating any single factor or bookmaker price as decisive. Missing odds, injuries, or lineups alone do not disqualify a match. Never invent a match or option.
 
 For each selection output only its match number and option number as MATCH|OPTION. Output exactly {target} lines, one per different match. Example: 2|4 means option 4 from match 2. No JSON, words, bullets, headings, or explanations."""
 
@@ -2627,6 +2645,8 @@ def _select_ai_legs(match, max_options):
     legs = match.get("legs", [])
     representatives, seen_groups = [], set()
     for option_i, leg in enumerate(legs, 1):
+        if not _selection_market_allowed(leg["key"]):
+            continue
         group = _pick_market_group(leg["key"])
         if group not in seen_groups:
             representatives.append((option_i, leg))
@@ -2635,11 +2655,12 @@ def _select_ai_legs(match, max_options):
     if len(selected) < max_options:
         selected_indices = {option_i for option_i, _ in selected}
         selected.extend((option_i, leg) for option_i, leg in enumerate(legs, 1)
-                        if option_i not in selected_indices and len(selected) < max_options)
+                        if option_i not in selected_indices and _selection_market_allowed(leg["key"])
+                        and len(selected) < max_options)
     return sorted(selected, key=lambda item: item[0])
 
 
-def format_matches_for_ai(matches, tz, max_n=15, max_options=5, include_history=True):
+def format_matches_for_ai(matches, tz, max_n=15, max_options=6, include_history=True):
     """Format all supplied match evidence compactly enough for the AI token budget."""
     lines = []
     for i, m in enumerate(matches[:max_n]):
@@ -2655,10 +2676,34 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=5, include_history=
         form_str = (f" form{ph.get('form5', '?')}({ph.get('ppg5', 0):.1f})/"
                     f"{pa.get('form5', '?')}({pa.get('ppg5', 0):.1f})") if include_history else ""
         model = m["model_p"]
+        market = m["p"]
+        goals = (f" goalsM O1.5/O2.5/O3.5={_pct(model['O1.5'])}/{_pct(model['O2.5'])}/"
+                 f"{_pct(model['O3.5'])} HT-O0.5={_pct(model['HT_O0.5'])} "
+                 f"BTTS={_pct(model['BTTS_Y'])}")
+        xg_n = min(ph.get("xg_n") or 0, pa.get("xg_n") or 0)
+        xg_str = (f" xGform{ph['xg_for']:.2f}-{pa['xg_for']:.2f}(n{xg_n})"
+                  if xg_n >= 3 and ph.get("xg_for") is not None and pa.get("xg_for") is not None else "")
+        scoring_str = (f" gf/ga{ph.get('gf_w', 0):.1f}/{ph.get('ga_w', 0):.1f}-"
+                       f"{pa.get('gf_w', 0):.1f}/{pa.get('ga_w', 0):.1f}") if include_history else ""
+        table_str = ""
+        if m.get("st_h") and m.get("st_a"):
+            table_str = f" table{m['st_h'].get('rank', '?')}/{m['st_a'].get('rank', '?')}"
+        availability = []
+        for side_name, profile in (("H", ph), ("A", pa)):
+            key_out = sum(1 for injury in profile.get("inj", [])
+                          if injury.get("key") and injury.get("type") == "Missing Fixture")
+            if key_out:
+                availability.append(f"{side_name}key-out{key_out}")
+            if (profile.get("lineup") or {}).get("rotation"):
+                availability.append(f"{side_name}rotation")
+        availability_str = f" avail{','.join(availability)}" if availability else ""
+        trap_str = ",".join(t.get("reasons", [])) or "none"
         lines.append(
-            f"MATCH {i + 1} {m['home']} v {m['away']} dq{m['dq']:.2f} trap{t['risk']} "
-            f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f} mdl{_pct(model['1'])}/{_pct(model['X'])}/{_pct(model['2'])} "
-            f"{form_str}{h2h_str}\n"
+            f"MATCH {i + 1} {m['home']} v {m['away']} dq{m['dq']:.2f} risk{t['risk']}[{trap_str}] "
+            f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f}(total{m['exp_goals']:.1f}) "
+            f"mdl{_pct(model['1'])}/{_pct(model['X'])}/{_pct(model['2'])} "
+            f"{goals}{xg_str}{scoring_str}{table_str}{availability_str}{form_str}{h2h_str} "
+            f"blend1X/X2={_pct(market['1X'])}/{_pct(market['X2'])}\n"
             f"OPTIONS {'; '.join(opts)}"
         )
     return "\n".join(lines)
@@ -2985,10 +3030,12 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     ranked = sorted(elig, key=lambda m: -(sum(l["rank"] for l in m.get("legs", [])[:2]) / max(1, len(m.get("legs", [])[:2]))))
     ai_pool = ranked
     target = min(requested_target, len(ai_pool))
-    available_categories = {_pick_market_group(leg["key"]) for match in ai_pool for leg in match.get("legs", [])}
+    available_categories = {_pick_market_group(leg["key"]) for match in ai_pool for leg in match.get("legs", [])
+                            if _selection_market_allowed(leg["key"])}
     min_categories = min(target, 3, len(available_categories))
     max_per_market = max(1, math.ceil(target * 0.4), math.ceil(target / max(1, len(available_categories))))
-    non_dc_matches = sum(any(leg["key"] not in ("1X", "X2") for leg in match.get("legs", [])) for match in ai_pool)
+    non_dc_matches = sum(any(_selection_market_allowed(leg["key"]) and leg["key"] not in ("1X", "X2")
+                             for leg in match.get("legs", [])) for match in ai_pool)
     max_double_chance = min(target, max(math.ceil(target * 0.4), target - non_dc_matches))
     active_min_categories = min_categories
     active_max_per_market = max_per_market
@@ -2998,7 +3045,7 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
               .replace("{max_per_market}", str(max_per_market))
               .replace("{max_double_chance}", str(max_double_chance)))
     available = min(ceiling, budget.remaining, gov.limit)
-    format_options = [(3, False), (2, False), (1, False)]
+    format_options = [(6, True), (4, True), (2, False), (1, False)]
     for max_options, include_history in format_options:
         data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool),
                                          max_options=max_options, include_history=include_history)
@@ -3055,7 +3102,8 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                     rejected["unmatched or ambiguous match"] += 1
                     continue
                 leg = _resolve_leg(pk_, match)
-            if not leg or (leg["key"] == "12" and min(leg["p"], leg["p_model"], leg["p_mkt"]) < 0.80):
+            if (not leg or not _selection_market_allowed(leg["key"])
+                    or (leg["key"] == "12" and min(leg["p"], leg["p_model"], leg["p_mkt"]) < 0.80)):
                 rejected["unmatched or unsafe market"] += 1
                 continue
             match_name = f"{match['home']} v {match['away']}"
@@ -3413,9 +3461,12 @@ def render_results(res, tz):
                          "KO": datetime.fromtimestamp(m["ts"], ZoneInfo(tz)).strftime("%H:%M"),
                          "Data": BASIS_TAG.get(m["basis"]), "Odds source": m.get("odds_src", ""),
                          "xG": f"{m['lam_h']:.2f}-{m['lam_a']:.2f}",
+                         "Total xG": f"{m['exp_goals']:.2f}",
                          "1": _pct(p["1"]), "X": _pct(p["X"]), "2": _pct(p["2"]),
                          "1X": _pct(p["1X"]), "X2": _pct(p["X2"]),
                          "BTTS": _pct(p["BTTS_Y"]), "O1.5": _pct(p["O1.5"]), "O2.5": _pct(p["O2.5"]),
+                         "U2.5": _pct(p["U2.5"]), "1H O0.5": _pct(p["HT_O0.5"]),
+                         "1H U0.5": _pct(p["HT_U0.5"]),
                          "Trap": m["trap"]["risk"], "DQ": m["dq"],
                          "Qualified": "yes" if m.get("eligible") else "no"})
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
@@ -3500,7 +3551,8 @@ def main():
         local_today = datetime.now(ZoneInfo(tz)).date()
         d = st.date_input("Match day to analyse", local_today)
         force = st.checkbox("Ignore cache (fresh data)", False)
-        st.caption("The AI reads all qualified matches and selects the safest picks. Python NEVER picks matches — it only collects data and presents it to the AI.")
+        st.caption("Python models the match; the AI selects among full-time/first-half goals, result and BTTS options. "
+                   "Corners and team totals are excluded. Risk flags indicate uncertainty, not proven bookmaker intent.")
         if st.button("🧠 Analyse Football Matches Now", type="primary"):
             cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "target_picks": target_picks,
                    "max_calls": int(max_calls), "depth": depth, "sims": int(sims), "w_model": w_model,
