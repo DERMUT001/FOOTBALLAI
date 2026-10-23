@@ -3529,7 +3529,6 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                             if _selection_market_allowed(leg["key"])}
     non_dc_matches = sum(any(_selection_market_allowed(leg["key"]) and leg["key"] not in ("1X", "X2")
                              for leg in match.get("legs", [])) for match in ai_pool)
-    prompt = AI_MATCH_PROMPT.replace("{target}", str(target))
     available = min(ceiling, budget.remaining, gov.limit)
     format_options = [(6, True), (4, True), (2, False), (1, False)]
     completion_reserve = max(
@@ -3539,29 +3538,129 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
         )
         for model_cfg in GROQ_MODEL_CONFIG.values()
     )
-    for max_options, include_history in format_options:
-        data_str = format_matches_for_ai(ai_pool, cfg["tz"], max_n=len(ai_pool),
-                                         max_options=max_options, include_history=include_history)
-        user_msg = f"{prompt}\n\nMATCH DATA:\n{data_str}"
-        p_est = est_tokens(sys_msg + user_msg, cpt) + 40
-        if p_est + completion_reserve + TOKEN_SAFETY <= available:
+
+    def fit_request(matches, request_target):
+        request_prompt = AI_MATCH_PROMPT.replace("{target}", str(request_target))
+        for max_options_, include_history_ in format_options:
+            data_str = format_matches_for_ai(
+                matches, cfg["tz"], max_n=len(matches), max_options=max_options_,
+                include_history=include_history_,
+            )
+            user_msg_ = f"{request_prompt}\n\nMATCH DATA:\n{data_str}"
+            prompt_tokens = est_tokens(sys_msg + user_msg_, cpt) + 40
+            if prompt_tokens + completion_reserve + TOKEN_SAFETY <= available:
+                return {
+                    "matches": matches,
+                    "max_options": max_options_,
+                    "include_history": include_history_,
+                    "user_msg": user_msg_,
+                    "prompt_tokens": prompt_tokens,
+                }
+        return None
+
+    request_plan = []
+    whole_request = fit_request(ai_pool, target)
+    if whole_request:
+        whole_request["start"] = 0
+        whole_request["target"] = target
+        request_plan.append(whole_request)
+    else:
+        current, start = [], 0
+        for match_i, match in enumerate(ai_pool):
+            trial = current + [match]
+            if fit_request(trial, min(target, len(trial))):
+                current = trial
+                continue
+            if not current:
+                status = (f"SKIPPED(single-match prompt~{fit_request([match], 1) or 'too large'}, "
+                          f"completion reserve={completion_reserve}, available={available})")
+                warnings.append("Even one match could not fit the AI token budget; no request was sent.")
+                return {"picks": [], "ai_note": "AI token budget is too small for even one match.",
+                        "warnings": warnings, "model": None, "passes": [{"model": "-", "status": status}],
+                        "tokens": budget.used, "n_ai": 0}
+            fitted = fit_request(current, min(target, len(current)))
+            request_plan.append(dict(fitted, start=start, target=0))
+            start = match_i
+            current = [match]
+        if current:
+            fitted = fit_request(current, min(target, len(current)))
+            request_plan.append(dict(fitted, start=start, target=0))
+
+        # Allocate the target across batches by size, then distribute rounding remainder.
+        quotas = [target * len(request["matches"]) / len(ai_pool) for request in request_plan]
+        allocated = [int(quota) for quota in quotas]
+        remainder = target - sum(allocated)
+        for batch_i in sorted(range(len(quotas)), key=lambda i: quotas[i] - allocated[i], reverse=True)[:remainder]:
+            allocated[batch_i] += 1
+        fitted_requests = []
+        for request, quota in zip(request_plan, allocated):
+            request["target"] = max(1, quota)
+            fitted = fit_request(request["matches"], request["target"])
+            if fitted is None:
+                warnings.append("A match batch could not fit the available AI token budget.")
+                continue
+            request.update(fitted)
+            fitted_requests.append(request)
+        request_plan = fitted_requests
+        if not request_plan:
+            return {"picks": [], "ai_note": "No match batch fit the available AI token budget.",
+                    "warnings": warnings, "model": None,
+                    "passes": [{"model": "-", "status": "No token-sized match batches"}],
+                    "tokens": budget.used, "n_ai": 0}
+
+    visible_options = {}
+    for request in request_plan:
+        for local_i, match in enumerate(request["matches"], 1):
+            global_i = request["start"] + local_i
+            visible_options[global_i] = {
+                option_i for option_i, _ in _select_ai_legs(match, request["max_options"])
+            }
+
+    log(f"🤖 AI Analyst: sending {len(ai_pool)} qualified matches in {len(request_plan)} request(s) "
+        f"(target: {target} picks)...")
+    batch_picks, attempts, selected_model, request_failed = [], [], None, False
+    for request_i, request in enumerate(request_plan):
+        picks, info = call_groq_for_picks(
+            sys_msg, request["user_msg"], budget, cpt, eff, gov, ceiling, log,
+        )
+        attempts.extend(info.get("attempts", []))
+        selected_model = info.get("model") or selected_model
+        if picks is None:
+            request_failed = True
+            warnings.append(f"AI request {request_i + 1}/{len(request_plan)} failed: {info.get('status', 'unknown error')}.")
+            progress((request_i + 1) / len(request_plan))
+            continue
+        if info.get("status") == "TRUNCATED":
+            warnings.append(f"AI request {request_i + 1}/{len(request_plan)} was truncated.")
+        for pick in picks[:request["target"]]:
+            if isinstance(pick, dict) and type(pick.get("match_index")) is int:
+                pick = dict(pick)
+                pick["match_index"] += request["start"]
+                batch_picks.append((request_i, pick))
+        progress((request_i + 1) / len(request_plan))
+
+    # Preserve each batch's AI ranking while drawing from every batch before taking a second pick.
+    picks, batch_offsets = [], [0] * len(request_plan)
+    while len(picks) < target:
+        added = False
+        for request_i, _ in enumerate(request_plan):
+            batch_items = [pick for batch_i, pick in batch_picks if batch_i == request_i]
+            offset = batch_offsets[request_i]
+            if offset < len(batch_items):
+                picks.append(batch_items[offset])
+                batch_offsets[request_i] += 1
+                added = True
+                if len(picks) >= target:
+                    break
+        if not added:
             break
-    if p_est + completion_reserve + TOKEN_SAFETY > available:
-        status = (f"SKIPPED(prompt~{p_est}, completion reserve={completion_reserve}, "
-                  f"available={available}); no request sent")
-        warnings.append("All qualified matches exceed the AI token budget, even with compact evidence; no AI tokens were spent.")
-        return {"picks": [], "ai_note": "AI token budget is too small for a complete response.",
-                "warnings": warnings, "model": None, "passes": [{"model": "-", "status": status}],
-                "tokens": budget.used, "n_ai": 0}
-    visible_options = {
-        i: {option_i for option_i, _ in _select_ai_legs(match, max_options)}
-        for i, match in enumerate(ai_pool, 1)
-    }
-    log(f"🤖 AI Analyst: sending {len(ai_pool)} qualified matches for selection (target: {target} picks)...")
-    picks, info = call_groq_for_picks(sys_msg, user_msg, budget, cpt, eff, gov, ceiling, log)
-    if not picks and info.get("status") == "TRUNCATED":
-        warnings.append("Groq truncated the response; stopped after one request to avoid spending more tokens without picks.")
-    progress(1.0)
+    info = {"model": selected_model, "attempts": attempts, "status": "FAILED" if request_failed else "SUCCESS"}
+    if request_failed and not picks:
+        return {"picks": [], "ai_note": "AI analysis failed for all token-sized match batches.",
+                "warnings": warnings, "model": selected_model, "passes": attempts, "tokens": budget.used,
+                "n_ai": len(ai_pool)}
+    if not picks and not request_failed:
+        info["status"] = "SUCCESS"
 
     def mix_limits(count):
         if not count:
@@ -3651,14 +3750,14 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
     if picks and isinstance(picks, list):
         valid_picks, groups, rejected, double_chance = validate_picks(picks)
         mix_violation = violates_mix(groups, len(valid_picks), double_chance)
-        if valid_picks and mix_violation:
+        if valid_picks and mix_violation and len(request_plan) == 1:
             required_categories, market_cap, double_chance_cap = mix_limits(len(valid_picks))
             issue = f"market mix {dict(groups)}"
             log(f"   ⚖️ AI selection needs adjustment ({issue}); requesting a re-selection...")
             correction_system = (sys_msg + f" Re-select at most {target} picks. For the number you return, use at least "
                                 f"{required_categories} market categories, no more than {market_cap} picks in any one "
                                 f"category, and no more than {double_chance_cap} double-chance picks.")
-            correction_user = (user_msg + f"\n\nPORTFOLIO BALANCE CORRECTION: Your previous selection violated the portfolio rules. "
+            correction_user = (request_plan[0]["user_msg"] + f"\n\nPORTFOLIO BALANCE CORRECTION: Your previous selection violated the portfolio rules. "
                               f"Return a fresh set of at most {target} full-time over/under goals picks, "
                               f"using at least {required_categories} categories, at most {market_cap} picks in one category, "
                               f"and at most {double_chance_cap} double-chance picks. Preserve one pick per match. "
@@ -3673,6 +3772,8 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                         revised_valid, revised_groups, revised_rejected, revised_double_chance, revised_info)
             if violates_mix(groups, len(valid_picks), double_chance):
                 warnings.append("AI did not fully meet the requested market mix after re-selection.")
+        elif valid_picks and mix_violation:
+            warnings.append("AI market mix was not re-checked with a second request because the slate was token-batched.")
         if valid_picks:
             log(f"   ✅ AI returned {len(valid_picks)} picks using {info.get('model', 'unknown')}")
             return {"picks": valid_picks, "ai_note": f"AI selected {len(valid_picks)} picks ({budget.used} tokens used)",
