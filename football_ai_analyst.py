@@ -13,10 +13,9 @@
 #        - The Odds API        : optional live bookmaker prices when ODDS_API_KEY is configured
 #      ESPN also supplements missing UEFA club fixtures when API-Football is available.
 #      If API-Football is unreachable / out of quota the app still analyses from free sources only.
-#   3. PYTHON runs a Monte Carlo per match and blends it with de-vigged bookmaker prices.
-#   4. PYTHON builds a WIDE leg menu (safe legs + clearly-labelled borderline legs) - the AI decides.
-#   5. AI (Groq) reads ALL qualified matches with token-adaptive, market-diverse evidence and
-#      selects the TOP 10 safest, most valuable individual match predictions. Python only verifies.
+#   3. PYTHON models full-time goals with Monte Carlo and blends goal totals with bookmaker prices.
+#   4. PYTHON builds a WIDE over/under menu (safe + clearly-labelled borderline legs) - the AI decides.
+#   5. AI (Groq) reads ALL qualified matches and selects the safest full-time goals-total predictions.
 #   6. PYTHON only verifies (real data, valid odds). The AI is the sole decision-maker.
 # =============================================================================
 import os, re, json, math, time, html, hashlib, threading, random, traceback, csv, io, unicodedata, difflib
@@ -1869,11 +1868,21 @@ def monte_carlo(lam_h, lam_a, mu_ch, mu_ca, n=40000, seed=0):
     for L in CORNER_LINES:
         p[f"C_O{L:g}"] = P(ct > L)
         p[f"C_U{L:g}"] = 1 - p[f"C_O{L:g}"]
-    code = np.clip(h, 0, 9) * 10 + np.clip(a, 0, 9)
-    cnt = np.bincount(code, weights=w, minlength=100)
-    top = np.argsort(-cnt)[:3]
+    total_counts = np.bincount(tot.astype(int), weights=w)
+    modal_total = int(np.argmax(total_counts))
+    score_values, score_inverse = np.unique(np.column_stack((h, a)), axis=0, return_inverse=True)
+    score_counts = np.bincount(score_inverse, weights=w)
+    top = np.argsort(-score_counts)[:3]
+    top_scores = [f"{int(score_values[i, 0])}-{int(score_values[i, 1])}" for i in top]
+    top_score_probs = [float(score_counts[i] / ws) for i in top]
+    total_goals_distribution = [
+        float(total_counts[i] / ws) if i < len(total_counts) else 0.0 for i in range(8)
+    ]
+    total_goals_distribution.append(float(total_counts[8:].sum() / ws) if len(total_counts) > 8 else 0.0)
     return {"p": p, "exp_goals": float((w * tot).sum() / ws), "exp_corners": float((w * ct).sum() / ws),
-            "top_scores": [f"{int(c // 10)}-{int(c % 10)}" for c in top]}
+            "modal_total_goals": modal_total, "modal_total_probability": float(total_counts[modal_total] / ws),
+            "total_goals_distribution": total_goals_distribution,
+            "top_scores": top_scores, "top_score_probs": top_score_probs}
 
 
 def _devig(odds_map, keys):
@@ -1994,7 +2003,8 @@ def trap_analysis(m):
 
 def data_quality(m):
     dq = 0.0
-    dq += 0.25 if m.get("odds") else 0
+    has_goal_totals_odds = any(_selection_market_allowed(key) for key in (m.get("odds") or {}))
+    dq += 0.25 if has_goal_totals_odds else 0
     dq += 0.20 if m.get("pred") else (0.10 if m.get("elo") else 0)
     dq += 0.20 if m["ph"].get("n", 0) >= 5 and m["pa"].get("n", 0) >= 5 else (0.10 if m["ph"].get("n", 0) >= 3 else 0)
     dq += 0.10 if m.get("h2h") else 0
@@ -2055,13 +2065,10 @@ def _pick_market_group(key):
 
 
 def _selection_market_allowed(key):
-    if key in {"1", "X", "2", "1X", "X2", "12", "BTTS_Y", "BTTS_N"}:
-        return True
-    match = re.fullmatch(r"(HT_)?[OU]([\d.]+)", key)
+    match = re.fullmatch(r"[OU]([\d.]+)", key)
     if not match:
         return False
-    prefix, line = match.groups()
-    return float(line) in (HT_LINES if prefix else GOAL_LINES)
+    return float(match.group(1)) in GOAL_LINES
 
 
 def market_fair_prob(key, om):
@@ -2086,9 +2093,7 @@ def market_fair_prob(key, om):
 
 
 def build_legs(m, allow_est=False, wide=True):
-    fav, risk = m["trap"]["fav"], m["trap"]["risk"]
     dq = m["dq"]
-    ext = m.get("ext_d") or m.get("api_1x2")
     legs = []
     for key, p in m["p"].items():
         if not _selection_market_allowed(key):
@@ -2105,7 +2110,7 @@ def build_legs(m, allow_est=False, wide=True):
             p_mkt = market_fair_prob(key, m["odds"])
         elif allow_est:
             odds, src = round(max(1.05, 0.93 / max(p, 0.05)), 2), "est"
-            p_mkt = ext.get(key, p) if ext else p
+            p_mkt = p
         else:
             continue
         if not (MIN_LEG_ODDS <= odds <= MAX_LEG_ODDS):
@@ -2125,12 +2130,6 @@ def build_legs(m, allow_est=False, wide=True):
         else:
             continue
         pen = 0.05 * (1 - dq)
-        if fav and key == fav:
-            pen += 0.25 * risk / 100
-        elif fav and key == ("1X" if fav == "1" else "X2"):
-            pen += 0.10 * risk / 100
-        elif risk:
-            pen += 0.03 * risk / 100
         if "friendl" in (m.get("league") or "").lower():
             pen += 0.03
         pen += 0.5 * max(0.0, abs(p_model - p_mkt) - 0.08)
@@ -2171,8 +2170,8 @@ def gate_reasons(m, cfg):
     why = []
     if m["basis"] == "prior":
         why.append("no team-specific data (league-average defaults only)")
-    if not m["odds"] and not cfg.get("allow_est"):
-        why.append("no real bookmaker odds")
+    if not any(_selection_market_allowed(key) for key in (m.get("odds") or {})) and not cfg.get("allow_est"):
+        why.append("no real full-time goals-total bookmaker odds")
     if (m.get("form_age_days") or 0) > 200:
         why.append(f"newest form result is {m['form_age_days']} days old")
     if m["dq"] < cfg.get("min_dq", 0.5):
@@ -2312,6 +2311,9 @@ def make_record(m, c, hs_h, hs_a, inj_h, inj_a, lu_h, lu_a, odds, odds_src, st_h
     rec = dict(m, ph=ph, pa=pa, pred=c["pred"], h2h=h2h_summary(c["h2h"]), lam_h=lam_h, lam_a=lam_a, basis=basis,
                model_p=mc["p"], p=p_bl, mkt_1x2=mkt, api_1x2=api_d, elo=elo, ext_d=ext_d, ext_src=ext_src, odds=odds,
                odds_src=odds_src, exp_goals=mc["exp_goals"], exp_corners=mc["exp_corners"], top_scores=mc["top_scores"],
+               top_score_probs=mc["top_score_probs"], modal_total_goals=mc["modal_total_goals"],
+               modal_total_probability=mc["modal_total_probability"],
+               total_goals_distribution=mc["total_goals_distribution"],
                corner_n=cn, st_h=st_h, st_a=st_a, inj_known=inj_known, free_tags=list(c.get("free_tags", [])))
     rec["trap"] = trap_analysis(rec)
     rec["dq"] = data_quality(rec)
@@ -3026,9 +3028,9 @@ def collect_day(api, cfg, log, progress, free=None):
 # ═════════════════════════════════════════════════════════════════════════════
 # AI MATCH SELECTION — THE AI IS THE SOLE DECISION-MAKER
 # ═════════════════════════════════════════════════════════════════════════════
-AI_MATCH_PROMPT = """You are selecting football bets using the supplied evidence. Choose exactly {target} options, safest first, with no more than one option per match. The Python evidence gate already qualified these matches; do not apply another eligibility filter.
+AI_MATCH_PROMPT = """You are selecting full-time football goals-total predictions using the supplied evidence. Choose exactly {target} options, safest first, with no more than one option per match. Every option is an OVER or UNDER full-time total-goals line. The Python evidence gate already qualified these matches; do not apply another eligibility filter.
 
-Evidence includes data quality, model and market probabilities, expected goals, recent form/scoring, available xG, table position, injuries, lineup rotation, head-to-head, and risk signals. Treat trap risk as a warning about uncertainty or disagreement, never as proof of bookmaker intent. Each option shows its exact option number and label, decimal odds, p=blended probability, m=model probability, k=market probability, and source B=bookmaker, D=derived, E=model-estimated, X=other. E and X are not bookmaker confirmation. The listed options are a market-diverse shortlist of eligible choices, not necessarily every available market; use only supplied match and option numbers. Prioritize full-time and first-half goal totals, 1X/X2, and other supplied result/BTTS options; corners and team totals are intentionally excluded. Compare model and market support, data reliability, price value, and the stated risk signals rather than treating any single factor or bookmaker price as decisive. Missing odds, injuries, or lineups alone do not disqualify a match. Never invent a match or option.
+Evidence includes expected full-time goals, the distribution of total-goal counts, the most likely total-goals count and its probability, the most likely correct scores and their probabilities, model and blended probabilities for full-time goal lines, recent scoring/conceding form, available xG, table position, injuries, lineup rotation, head-to-head goal history, and data quality. Each option shows its exact option number and label, decimal odds, p=blended probability, m=model probability, k=market probability, and source B=bookmaker, D=derived, E=model-estimated, X=other. E and X are not bookmaker confirmation. Compare over/under support, the expected-goals and score distributions, data reliability, and price value. The correct-score forecast is the model's most probable scoreline, shown as additional context rather than a separate market selection. Missing injuries or lineups alone do not disqualify a match. Never invent a match or option.
 
 For each selection output only its match number and option number as MATCH|OPTION. Output exactly {target} lines, one per different match. Example: 2|4 means option 4 from match 2. No JSON, words, bullets, headings, or explanations."""
 
@@ -3057,7 +3059,6 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=6, include_history=
     lines = []
     for i, m in enumerate(matches[:max_n]):
         ph, pa = m["ph"], m["pa"]
-        t = m["trap"]
         opts = []
         selected = _select_ai_legs(m, max_options)
         for option_i, l in selected:
@@ -3069,9 +3070,23 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=6, include_history=
                     f"{pa.get('form5', '?')}({pa.get('ppg5', 0):.1f})") if include_history else ""
         model = m["model_p"]
         market = m["p"]
-        goals = (f" goalsM O1.5/O2.5/O3.5={_pct(model['O1.5'])}/{_pct(model['O2.5'])}/"
-                 f"{_pct(model['O3.5'])} HT-O0.5={_pct(model['HT_O0.5'])} "
-                 f"BTTS={_pct(model['BTTS_Y'])}")
+        goal_distribution = ",".join(
+            f"{goals}:{_pct(prob)}%" for goals, prob in enumerate(m["total_goals_distribution"][:8])
+        ) + f",8+:{_pct(m['total_goals_distribution'][8])}%"
+        goals = (f" FT-goals expected={m['exp_goals']:.2f} mode={m['modal_total_goals']} "
+                 f"({_pct(m['modal_total_probability'])}%) dist={goal_distribution} "
+                 f"O/U model/market 0.5={_pct(model['O0.5'])}/{_pct(model['U0.5'])}:"
+                 f"{_pct(market['O0.5'])}/{_pct(market['U0.5'])} "
+                 f"1.5={_pct(model['O1.5'])}/{_pct(model['U1.5'])}:"
+                 f"{_pct(market['O1.5'])}/{_pct(market['U1.5'])} "
+                 f"2.5={_pct(model['O2.5'])}/{_pct(model['U2.5'])}:"
+                 f"{_pct(market['O2.5'])}/{_pct(market['U2.5'])} "
+                 f"3.5={_pct(model['O3.5'])}/{_pct(model['U3.5'])}:"
+                 f"{_pct(market['O3.5'])}/{_pct(market['U3.5'])} "
+                 f"4.5={_pct(model['O4.5'])}/{_pct(model['U4.5'])}:"
+                 f"{_pct(market['O4.5'])}/{_pct(market['U4.5'])}")
+        score_str = " likely-scores=" + ",".join(
+            f"{score}({_pct(prob)}%)" for score, prob in zip(m["top_scores"], m["top_score_probs"]))
         xg_n = min(ph.get("xg_n") or 0, pa.get("xg_n") or 0)
         xg_str = (f" xGform{ph['xg_for']:.2f}-{pa['xg_for']:.2f}(n{xg_n})"
                   if xg_n >= 3 and ph.get("xg_for") is not None and pa.get("xg_for") is not None else "")
@@ -3098,14 +3113,11 @@ def format_matches_for_ai(matches, tz, max_n=15, max_options=6, include_history=
             if (profile.get("lineup") or {}).get("rotation"):
                 availability.append(f"{side_name}rotation")
         availability_str = f" avail{','.join(availability)}" if availability else ""
-        trap_str = ",".join(t.get("reasons", [])) or "none"
         lines.append(
             f"MATCH {i + 1} {m['home']} v {m['away']} basis{BASIS_TAG.get(m.get('basis'), '?')} "
-            f"dq{m['dq']:.2f} risk{t['risk']}[{trap_str}] "
-            f"xG{m['lam_h']:.1f}-{m['lam_a']:.1f}(total{m['exp_goals']:.1f}) "
-            f"mdl{_pct(model['1'])}/{_pct(model['X'])}/{_pct(model['2'])} "
-            f"{goals}{xg_str}{scoring_str}{form_source_str}{elo_age_str}{table_str}{availability_str}{form_str}{h2h_str} "
-            f"blend1X/X2={_pct(market['1X'])}/{_pct(market['X2'])}\n"
+            f"dq{m['dq']:.2f} "
+            f"team-xG{m['lam_h']:.2f}-{m['lam_a']:.2f} "
+            f"{goals}{score_str}{xg_str}{scoring_str}{form_source_str}{elo_age_str}{table_str}{availability_str}{form_str}{h2h_str}\n"
             f"OPTIONS {'; '.join(opts)}"
         )
     return "\n".join(lines)
@@ -3425,7 +3437,7 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
         return {"picks": [], "ai_note": "AI disabled in settings.", "warnings": ["AI is disabled."], "model": None, "passes": [], "tokens": 0, "n_ai": 0}
     if not elig:
         return {"picks": [], "ai_note": "No matches passed the evidence gate.", "warnings": [], "model": None, "passes": [], "tokens": 0, "n_ai": 0}
-    sys_msg = "You are a concise football quant analyst. Follow the requested MATCH|OPTION output format exactly."
+    sys_msg = "You are a concise football goals-total analyst. Select only full-time OVER or UNDER total-goals options. Follow the requested MATCH|OPTION output format exactly."
     max_completion = max(cfg_.get("max_completion_tokens", GROQ_DEFAULT_CFG["max_completion_tokens"])
                          for cfg_ in GROQ_MODEL_CONFIG.values())
     completion_reserve = _completion_token_reserve(eff, max_completion)
@@ -3525,8 +3537,13 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
                 "odds_source": leg["src"],
                 "probability": _pct(leg["p"]),
                 "confidence": "HIGH" if str(item.get("confidence", "MED")).upper() == "HIGH" else "MED",
+                "expected_goals": round(float(match["exp_goals"]), 2),
+                "most_likely_total": int(match["modal_total_goals"]),
+                "most_likely_total_probability": _pct(match["modal_total_probability"]),
+                "correct_score": match["top_scores"][0],
+                "correct_score_probability": _pct(match["top_score_probs"][0]),
                 "reason": str(item.get("reason") or "Selected from supplied match evidence"),
-                "risk_if_fails": str(item.get("risk_if_fails") or "Match outcome differs from prediction"),
+                "risk_if_fails": str(item.get("risk_if_fails") or "The full-time goal total falls on the other side of the selected line"),
             })
         return valid, groups, rejected, double_chance
 
@@ -3539,12 +3556,11 @@ def run_ai_stage(elig, cfg, log, progress=lambda x: None):
         if valid_picks and (mix_violation or len(valid_picks) < target):
             issue = f"market mix {dict(groups)}" if mix_violation else f"incomplete count {len(valid_picks)}/{target}"
             log(f"   ⚖️ AI selection needs adjustment ({issue}); requesting a re-selection...")
-            correction_system = (sys_msg + f" Select exactly {target} picks across at least {active_min_categories} market categories, "
-                                f"with no more than {active_max_per_market} picks per category and {active_max_double_chance} double-chance picks.")
+            correction_system = (sys_msg + f" Select exactly {target} picks from the supplied full-time goals-total options, "
+                                f"with no more than {active_max_per_market} picks in any category.")
             correction_user = (user_msg + f"\n\nPORTFOLIO BALANCE CORRECTION: Your previous selection violated the portfolio rules. "
-                              f"Return a fresh set of exactly {target} picks from at least {active_min_categories} different market categories, "
-                              f"with at most {active_max_per_market} picks in each category and {active_max_double_chance} double-chance picks. "
-                              "Use qualified non-double-chance options where available. Preserve one pick per match and follow all evidence rules. "
+                              f"Return a fresh set of exactly {target} full-time over/under goals picks, "
+                              f"with at most {active_max_per_market} picks in the category. Preserve one pick per match and follow all evidence rules. "
                               "Output only MATCH|OPTION lines, one per pick.")
             revised, revised_info = call_groq_for_picks(correction_system, correction_user, budget, cpt, eff, gov, ceiling, log)
             revised_info["attempts"] = info.get("attempts", []) + revised_info.get("attempts", [])
@@ -3619,6 +3635,9 @@ def build_telegram_message(res, tz):
                 "derived from bookmaker prices" if odds_source == "derived" else "bookmaker")
             L.append(f"{n} <b>{_esc(p.get('match', ''))}</b> [{_esc(p.get('league', ''))}]\n"
                      f"   ➜ <b>{_esc(p.get('pick', ''))}</b> @{_num(p.get('odds')):.2f} ({p.get('probability', 0)}%; {_esc(odds_note)})\n"
+                     f"   📊 Expected FT goals: {_num(p.get('expected_goals')):.2f} | most likely total: {p.get('most_likely_total')} "
+                     f"({_num(p.get('most_likely_total_probability')):.0f}%) | most likely score: "
+                     f"{_esc(p.get('correct_score', 'n/a'))} ({_num(p.get('correct_score_probability')):.0f}%)\n"
                      f"   {conf_icon} {_esc(p.get('reason', ''))}\n"
                      f"   ⚠️ Loses if: {_esc(p.get('risk_if_fails', ''))}")
     foot = (f"\n🤖 {_esc(res.get('model') or 'AI')} | AI tokens {res.get('tokens', 0)} | "
@@ -3836,7 +3855,7 @@ def render_results(res, tz):
     if res.get("picks"):
         note = res.get("ai_note") or f"{len(res['picks'])} AI picks"
         st.success(f"✅ {note}")
-        st.markdown("### 🏆 AI Top Picks")
+        st.markdown("### 🏆 AI Full-Time Goals Predictions")
         rows = []
         for i, p in enumerate(res["picks"]):
             rows.append({
@@ -3844,6 +3863,9 @@ def render_results(res, tz):
                 "Match": p.get("match", ""),
                 "League": p.get("league", ""),
                 "Pick": p.get("pick", ""),
+                "Expected FT goals": p.get("expected_goals", ""),
+                "Most likely total": f"{p.get('most_likely_total', '')} ({p.get('most_likely_total_probability', '')}%)",
+                "Most likely score": f"{p.get('correct_score', '')} ({p.get('correct_score_probability', '')}%)",
                 "Odds": p.get("odds", ""),
                 "Odds source": p.get("odds_source", ""),
                 "Prob%": p.get("probability", ""),
@@ -3855,7 +3877,7 @@ def render_results(res, tz):
     else:
         if not res.get("no_bet"):
             st.warning("🤖 AI returned no picks. Press 'Re-run AI analysis' to try again.")
-    with st.expander("📋 All analysed matches (Monte Carlo + market blend)"):
+    with st.expander("📋 All analysed matches (full-time goals model + market blend)"):
         rows = []
         for m in res.get("matches", []):
             p = m["p"]
@@ -3864,12 +3886,17 @@ def render_results(res, tz):
                          "Data": BASIS_TAG.get(m["basis"]), "Odds source": m.get("odds_src", ""),
                          "xG": f"{m['lam_h']:.2f}-{m['lam_a']:.2f}",
                          "Total xG": f"{m['exp_goals']:.2f}",
-                         "1": _pct(p["1"]), "X": _pct(p["X"]), "2": _pct(p["2"]),
-                         "1X": _pct(p["1X"]), "X2": _pct(p["X2"]),
-                         "BTTS": _pct(p["BTTS_Y"]), "O1.5": _pct(p["O1.5"]), "O2.5": _pct(p["O2.5"]),
-                         "U2.5": _pct(p["U2.5"]), "1H O0.5": _pct(p["HT_O0.5"]),
-                         "1H U0.5": _pct(p["HT_U0.5"]),
-                         "Trap": m["trap"]["risk"], "DQ": m["dq"],
+                         "Most likely total": f"{m['modal_total_goals']} ({_pct(m['modal_total_probability'])}%)",
+                         "Most likely score": f"{m['top_scores'][0]} ({_pct(m['top_score_probs'][0])}%)",
+                         "Goals distribution (0-7, 8+)": ", ".join(
+                             f"{n}: {_pct(prob)}%" for n, prob in enumerate(m["total_goals_distribution"][:8])
+                         ) + f", 8+: {_pct(m['total_goals_distribution'][8])}%",
+                         "O0.5": _pct(p["O0.5"]), "U0.5": _pct(p["U0.5"]),
+                         "O1.5": _pct(p["O1.5"]), "U1.5": _pct(p["U1.5"]),
+                         "O2.5": _pct(p["O2.5"]), "U2.5": _pct(p["U2.5"]),
+                         "O3.5": _pct(p["O3.5"]), "U3.5": _pct(p["U3.5"]),
+                         "O4.5": _pct(p["O4.5"]), "U4.5": _pct(p["U4.5"]),
+                         "DQ": m["dq"],
                          "Qualified": "yes" if m.get("eligible") else "no"})
         st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     if res.get("excluded"):
@@ -3953,8 +3980,8 @@ def main():
         local_today = datetime.now(ZoneInfo(tz)).date()
         d = st.date_input("Match day to analyse", local_today)
         force = st.checkbox("Ignore cache (fresh data)", False)
-        st.caption("Python models the match; the AI selects among full-time/first-half goals, result and BTTS options. "
-                   "Corners and team totals are excluded. Risk flags indicate uncertainty, not proven bookmaker intent.")
+        st.caption("Python models full-time goal totals and likely scorelines; the AI selects only Over/Under full-time goals options. "
+                   "Risk flags indicate uncertainty, not proven bookmaker intent.")
         if st.button("🧠 Analyse Football Matches Now", type="primary"):
             cfg = {"date": d.strftime("%Y-%m-%d"), "tz": tz, "max_matches": max_matches, "target_picks": target_picks,
                    "max_calls": int(max_calls), "depth": depth, "sims": int(sims), "w_model": w_model,
